@@ -1,0 +1,39 @@
+# Power Spectrum Autoencoder Training Configuration
+
+# Model Configuration
+model:
+  encoder_dims: [64, 128, 256, 512]
+  num_layers: 4
+  activation: 'gelu'
+  input_length: 1024
+  
+# Training Configuration
+training:
+  batch_size: 32
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 1e-4
+  val_split: 0.2
+  
+# Data Configuration
+data:
+  synthetic: true
+  num_samples: 10000
+  length: 1024
+  add_noise: true
+  normalize: true
+  
+# Training Options
+options:
+  mixed_precision: true
+  num_workers: 4
+  save_every: 10
+  plot_examples: true
+  
+# Paths
+paths:
+  save_dir: './power_spectrum_results'
+  data_dir: null  # Set this for real data
+  
+# Device
+device: 'auto'  # 'cuda', 'cpu', or 'auto'
