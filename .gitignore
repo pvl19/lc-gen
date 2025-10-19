@@ -1,3 +1,101 @@
-*/model_artifacts/*
-pk_star_lc_cf_norm.pickle
-transformer/star_dataset.pt
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code
+.claude/
+.claude-cache/
+claude_*.log
+CLAUDE.md
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# PyTorch
+*.pt
+*.pth
+*.ckpt
+
+# Data files
+data/*.pickle
+data/*.pkl
+data/*.h5
+data/*.hdf5
+data/*.npy
+data/*.npz
+data/*.csv
+data/*.json
+!data/README.md
+
+# Experiment results
+experiments/results/*/
+experiments/notebooks/.ipynb_checkpoints/
+
+# Logs
+*.log
+logs/
+runs/
+outputs/
+wandb/
+
+# Model artifacts
+model_artifacts/
+checkpoints/
+*.pt.tar
+
+# Temporary files
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json

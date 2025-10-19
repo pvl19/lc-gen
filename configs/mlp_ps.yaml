@@ -1,0 +1,70 @@
+# Configuration for MLP autoencoder on power spectra
+
+# Model configuration
+model:
+  model_type: mlp
+  model_name: mlp_ps_autoencoder
+  input_dim: 1024
+  encoder_hidden_dims: [512, 256, 128]
+  latent_dim: 64
+  decoder_hidden_dims: null  # Symmetric (reverse of encoder)
+  dropout: 0.1
+  activation: gelu
+
+# Data configuration
+data:
+  data_path: ./data
+  dataset_type: power_spectrum
+  batch_size: 32
+  num_workers: 4
+  shuffle: true
+  val_split: 0.2
+  test_split: 0.1
+
+  normalize: true
+  normalization_method: arcsinh
+  scale_factor: 50.0
+
+  use_masking: false  # MLP typically doesn't use masking
+  mask_ratio: 0.0
+  mask_block_size: 0
+
+# Training configuration
+training:
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  optimizer: adamw
+
+  use_scheduler: true
+  scheduler_type: plateau
+  scheduler_patience: 5
+  scheduler_factor: 0.5
+
+  loss_fn: mse
+
+  save_every: 10
+  save_best_only: false
+  early_stopping: true
+  early_stopping_patience: 20
+
+  log_every: 1
+  plot_examples: true
+  plot_every: 10
+
+  mixed_precision: false
+  clip_gradients: false
+  max_grad_norm: 1.0
+
+# Paths
+output_dir: ./experiments/results/mlp/ps
+checkpoint_dir: ./experiments/results/mlp/ps/checkpoints
+log_dir: ./experiments/results/mlp/ps/logs
+
+# Experiment tracking
+experiment_name: mlp_ps
+version: v01
+notes: "MLP autoencoder for compact power spectrum representations"
+
+device: auto
+seed: 42

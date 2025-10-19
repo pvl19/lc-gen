@@ -1,0 +1,80 @@
+# Configuration for UNet autoencoder on power spectra
+
+# Model configuration
+model:
+  model_type: unet
+  model_name: unet_ps_autoencoder
+  input_length: 1024
+  target_length: 1024
+  in_channels: 1
+  encoder_dims: [64, 128, 256, 512]
+  num_layers: 4
+  activation: gelu
+
+# Data configuration
+data:
+  data_path: ./data
+  dataset_type: power_spectrum
+  batch_size: 32
+  num_workers: 4
+  shuffle: true
+  val_split: 0.2
+  test_split: 0.1
+
+  # Preprocessing
+  normalize: true
+  normalization_method: arcsinh
+  scale_factor: 50.0
+
+  # Masking (for training)
+  use_masking: true
+  mask_ratio: 0.5
+  mask_block_size: 50
+
+# Training configuration
+training:
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  optimizer: adamw
+
+  # Learning rate scheduling
+  use_scheduler: true
+  scheduler_type: plateau
+  scheduler_patience: 5
+  scheduler_factor: 0.5
+
+  # Loss function
+  loss_fn: mse
+
+  # Checkpointing
+  save_every: 10
+  save_best_only: false
+  early_stopping: true
+  early_stopping_patience: 20
+
+  # Logging
+  log_every: 1
+  plot_examples: true
+  plot_every: 10
+
+  # Mixed precision
+  mixed_precision: false
+
+  # Gradient clipping
+  clip_gradients: false
+  max_grad_norm: 1.0
+
+# Paths
+output_dir: ./experiments/results/unet/ps
+checkpoint_dir: ./experiments/results/unet/ps/checkpoints
+log_dir: ./experiments/results/unet/ps/logs
+
+# Experiment tracking
+experiment_name: unet_ps
+version: v01
+notes: "UNet autoencoder for power spectrum reconstruction with masking"
+
+# Device
+device: auto  # 'cuda', 'cpu', or 'auto'
+seed: 42
