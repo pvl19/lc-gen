@@ -1,0 +1,77 @@
+# Configuration for Transformer on light curves
+
+# Model configuration
+model:
+  model_type: transformer
+  model_name: transformer_lc
+  input_dim: 2  # flux + flux_err
+  embed_dim: 128
+  d_model: 128
+  nhead: 4
+  num_layers: 4
+  ff_dim: 512
+  dropout: 0.1
+
+  # Positional encoding
+  min_period: 0.00278  # ~4 minutes
+  max_period: 1640.0   # ~45 hours
+
+  # Masking
+  use_learnable_mask: true
+
+# Data configuration
+data:
+  data_path: ./data
+  dataset_type: flux
+  batch_size: 32
+  num_workers: 4
+  shuffle: true
+  val_split: 0.2
+  test_split: 0.1
+
+  normalize: false  # Light curves typically standardized differently
+
+  # Masking for training
+  use_masking: true
+  mask_ratio: 0.3
+  mask_block_size: 10
+
+# Training configuration
+training:
+  epochs: 100
+  learning_rate: 0.0001  # Lower LR for transformers
+  weight_decay: 0.01     # Higher weight decay
+  optimizer: adamw
+
+  use_scheduler: true
+  scheduler_type: plateau
+  scheduler_patience: 5
+  scheduler_factor: 0.5
+
+  loss_fn: chi_squared  # Use chi-squared loss with uncertainties
+
+  save_every: 10
+  save_best_only: false
+  early_stopping: true
+  early_stopping_patience: 20
+
+  log_every: 1
+  plot_examples: true
+  plot_every: 10
+
+  mixed_precision: false
+  clip_gradients: true  # Important for transformers
+  max_grad_norm: 1.0
+
+# Paths
+output_dir: ./experiments/results/transformer
+checkpoint_dir: ./experiments/results/transformer/checkpoints
+log_dir: ./experiments/results/transformer/logs
+
+# Experiment tracking
+experiment_name: transformer_lc
+version: v01
+notes: "Transformer for light curve reconstruction with time-aware positional encoding"
+
+device: auto
+seed: 42
