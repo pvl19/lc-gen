@@ -18,7 +18,7 @@ class UNetConfig(ModelConfig):
     # Architecture
     input_length: int = 1024
     target_length: int = 1024
-    in_channels: int = 1
+    in_channels: int = 2  # Channel 0: data, Channel 1: binary mask
     encoder_dims: List[int] = field(default_factory=lambda: [64, 128, 256, 512])
     num_layers: int = 4
     activation: str = "gelu"
@@ -53,6 +53,21 @@ def get_activation(activation_name: str, **kwargs):
     return activations[activation_name.lower()](**kwargs)
 
 
+class LayerNorm1d(nn.Module):
+    """LayerNorm for 1D convolutions (batch, channels, length)"""
+
+    def __init__(self, num_channels):
+        super().__init__()
+        self.norm = nn.LayerNorm(num_channels)
+
+    def forward(self, x):
+        # x: (batch, channels, length)
+        x = x.permute(0, 2, 1)  # (batch, length, channels)
+        x = self.norm(x)
+        x = x.permute(0, 2, 1)  # (batch, channels, length)
+        return x
+
+
 class PowerSpectrumUNetEncoder(nn.Module):
     """
     UNet-style CNN encoder for power spectra with skip connections.
@@ -78,7 +93,7 @@ class PowerSpectrumUNetEncoder(nn.Module):
                 padding=3,
                 bias=False
             ),
-            nn.BatchNorm1d(config.encoder_dims[0]),
+            LayerNorm1d(config.encoder_dims[0]),
             self.activation,
         )
 
@@ -91,10 +106,10 @@ class PowerSpectrumUNetEncoder(nn.Module):
             # Pre-downsampling convolution (skip connection source)
             pre_conv = nn.Sequential(
                 nn.Conv1d(in_dim, out_dim, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm1d(out_dim),
+                LayerNorm1d(out_dim),
                 self.activation,
                 nn.Conv1d(out_dim, out_dim, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm1d(out_dim),
+                LayerNorm1d(out_dim),
                 self.activation
             )
 
@@ -110,10 +125,10 @@ class PowerSpectrumUNetEncoder(nn.Module):
         bottleneck_dim = config.encoder_dims[-1]
         self.bottleneck = nn.Sequential(
             nn.Conv1d(bottleneck_dim, bottleneck_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(bottleneck_dim),
+            LayerNorm1d(bottleneck_dim),
             self.activation,
             nn.Conv1d(bottleneck_dim, bottleneck_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(bottleneck_dim),
+            LayerNorm1d(bottleneck_dim),
             self.activation
         )
 
@@ -129,16 +144,18 @@ class PowerSpectrumUNetEncoder(nn.Module):
         Forward pass through encoder.
 
         Args:
-            x: Input tensor
+            x: Input tensor of shape [batch, in_channels, length]
+               For masking: [batch, 2, length] where channel 0 is data, channel 1 is binary mask
 
         Returns:
             bottleneck_features: Encoded representation with spatial structure
             skip_connections: List of skip connection tensors
         """
         # Handle different input dimensions
-        if len(x.shape) == 2:  # [batch, length] -> [batch, 1, length]
+        if len(x.shape) == 2:  # [batch, length] -> [batch, 1, length] (legacy single channel)
             x = x.unsqueeze(1)
-        elif len(x.shape) == 3 and x.shape[-1] == 1:  # [batch, length, 1] -> [batch, 1, length]
+        elif len(x.shape) == 3 and x.shape[-1] != self.in_channels and x.shape[1] != self.in_channels:
+            # [batch, length, channels] -> [batch, channels, length]
             x = x.permute(0, 2, 1)
 
         x = x.float()
@@ -219,10 +236,10 @@ class PowerSpectrumUNetDecoder(nn.Module):
             # Skip connection integration + convolution
             skip_integrate = nn.Sequential(
                 nn.Conv1d(in_dim + skip_dim, out_dim, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm1d(out_dim),
+                LayerNorm1d(out_dim),
                 self.activation,
                 nn.Conv1d(out_dim, out_dim, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm1d(out_dim),
+                LayerNorm1d(out_dim),
                 self.activation
             )
 
@@ -235,7 +252,7 @@ class PowerSpectrumUNetDecoder(nn.Module):
         final_in_dim = decoder_dims[-1] if len(decoder_dims) > 0 else config.encoder_dims[0]
         self.final_conv = nn.Sequential(
             nn.Conv1d(final_in_dim, final_in_dim // 2, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(final_in_dim // 2),
+            LayerNorm1d(final_in_dim // 2),
             self.activation,
             nn.Conv1d(final_in_dim // 2, 1, kernel_size=7, padding=3)
         )
