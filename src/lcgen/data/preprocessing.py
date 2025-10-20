@@ -5,19 +5,25 @@ from typing import Optional, Dict, Tuple, Any
 import warnings
 
 
-def normalize_ps(data, scale_factor=50):
+def normalize_ps(data, scale_factor=1.0):
     """
     Normalize power spectrum using arcsinh transformation.
 
+    Applies arcsinh transformation for dynamic range compression,
+    then z-score normalization.
+
     Args:
         data: Power spectrum array
-        scale_factor: Scaling factor for arcsinh (default: 50)
+        scale_factor: Scaling factor for arcsinh (default: 1.0)
+                     Lower values → more compression of large values
 
     Returns:
         Normalized power spectrum (z-scored after arcsinh transform)
     """
-    asinh = np.arcsinh(np.log10(data) / scale_factor)
-    scaled = (asinh - np.mean(asinh)) / np.std(asinh)
+    # Arcsinh handles both small and large values gracefully
+    # No need for log10 - arcsinh is already logarithmic for large values
+    asinh = np.arcsinh(data / scale_factor)
+    scaled = (asinh - np.mean(asinh)) / (np.std(asinh) + 1e-8)
     return scaled
 
 
@@ -37,7 +43,7 @@ def normalize_acf(data, scale_factor=0.001):
     return scaled
 
 
-def denormalize_ps(normalized_data, original_data, scale_factor=50):
+def denormalize_ps(normalized_data, original_data, scale_factor=1.0):
     """
     Reverse the power spectrum normalization.
 
@@ -50,16 +56,15 @@ def denormalize_ps(normalized_data, original_data, scale_factor=50):
         Denormalized power spectrum
     """
     # Compute statistics from original data
-    asinh_orig = np.arcsinh(np.log10(original_data) / scale_factor)
+    asinh_orig = np.arcsinh(original_data / scale_factor)
     mean_orig = np.mean(asinh_orig)
-    std_orig = np.std(asinh_orig)
+    std_orig = np.std(asinh_orig) + 1e-8
 
     # Reverse z-score
     asinh_reconstructed = normalized_data * std_orig + mean_orig
 
     # Reverse arcsinh
-    log10_ps = np.sinh(asinh_reconstructed) * scale_factor
-    ps = 10 ** log10_ps
+    ps = np.sinh(asinh_reconstructed) * scale_factor
 
     return ps
 
@@ -303,6 +308,9 @@ def preprocess_lightcurve_multimodal(
     # Normalization options
     compute_pvalues: bool = True,
     acf_mode: str = 'correlation',
+    psd_scale_factor: float = 1.0,
+    acf_scale_factor: float = 1.0,
+    fstat_scale_factor: float = 1.0,  # Set to None for z-score only
     # Preprocessing options
     remove_outliers: bool = True,
     outlier_sigma: float = 5.0,
@@ -352,6 +360,15 @@ def preprocess_lightcurve_multimodal(
         Compute p-values from F-statistics
     acf_mode : str, default='correlation'
         ACF mode: 'correlation' (normalized) or 'covariance' (preserves amplitude)
+    psd_scale_factor : float, default=1.0
+        Scale factor for PSD arcsinh normalization.
+        Lower values → more compression of large values
+    acf_scale_factor : float, default=1.0
+        Scale factor for ACF arcsinh normalization.
+        Lower values → more compression of large values
+    fstat_scale_factor : float, default=1.0
+        Scale factor for F-stat arcsinh normalization.
+        Set to None to use z-score normalization only (backward compatible)
     remove_outliers : bool, default=True
         Remove outliers during preprocessing
     outlier_sigma : float, default=5.0
@@ -513,13 +530,21 @@ def preprocess_lightcurve_multimodal(
 
     # Step 8: Normalize spectral features
     # Arcsinh normalization for PSD and ACF
-    psd_normalized = normalize_ps(psd_1024, scale_factor=50.0)
-    acf_normalized = normalize_acf(acf_1024, scale_factor=0.001)
+    psd_normalized = normalize_ps(psd_1024, scale_factor=psd_scale_factor)
+    acf_normalized = normalize_acf(acf_1024, scale_factor=acf_scale_factor)
 
-    # Z-score normalization for F-statistic
-    fstat_mean = np.mean(fstat_1024)
-    fstat_std = np.std(fstat_1024)
-    fstat_normalized = (fstat_1024 - fstat_mean) / (fstat_std + 1e-8)
+    # F-statistic normalization (arcsinh + z-score or z-score only)
+    if fstat_scale_factor is not None:
+        # Apply arcsinh transformation first, then z-score
+        fstat_asinh = np.arcsinh(fstat_1024 / fstat_scale_factor)
+        fstat_mean = np.mean(fstat_asinh)
+        fstat_std = np.std(fstat_asinh)
+        fstat_normalized = (fstat_asinh - fstat_mean) / (fstat_std + 1e-8)
+    else:
+        # Z-score normalization only
+        fstat_mean = np.mean(fstat_1024)
+        fstat_std = np.std(fstat_1024)
+        fstat_normalized = (fstat_1024 - fstat_mean) / (fstat_std + 1e-8)
 
     # Step 9: Prepare time series input
     # Standardized flux + scaled uncertainties
@@ -560,6 +585,7 @@ def preprocess_lightcurve_multimodal(
 
         # Metadata for reconstruction/denormalization
         'metadata': {
+            # Light curve statistics
             'median_flux': float(median_flux),
             'iqr_flux': float(iqr_flux),
             'psd_integral': float(psd_integral),
@@ -569,10 +595,25 @@ def preprocess_lightcurve_multimodal(
             'lc_duration': float(lc_duration),
             'n_observations': int(n_observations),
             'median_cadence': float(median_cadence),
+
+            # Spectral analysis parameters
             'NW': float(NW),
             'K': int(K_used),
             'freq_spacing': freq_spacing,
             'acf_mode': acf_mode,
+
+            # Normalization parameters (for denormalization)
+            'psd_scale_factor': float(psd_scale_factor),
+            'acf_scale_factor': float(acf_scale_factor),
+            'fstat_scale_factor': float(fstat_scale_factor) if fstat_scale_factor is not None else None,
+
+            # Per-sample normalization statistics
+            'psd_mean': float(np.mean(np.arcsinh(psd_1024 / psd_scale_factor))),
+            'psd_std': float(np.std(np.arcsinh(psd_1024 / psd_scale_factor))),
+            'acf_mean': float(np.mean(np.arcsinh(acf_1024 / acf_scale_factor))),
+            'acf_std': float(np.std(np.arcsinh(acf_1024 / acf_scale_factor))),
+            'fstat_mean': float(fstat_mean),
+            'fstat_std': float(fstat_std),
         }
     }
 

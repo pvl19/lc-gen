@@ -178,3 +178,75 @@ def create_random_block_mask_batch(batch_size, seq_len, mask_ratio=0.15, block_s
                 mask[i, start:start + block_size] = True
 
     return mask
+
+
+def dynamic_block_mask(x, min_block_size=1, max_block_size=None,
+                       min_mask_ratio=0.1, max_mask_ratio=0.9):
+    """
+    Create dynamic block mask with random block sizes and mask ratios.
+
+    At each call, randomly samples:
+    - Block size from uniform distribution [min_block_size, max_block_size]
+    - Mask ratio from uniform distribution [min_mask_ratio, max_mask_ratio]
+
+    Ensures at least 1 block remains unmasked.
+
+    Args:
+        x: Tensor of shape (seq_len,) or (batch, seq_len)
+        min_block_size: Minimum block size (default: 1)
+        max_block_size: Maximum block size (default: seq_len // 2)
+        min_mask_ratio: Minimum masking fraction (default: 0.1)
+        max_mask_ratio: Maximum masking fraction (default: 0.9)
+
+    Returns:
+        masked_x: Input with masked blocks set to 0
+        mask: Boolean tensor, True where input is masked
+        block_size: The sampled block size (for logging)
+        mask_ratio: The sampled mask ratio (for logging)
+    """
+    # Determine sequence length
+    if x.dim() == 1:
+        seq_len = x.shape[0]
+        batch_mode = False
+    else:
+        seq_len = x.shape[-1]
+        batch_mode = True
+
+    # Set default max block size to half the sequence length
+    if max_block_size is None:
+        max_block_size = seq_len // 2
+
+    # Ensure max_block_size is valid
+    max_block_size = min(max_block_size, seq_len)
+
+    # Sample random block size and mask ratio
+    block_size = np.random.randint(min_block_size, max_block_size + 1)
+    mask_ratio = np.random.uniform(min_mask_ratio, max_mask_ratio)
+
+    # Calculate number of blocks
+    num_blocks = int(np.ceil(seq_len / block_size))
+    num_masked = int(num_blocks * mask_ratio)
+
+    # Ensure at least 1 block is unmasked
+    num_masked = min(num_masked, num_blocks - 1)
+    num_masked = max(num_masked, 1)  # Ensure at least 1 block is masked
+
+    # Randomly select blocks to mask
+    masked_blocks = np.random.choice(np.arange(num_blocks), size=num_masked, replace=False)
+
+    # Create masked version
+    x_masked = x.clone()
+    mask = torch.zeros_like(x, dtype=torch.bool)
+
+    for block_idx in masked_blocks:
+        start = block_idx * block_size
+        end = min(start + block_size, seq_len)
+
+        if batch_mode:
+            x_masked[..., start:end] = 0.0
+            mask[..., start:end] = True
+        else:
+            x_masked[start:end] = 0.0
+            mask[start:end] = True
+
+    return x_masked, mask, block_size, mask_ratio

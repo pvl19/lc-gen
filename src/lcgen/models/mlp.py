@@ -19,8 +19,8 @@ class MLPConfig(ModelConfig):
     encoder_hidden_dims: List[int] = field(default_factory=lambda: [512, 256, 128])
     latent_dim: int = 64
     decoder_hidden_dims: Optional[List[int]] = None  # If None, use reverse of encoder
-    dropout: float = 0.1
-    activation: str = "relu"
+    dropout: float = 0.0
+    activation: str = "gelu"
 
 
 class MLPBlock(nn.Module):

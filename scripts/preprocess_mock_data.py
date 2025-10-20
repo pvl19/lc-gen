@@ -63,6 +63,9 @@ def preprocess_dataset(input_file, output_file, batch_size=100, NW=4.0, K=7):
     all_fstat = []
     all_pvalues = []
     all_tabular = []
+    all_metadata = []
+    all_timeseries = []  # Variable length
+    all_time = []  # Variable length
     all_frequency = None  # Same for all
     failed_indices = []
 
@@ -97,6 +100,15 @@ def preprocess_dataset(input_file, output_file, batch_size=100, NW=4.0, K=7):
             all_pvalues.append(result['pvalues'])
             all_tabular.append(result['tabular'])
 
+            # Store time series and time arrays (variable length)
+            for ts in result['timeseries']:
+                all_timeseries.append(ts)
+            for t in result['time']:
+                all_time.append(t)
+
+            # Store metadata (list of dicts)
+            all_metadata.extend(result['metadata'])
+
             if all_frequency is None:
                 all_frequency = result['frequency']
 
@@ -114,12 +126,33 @@ def preprocess_dataset(input_file, output_file, batch_size=100, NW=4.0, K=7):
     pvalues_array = np.concatenate(all_pvalues, axis=0)
     tabular_array = np.concatenate(all_tabular, axis=0)
 
+    # Pad time series to fixed length
+    print("\nPadding time series to fixed length...")
+    lengths = [len(ts) for ts in all_timeseries]
+    max_length = max(lengths)
+    print(f"  Time series lengths: min={min(lengths)}, max={max_length}, mean={np.mean(lengths):.1f}")
+
+    # Pad to max_length
+    n_valid = len(all_timeseries)
+    timeseries_padded = np.zeros((n_valid, max_length, 2), dtype=np.float32)
+    time_padded = np.zeros((n_valid, max_length), dtype=np.float32)
+    mask = np.zeros((n_valid, max_length), dtype=bool)
+
+    for i, (ts, t) in enumerate(zip(all_timeseries, all_time)):
+        length = len(ts)
+        timeseries_padded[i, :length] = ts
+        time_padded[i, :length] = t
+        mask[i, :length] = True
+
     print(f"\nPreprocessed shapes:")
     print(f"  ACF: {acf_array.shape}")
     print(f"  PSD: {psd_array.shape}")
     print(f"  F-stat: {fstat_array.shape}")
     print(f"  P-values: {pvalues_array.shape}")
     print(f"  Tabular: {tabular_array.shape}")
+    print(f"  Timeseries: {timeseries_padded.shape}")
+    print(f"  Time: {time_padded.shape}")
+    print(f"  Mask: {mask.shape}")
     print(f"  Frequency: {all_frequency.shape}")
 
     if failed_indices:
@@ -139,9 +172,46 @@ def preprocess_dataset(input_file, output_file, batch_size=100, NW=4.0, K=7):
         f.create_dataset('tabular', data=tabular_array, compression='gzip')
         f.create_dataset('frequency', data=all_frequency, compression='gzip')
 
-        # Metadata
+        # Time series data (padded to max_length)
+        f.create_dataset('timeseries', data=timeseries_padded, compression='gzip')
+        f.create_dataset('time', data=time_padded, compression='gzip')
+        f.create_dataset('mask', data=mask, compression='gzip')
+
+        # Save per-sample metadata (normalization parameters for denormalization)
+        # Create metadata group
+        meta_grp = f.create_group('metadata')
+
+        # Extract metadata fields into arrays
+        metadata_fields = {
+            'median_flux': [],
+            'iqr_flux': [],
+            'psd_scale_factor': [],
+            'acf_scale_factor': [],
+            'fstat_scale_factor': [],
+            'psd_mean': [],
+            'psd_std': [],
+            'acf_mean': [],
+            'acf_std': [],
+            'fstat_mean': [],
+            'fstat_std': [],
+        }
+
+        for meta in all_metadata:
+            for key in metadata_fields.keys():
+                value = meta.get(key, np.nan)
+                # Handle None values for fstat_scale_factor
+                if value is None:
+                    value = np.nan
+                metadata_fields[key].append(value)
+
+        # Save each metadata field as a dataset
+        for key, values in metadata_fields.items():
+            meta_grp.create_dataset(key, data=np.array(values, dtype=np.float32), compression='gzip')
+
+        # Global metadata attributes
         f.attrs['n_samples'] = len(acf_array)
         f.attrs['n_bins'] = 1024
+        f.attrs['max_length'] = max_length
         f.attrs['NW'] = NW
         f.attrs['K'] = K
         f.attrs['n_failed'] = len(failed_indices)
@@ -175,10 +245,26 @@ def verify_preprocessing(output_file):
         for key in f.keys():
             if isinstance(f[key], h5py.Dataset):
                 print(f"  {key}: {f[key].shape}, dtype={f[key].dtype}")
+            elif isinstance(f[key], h5py.Group):
+                print(f"  {key}/ (group with {len(f[key])} datasets)")
 
         print(f"\nAttributes:")
         for key, val in f.attrs.items():
             print(f"  {key}: {val}")
+
+        # Show metadata fields if available
+        if 'metadata' in f:
+            print(f"\nMetadata fields:")
+            for key in f['metadata'].keys():
+                print(f"  {key}: {f['metadata'][key].shape}")
+
+            print(f"\nSample metadata (first entry):")
+            meta = f['metadata']
+            print(f"  psd_scale_factor: {meta['psd_scale_factor'][0]}")
+            print(f"  acf_scale_factor: {meta['acf_scale_factor'][0]}")
+            print(f"  fstat_scale_factor: {meta['fstat_scale_factor'][0]}")
+            print(f"  psd_mean: {meta['psd_mean'][0]:.4f}")
+            print(f"  psd_std: {meta['psd_std'][0]:.4f}")
 
         # Check for NaNs
         acf = f['acf'][:]
