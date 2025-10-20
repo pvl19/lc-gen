@@ -2,11 +2,32 @@
 
 This document describes the long-term architectural vision for the LC-Gen project, including the multi-modal deep learning framework for light curve reconstruction and prediction.
 
-## Current State (v0.1.0)
+## Current State (v0.2.0)
 
-The project currently implements **separate autoencoder architectures** trained independently on different data modalities:
+### Multi-Modal Preprocessing Pipeline ✓ COMPLETED
+
+The project now includes a **complete preprocessing pipeline** that transforms raw irregularly-sampled light curves into 5-channel multi-modal inputs ready for the encoder network:
+
+**Implemented Features:**
+- Multitaper spectral analysis via `tapify` (Non-Uniform FFT for irregular sampling)
+- Thomson F-test with p-values for periodic signal detection
+- Robust standardization using median/IQR
+- ACF derived from PSD via Wiener-Khinchin theorem
+- Log-spaced frequency grids with dynamic bounds
+- Batch processing with progress tracking
+
+**5 Output Channels:**
+1. **ACF** (1024 bins) - Temporal correlation structure, arcsinh normalized
+2. **PSD** (1024 bins) - Frequency-domain power, arcsinh normalized
+3. **F-statistic** (1024 bins) - Thomson F-test, z-score normalized
+4. **Time Series** (N × 2) - [standardized flux, scaled uncertainties]
+5. **Tabular** (9 features) - Summary statistics (median, IQR, PSD peak/integral, ACF variance/timescale, duration, n_obs, cadence)
+
+See [PREPROCESSING.md](../PREPROCESSING.md) for complete documentation.
 
 ### Implemented Models
+
+The project currently implements **separate autoencoder architectures** trained independently on different data modalities:
 
 1. **UNet Autoencoder** (`PowerSpectrumUNetAutoencoder`)
    - **Input**: Power spectra or ACF (1024 frequency bins)

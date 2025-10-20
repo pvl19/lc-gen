@@ -5,8 +5,10 @@ matplotlib>=3.7.0
 pyyaml>=6.0
 
 # Spectral analysis for irregular time series
-tapify>=1.0.0
+tapify @ git+https://github.com/aaryapatil/tapify.git
 scipy>=1.10.0
+nfft>=0.1  # Required by tapify
+statsmodels>=0.14.0  # Required by tapify
 
 # Development and testing
 pytest>=7.4.0
