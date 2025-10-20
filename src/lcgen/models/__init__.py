@@ -7,6 +7,11 @@ from .transformer import (
     TimeSeriesTransformer,
     TransformerConfig,
 )
+from .rnn import (
+    HierarchicalRNN,
+    TimeSeriesRNN,
+    RNNConfig,
+)
 
 __all__ = [
     "BaseAutoencoder",
@@ -17,4 +22,7 @@ __all__ = [
     "MLPConfig",
     "TimeSeriesTransformer",
     "TransformerConfig",
+    "HierarchicalRNN",
+    "TimeSeriesRNN",
+    "RNNConfig",
 ]
