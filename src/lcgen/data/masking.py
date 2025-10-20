@@ -180,29 +180,79 @@ def create_random_block_mask_batch(batch_size, seq_len, mask_ratio=0.15, block_s
     return mask
 
 
+# Global cache for valid masking combinations
+_MASKING_COMBINATIONS_CACHE = {}
+
+
+def _compute_valid_combinations(seq_len, min_block_size, max_block_size,
+                                min_mask_ratio, max_mask_ratio):
+    """
+    Precompute valid (block_size, num_masked_blocks, actual_ratio) combinations.
+
+    This is cached to avoid recomputing on every call.
+    """
+    cache_key = (seq_len, min_block_size, max_block_size, min_mask_ratio, max_mask_ratio)
+
+    if cache_key in _MASKING_COMBINATIONS_CACHE:
+        return _MASKING_COMBINATIONS_CACHE[cache_key]
+
+    # Generate all powers of 2 within the valid range
+    min_power = int(np.floor(np.log2(max(1, min_block_size))))
+    max_power = int(np.floor(np.log2(max_block_size)))
+
+    if max_power < min_power:
+        max_power = min_power
+
+    valid_block_sizes = [2**p for p in range(min_power, max_power + 1)]
+
+    # For each block size, find valid numbers of masked blocks
+    valid_combinations = []
+
+    for block_size in valid_block_sizes:
+        num_blocks = int(np.ceil(seq_len / block_size))
+
+        # Precompute total data in all blocks
+        total_data_in_blocks = sum([min((i+1)*block_size, seq_len) - i*block_size
+                                   for i in range(num_blocks)])
+        avg_block_size = total_data_in_blocks / num_blocks
+
+        # Try each possible number of masked blocks
+        for num_masked in range(1, num_blocks):  # At least 1 unmasked
+            expected_masked_data = num_masked * avg_block_size
+            actual_ratio = expected_masked_data / seq_len
+
+            # Check if this combination gives us the desired masking percentage
+            if min_mask_ratio <= actual_ratio <= max_mask_ratio:
+                valid_combinations.append((block_size, num_masked, actual_ratio))
+
+    # Cache the result
+    _MASKING_COMBINATIONS_CACHE[cache_key] = valid_combinations
+    return valid_combinations
+
+
 def dynamic_block_mask(x, min_block_size=1, max_block_size=None,
                        min_mask_ratio=0.1, max_mask_ratio=0.9):
     """
-    Create dynamic block mask with random block sizes and mask ratios.
+    Create dynamic block mask with power-of-2 block sizes (FAST version).
 
-    At each call, randomly samples:
-    - Block size from uniform distribution [min_block_size, max_block_size]
-    - Mask ratio from uniform distribution [min_mask_ratio, max_mask_ratio]
+    Randomly samples:
+    - Block size from powers of 2 (log-style distribution)
+    - Mask ratio uniformly from [min_mask_ratio, max_mask_ratio]
 
-    Ensures at least 1 block remains unmasked.
+    Much faster than validated version - skips expensive combination checking.
 
     Args:
         x: Tensor of shape (seq_len,) or (batch, seq_len)
         min_block_size: Minimum block size (default: 1)
         max_block_size: Maximum block size (default: seq_len // 2)
-        min_mask_ratio: Minimum masking fraction (default: 0.1)
-        max_mask_ratio: Maximum masking fraction (default: 0.9)
+        min_mask_ratio: Minimum fraction of blocks to mask (default: 0.1)
+        max_mask_ratio: Maximum fraction of blocks to mask (default: 0.9)
 
     Returns:
         masked_x: Input with masked blocks set to 0
         mask: Boolean tensor, True where input is masked
         block_size: The sampled block size (for logging)
-        mask_ratio: The sampled mask ratio (for logging)
+        actual_mask_ratio: The actual fraction of data masked (for logging)
     """
     # Determine sequence length
     if x.dim() == 1:
@@ -219,34 +269,130 @@ def dynamic_block_mask(x, min_block_size=1, max_block_size=None,
     # Ensure max_block_size is valid
     max_block_size = min(max_block_size, seq_len)
 
-    # Sample random block size and mask ratio
-    block_size = np.random.randint(min_block_size, max_block_size + 1)
+    # Sample block size from powers of 2 (log-style distribution) - FAST!
+    min_power = int(np.floor(np.log2(max(1, min_block_size))))
+    max_power = int(np.floor(np.log2(max_block_size)))
+    if max_power < min_power:
+        max_power = min_power
+
+    # Randomly select a power of 2
+    power = np.random.randint(min_power, max_power + 1)
+    block_size = 2 ** power
+
+    # Sample mask ratio uniformly
     mask_ratio = np.random.uniform(min_mask_ratio, max_mask_ratio)
 
     # Calculate number of blocks
     num_blocks = int(np.ceil(seq_len / block_size))
     num_masked = int(num_blocks * mask_ratio)
 
-    # Ensure at least 1 block is unmasked
-    num_masked = min(num_masked, num_blocks - 1)
-    num_masked = max(num_masked, 1)  # Ensure at least 1 block is masked
+    # Ensure at least 1 block is unmasked and at least 1 is masked
+    num_masked = max(1, min(num_masked, num_blocks - 1))
 
     # Randomly select blocks to mask
-    masked_blocks = np.random.choice(np.arange(num_blocks), size=num_masked, replace=False)
+    masked_blocks = np.random.choice(num_blocks, size=num_masked, replace=False)
 
-    # Create masked version
-    x_masked = x.clone()
-    mask = torch.zeros_like(x, dtype=torch.bool)
+    # Create boolean mask efficiently using vectorized operations
+    mask = torch.zeros(seq_len, dtype=torch.bool)
 
+    # Vectorize the masking by computing all indices at once
     for block_idx in masked_blocks:
         start = block_idx * block_size
         end = min(start + block_size, seq_len)
+        mask[start:end] = True
 
-        if batch_mode:
-            x_masked[..., start:end] = 0.0
-            mask[..., start:end] = True
-        else:
-            x_masked[start:end] = 0.0
-            mask[start:end] = True
+    # Calculate actual mask ratio
+    actual_mask_ratio = mask.sum().item() / seq_len
 
-    return x_masked, mask, block_size, mask_ratio
+    # Apply mask to data
+    x_masked = x.clone()
+    if batch_mode:
+        x_masked[..., mask] = 0.0
+    else:
+        x_masked[mask] = 0.0
+
+    return x_masked, mask, block_size, actual_mask_ratio
+
+
+def dynamic_block_mask_batch(x_batch, min_block_size=1, max_block_size=None,
+                             min_mask_ratio=0.1, max_mask_ratio=0.9):
+    """
+    Create dynamic block masks for an entire batch at once (MUCH faster).
+
+    Picks ONE (block_size, mask_ratio) combination for the batch, but varies
+    which blocks are masked per sample.
+
+    Args:
+        x_batch: Tensor of shape (batch_size, seq_len)
+        min_block_size: Minimum block size (default: 1)
+        max_block_size: Maximum block size (default: seq_len // 2)
+        min_mask_ratio: Minimum fraction of DATA to mask (default: 0.1)
+        max_mask_ratio: Maximum fraction of DATA to mask (default: 0.9)
+
+    Returns:
+        masked_batch: Batch with masked blocks set to 0
+        mask_batch: Boolean tensor [batch_size, seq_len], True where masked
+        block_size: The sampled block size (same for all samples)
+        actual_ratio: The actual fraction of data masked (same for all samples)
+    """
+    batch_size, seq_len = x_batch.shape
+
+    # Set default max block size
+    if max_block_size is None:
+        max_block_size = seq_len // 2
+
+    max_block_size = min(max_block_size, seq_len)
+
+    # Get valid combinations (cached) - ONLY ONCE for the batch
+    valid_combinations = _compute_valid_combinations(
+        seq_len, min_block_size, max_block_size, min_mask_ratio, max_mask_ratio
+    )
+
+    # Pick one combination for the entire batch
+    if len(valid_combinations) == 0:
+        # Fallback
+        min_power = int(np.floor(np.log2(max(1, min_block_size))))
+        max_power = int(np.floor(np.log2(max_block_size)))
+        if max_power < min_power:
+            max_power = min_power
+        valid_block_sizes = [2**p for p in range(min_power, max_power + 1)]
+
+        block_size = valid_block_sizes[len(valid_block_sizes) // 2]
+        num_blocks = int(np.ceil(seq_len / block_size))
+        num_masked = max(1, min(num_blocks - 1, int(num_blocks * min_mask_ratio)))
+        actual_ratio = (num_masked * block_size) / seq_len
+    else:
+        block_size, num_masked, actual_ratio = valid_combinations[
+            np.random.randint(len(valid_combinations))
+        ]
+        num_blocks = int(np.ceil(seq_len / block_size))
+
+    # VECTORIZED: Generate all random block selections at once
+    # Shape: [batch_size, num_masked] - which blocks to mask for each sample
+    masked_blocks_batch = np.array([
+        np.random.choice(num_blocks, size=num_masked, replace=False)
+        for _ in range(batch_size)
+    ])  # [batch_size, num_masked]
+
+    # Create mask tensor
+    mask_batch = torch.zeros(batch_size, seq_len, dtype=torch.bool)
+
+    # VECTORIZED: Set all masked regions at once
+    # For each masked block position
+    for i in range(num_masked):
+        # Get the block index for this position across all samples
+        block_indices = masked_blocks_batch[:, i]  # [batch_size]
+
+        # Calculate start/end for each sample
+        starts = block_indices * block_size
+        ends = np.minimum(starts + block_size, seq_len)
+
+        # Apply mask for all samples
+        for j in range(batch_size):
+            mask_batch[j, starts[j]:ends[j]] = True
+
+    # Apply masking: set masked regions to 0 (vectorized operation)
+    x_masked_batch = x_batch.clone()
+    x_masked_batch[mask_batch] = 0.0
+
+    return x_masked_batch, mask_batch, block_size, actual_ratio
