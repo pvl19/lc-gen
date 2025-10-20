@@ -147,30 +147,77 @@ Three methods to extract characteristic timescale from ACF:
 
 ## Normalization Strategy
 
-### PSD and ACF: arcsinh Transformation
+All normalizations use **arcsinh transformation** followed by **z-score** for neural network compatibility.
+
+### PSD: arcsinh + z-score
 
 ```python
-psd_normalized = arcsinh(psd_raw)
-acf_normalized = arcsinh(acf_raw)
+psd_asinh = arcsinh(psd_raw / psd_scale_factor)
+psd_normalized = (psd_asinh - mean) / std
 ```
+
+**Default**: `psd_scale_factor = 1.0`
 
 **Why arcsinh?**
 - Logarithmic behavior for large values (dynamic range compression)
 - Linear behavior near zero (preserves low-power features)
-- Symmetric around zero (handles negative ACF values)
 - Smooth and differentiable everywhere
+- No issues with zero or negative values (unlike log)
 
-### F-statistic: Z-score Normalization
+**Tuning**: Lower scale_factor → more compression of large values
+
+### ACF: arcsinh + z-score
 
 ```python
-fstat_normalized = (fstat - mean) / (std + ε)
+acf_asinh = arcsinh(acf_raw / acf_scale_factor)
+acf_normalized = (acf_asinh - mean) / std
 ```
 
-**Why z-score?**
-- F-statistics are approximately log-normal distributed
-- Z-score converts to standardized units
-- Preserves relative significance across frequencies
-- ε = 1e-8 prevents division by zero
+**Default**: `acf_scale_factor = 1.0`
+
+**Why arcsinh?**
+- Symmetric around zero (handles negative ACF values)
+- Compresses extreme positive/negative correlations
+- Preserves structure near zero
+
+**Tuning**: Lower scale_factor → more compression of extreme values
+
+### F-statistic: arcsinh + z-score (optional)
+
+```python
+# Option 1: Z-score only (default, backward compatible)
+fstat_normalized = (fstat - mean) / (std + ε)
+
+# Option 2: Arcsinh + z-score (recommended for training)
+fstat_asinh = arcsinh(fstat / fstat_scale_factor)
+fstat_normalized = (fstat_asinh - mean) / std
+```
+
+**Default**: `fstat_scale_factor = 1.0` (arcsinh + z-score) ✓ Recommended
+**Legacy**: `fstat_scale_factor = None` (z-score only, backward compatible)
+
+**Why arcsinh for F-stat?**
+- F-statistics can have extreme values (>100) for strong periodic signals
+- Arcsinh compresses these outliers (e.g., 100 → 5.3 after arcsinh)
+- Better dynamic range for neural networks
+- Typical output range: [-2, 4] vs [-2, 30] without arcsinh
+
+**Impact of arcsinh normalization**:
+```
+Without arcsinh (None): F-stat range = [-1.21, 6.27]
+With arcsinh (1.0):     F-stat range = [-1.64, 3.31]  ✓ Better for training
+```
+
+### Configuring Normalization
+
+```python
+result = preprocess_lightcurve_multimodal(
+    time, flux, flux_err,
+    psd_scale_factor=1.0,     # PSD compression
+    acf_scale_factor=1.0,     # ACF compression
+    fstat_scale_factor=1.0,   # Enable arcsinh for F-stat
+)
+```
 
 ## Frequency Grid
 
