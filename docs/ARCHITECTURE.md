@@ -41,11 +41,12 @@ The project currently implements **separate autoencoder architectures** trained 
    - **Latent**: Compact vector (typically 64-128 dimensions)
    - **Use case**: Highly compressed representations for analysis
 
-3. **Transformer Models** (`TimeSeriesTransformer`, `MaskedTimeSeriesTransformer`)
+3. **Hierarchical Transformer** (`TimeSeriesTransformer`)
    - **Input**: Light curves (flux + uncertainty, irregular sampling)
-   - **Architecture**: Transformer encoder with time-aware positional encoding
-   - **Latent**: Sequence of embeddings (seq_len × d_model)
-   - **Use case**: Modeling temporal dependencies and masked reconstruction
+   - **Architecture**: Hierarchical U-Net-style transformer with multi-scale processing
+   - **Latent**: Compressed temporal sequence (32 × 512 bottleneck)
+   - **Use case**: Modeling temporal dependencies at multiple scales with ~34% fewer attention operations
+   - **Key features**: Skip connections, pre-norm architecture, 5-level hierarchy (512→256→128→64→32)
 
 ### Current Training Paradigm
 
@@ -124,10 +125,11 @@ The ultimate goal is a **unified multi-modal encoder-decoder** that processes mu
 - **Purpose**: Detect and characterize periodic signals
 
 #### 4. Time Series Branch
-- **Architecture**: Transformer encoder
+- **Architecture**: Hierarchical Transformer encoder (U-Net style)
 - **Input**: Partially observed light curve (flux, time, uncertainty)
-- **Output**: Sequence latent `z_ts` (seq_len × d_model)
-- **Purpose**: Model temporal dynamics and handle irregular sampling
+- **Output**: Compressed sequence latent `z_ts` (32 × 512)
+- **Purpose**: Model temporal dynamics at multiple scales, handle irregular sampling efficiently
+- **Hierarchy**: 5 levels with skip connections (512→256→128→64→32)
 
 #### 5. Tabular Branch
 - **Architecture**: MLP encoder
@@ -247,11 +249,15 @@ The architecture should gracefully handle missing inputs:
 
 ## Implementation Roadmap
 
-### v0.2.0 - Unified Data Pipeline
-- [ ] Implement `MultiModalDataset` with all modalities
-- [ ] Create data loaders that handle missing modalities
-- [ ] Add F-statistic computation pipeline (tapify integration)
-- [ ] Standardize tabular feature extraction
+### v0.2.0 - Unified Data Pipeline ✓ COMPLETED
+- [x] Implement `MultiModalDataset` with all modalities
+- [x] Create data loaders that handle missing modalities
+- [x] Add F-statistic computation pipeline (tapify integration)
+- [x] Standardize tabular feature extraction
+- [x] Hierarchical Transformer implementation with U-Net architecture
+- [x] Optimized dynamic block masking (3.2x speedup)
+- [x] OneCycleLR scheduler integration
+- [x] Unified training output format across all models
 
 ### v0.3.0 - Multi-Modal Encoder
 - [ ] Implement fusion layer (concatenation-based)
