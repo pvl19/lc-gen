@@ -5,7 +5,6 @@ from .unet import PowerSpectrumUNetAutoencoder, UNetConfig
 from .mlp import MLPAutoencoder, MLPConfig
 from .transformer import (
     TimeSeriesTransformer,
-    MaskedTimeSeriesTransformer,
     TransformerConfig,
 )
 
@@ -17,6 +16,5 @@ __all__ = [
     "MLPAutoencoder",
     "MLPConfig",
     "TimeSeriesTransformer",
-    "MaskedTimeSeriesTransformer",
     "TransformerConfig",
 ]
