@@ -1,0 +1,63 @@
+# Hierarchical RNN (minLSTM/minGRU) Configuration
+# Based on "Were RNNs All We Needed?" (arXiv:2410.01201)
+
+model:
+  model_type: rnn
+  model_name: hierarchical_rnn_lc
+
+  # Input
+  input_dim: 2  # flux + mask
+  input_length: 512
+
+  # Architecture
+  encoder_dims: [64, 128, 256, 512]  # Multi-scale hierarchy
+  rnn_type: minGRU  # Options: minGRU, minlstm (minGRU is simpler and often performs better)
+  num_layers_per_level: 2  # RNN layers per hierarchy level
+  dropout: 0.0  # No dropout (like Transformer and UNet)
+
+  # Positional encoding (time-aware)
+  min_period: 0.00278  # ~4 minutes in days
+  max_period: 1640.0   # ~4.5 years in days
+  num_freqs: 32
+
+# Training configuration
+training:
+  # Optimizer
+  optimizer: adamw
+  learning_rate: 1e-3
+  weight_decay: 0.01
+
+  # Scheduler (OneCycleLR - same as Transformer)
+  scheduler_type: onecycle
+  pct_start: 0.1
+  div_factor: 1e2
+  final_div_factor: 1e2
+
+  # Gradient clipping
+  clip_gradients: true
+  max_grad_norm: 1.0
+
+  # Batch size
+  batch_size: 32
+
+  # Epochs
+  epochs: 50
+
+# Data configuration
+data:
+  data_path: ./data/mock_lightcurves/timeseries.h5
+  val_split: 0.1
+
+  # Dynamic masking (optimized power-of-2 sampling)
+  mask_ratio: 0.3  # 30% masking
+  min_block_size: 16
+  max_block_size: 64
+
+# Experiment tracking
+experiment_name: hierarchical_rnn_lc
+version: v01
+save_dir: ./models/rnn
+
+# Hardware
+device: cuda  # or cpu
+mixed_precision: false  # FP16 training (optional)

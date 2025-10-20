@@ -90,6 +90,13 @@ python scripts/train_transformer_autoencoder.py \
   --epochs 50 \
   --batch_size 32 \
   --lr 1e-4
+
+# Train Hierarchical RNN (minGRU/minLSTM) on time-series
+python scripts/train_rnn_autoencoder.py \
+  --rnn_type minGRU \
+  --epochs 50 \
+  --batch_size 32 \
+  --lr 1e-3
 ```
 
 All scripts use sensible defaults and will automatically use the mock data if available.
@@ -148,6 +155,52 @@ Output (512 length, 1 channel)
 ```
 
 **Parameters:** ~26.8M
+
+### Hierarchical RNN (minLSTM/minGRU)
+
+**Key Features:**
+- **Bidirectional RNN** - Uses both past and future context for reconstruction
+- **Simplified RNN cells** - Based on "Were RNNs All We Needed?" (arXiv:2410.01201)
+- **Multi-scale temporal processing** - Same U-Net hierarchy as Transformer (512→256→128→64→32)
+- **Skip connections** - Preserves fine-scale temporal information
+- **Two cell types** - minLSTM or minGRU (same parameter count)
+- **Parameter-efficient** - 2× fewer parameters than Transformer
+
+**Architecture:**
+```
+Input (512 length, 2 channels)
+  ↓ Embedding (64 dim)
+  ↓ Positional Encoding
+  ↓ Level 0: Bidirectional RNN @ 64 dim → Skip → Downsample (256 length, 128 dim)
+  ↓ Level 1: Bidirectional RNN @ 128 dim → Skip → Downsample (128 length, 256 dim)
+  ↓ Level 2: Bidirectional RNN @ 256 dim → Skip → Downsample (64 length, 512 dim)
+  ↓ Level 3: Bidirectional RNN @ 512 dim → Skip → Downsample (32 length, 512 dim)
+  ↓ Bottleneck: Bidirectional RNN @ 512 dim (32 length)
+  ↓ Upsample + Skip fusion (64 length, 512 dim)
+  ↓ Decode Level 3: Bidirectional RNN @ 512 dim
+  ↓ ... (continue back to original resolution)
+Output (512 length, 1 channel)
+```
+
+**Parameters:** ~13.4M (2× fewer than Transformer, 50.96 MB)
+
+**Trade-offs:**
+- ✓ Fewer parameters than Transformer (better for deployment)
+- ✓ Bidirectional context for reconstruction
+- ✓ Fully parallelized using associative scan (O(log n) parallel depth)
+- ✓ Memory-efficient: O(n) memory usage, same as input (not O(n²))
+
+**Configuration:**
+```python
+RNNConfig(
+    input_length=512,
+    input_dim=2,  # flux + mask
+    encoder_dims=[64, 128, 256, 512],
+    rnn_type='minGRU',  # or 'minlstm' (minGRU is simpler and often better)
+    num_layers_per_level=2,
+    bidirectional=True  # Essential for reconstruction
+)
+```
 
 ### UNet Autoencoder
 
