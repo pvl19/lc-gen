@@ -1,3 +1,4 @@
 */model_artifacts/*
 pk_star_lc_cf_norm.pickle
+pk_star_sector_f_p_fs.pickle
 transformer/star_dataset.pt
