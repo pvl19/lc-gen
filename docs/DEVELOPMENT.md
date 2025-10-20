@@ -57,7 +57,7 @@ lc-gen/
 │   │   ├── base.py            # Base classes
 │   │   ├── unet.py            # UNet autoencoder
 │   │   ├── mlp.py             # MLP autoencoder
-│   │   └── transformer.py     # Transformer models
+│   │   └── transformer.py     # Hierarchical Transformer (U-Net style)
 │   ├── data/                   # Data processing
 │   │   ├── datasets.py        # PyTorch datasets
 │   │   ├── preprocessing.py   # Normalization functions
@@ -74,6 +74,12 @@ lc-gen/
 │       └── logging.py         # Logging utilities
 ├── configs/                    # YAML configurations
 ├── scripts/                    # CLI tools
+│   ├── train_transformer_autoencoder.py  # Hierarchical Transformer training
+│   ├── train_mlp_autoencoder.py         # MLP training
+│   ├── train_unet_autoencoder.py        # UNet training
+│   ├── generate_mock_data.py            # Mock LC generation
+│   ├── preprocess_mock_data.py          # Multi-modal preprocessing
+│   └── convert_timeseries_to_h5.py      # Time-series conversion
 ├── experiments/                # Notebooks and results
 │   ├── notebooks/             # Jupyter notebooks
 │   └── results/               # Saved models and logs

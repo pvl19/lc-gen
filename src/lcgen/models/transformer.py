@@ -1,41 +1,46 @@
-"""Transformer models for time-series light curve reconstruction"""
+"""Hierarchical U-Net-style Transformer for time-series light curve reconstruction"""
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict, List
 
 from .base import BaseAutoencoder, ModelConfig
 
 
 @dataclass
 class TransformerConfig(ModelConfig):
-    """Configuration for Transformer models"""
+    """Configuration for hierarchical Transformer autoencoder"""
     model_type: str = "transformer"
     model_name: str = "transformer_lc"
 
     # Architecture
-    input_dim: int = 2  # flux + flux_err
-    embed_dim: int = 128
-    d_model: int = 128
-    nhead: int = 4
-    num_layers: int = 4
-    ff_dim: int = 256
-    dropout: float = 0.1
+    input_dim: int = 2  # flux + mask (explicit mask channel)
+    input_length: int = 512  # Sequence length
+    encoder_dims: List[int] = field(default_factory=lambda: [64, 128, 256, 512])
+    num_layers: int = 4  # Number of hierarchical levels
+    nhead: int = 4  # Number of attention heads
+    num_transformer_blocks: int = 2  # Transformer blocks per level
+    dropout: float = 0.0  # No dropout, consistent with MLP/UNet
 
-    # Positional encoding
-    min_period: float = 0.00278  # Minimum period in days
-    max_period: float = 1640.0   # Maximum period in days
+    # Positional encoding (for time-series)
+    min_period: float = 0.00278  # Minimum period in days (~4 minutes)
+    max_period: float = 1640.0   # Maximum period in days (~45 hours)
 
-    # Masking
-    use_learnable_mask: bool = False  # Use learnable mask tokens
+    def __post_init__(self):
+        """Compute derived properties after initialization"""
+        super().__post_init__()
+        # Ensure num_layers matches encoder_dims
+        if len(self.encoder_dims) != self.num_layers:
+            self.num_layers = len(self.encoder_dims)
 
     @property
     def latent_dim(self) -> int:
-        """Latent dimension is d_model"""
-        return self.d_model
+        """Latent dimension is channels * spatial_size at bottleneck"""
+        bottleneck_spatial_size = self.input_length // (2 ** self.num_layers)
+        return self.encoder_dims[-1] * bottleneck_spatial_size
 
 
 class TimeChannelPositionalEncoding(nn.Module):
@@ -43,16 +48,20 @@ class TimeChannelPositionalEncoding(nn.Module):
     Positional encoding based on actual time values (not indices).
 
     Uses log-spaced frequencies to encode time information across
-    multiple scales.
+    multiple scales, designed for astrophysical light curves.
     """
 
     def __init__(self, embed_dim: int, min_period: float, max_period: float):
         super().__init__()
+
+        # Ensure embed_dim is even for sin/cos pairing
+        assert embed_dim % 2 == 0, f"embed_dim must be even, got {embed_dim}"
+
         self.embed_dim = embed_dim
         self.min_period = min_period
         self.max_period = max_period
 
-        # Precompute angular frequencies (log-spaced)
+        # Precompute angular frequencies (log-spaced for multi-scale coverage)
         num_freqs = embed_dim // 2
         periods = torch.logspace(np.log10(min_period), np.log10(max_period), num_freqs)
         self.register_buffer("div_term", 2 * np.pi / periods)  # shape: (num_freqs,)
@@ -63,300 +72,491 @@ class TimeChannelPositionalEncoding(nn.Module):
 
         Args:
             x: Input embeddings (batch, seq_len, embed_dim)
-            t: Time values (batch, seq_len, 1) - real timestamps
+            t: Time values (batch, seq_len) or (batch, seq_len, 1) - real timestamps
 
         Returns:
             x + positional encoding
         """
         batch_size, seq_len, _ = x.shape
 
-        # Normalize time to [0,1] for stability
-        t_min, t_max = t.min(), t.max()
-        t_norm = (t - t_min) / (t_max - t_min + 1e-8)
+        # Handle time dimension
+        if t.dim() == 3:
+            t = t.squeeze(-1)  # (batch, seq_len)
 
+        # Use raw timestamps (sinusoidal encoding is scale-invariant)
         # Compute angles: (batch, seq_len, num_freqs)
-        angles = t_norm * self.div_term.unsqueeze(0).unsqueeze(0)
+        t_expanded = t.unsqueeze(-1)  # (batch, seq_len, 1)
+        angles = t_expanded * self.div_term.unsqueeze(0).unsqueeze(0)
 
         # Sin/cos encoding: (batch, seq_len, embed_dim)
-        pe = torch.zeros(batch_size, seq_len, self.embed_dim, device=x.device)
+        pe = torch.zeros(batch_size, seq_len, self.embed_dim, device=x.device, dtype=x.dtype)
         pe[:, :, 0::2] = torch.sin(angles)
         pe[:, :, 1::2] = torch.cos(angles)
 
         return x + pe
 
 
-class SingleHeadAttention(nn.Module):
-    """Simple single-head attention mechanism"""
+class TransformerBlock(nn.Module):
+    """
+    Pre-norm Transformer block with multi-head attention.
 
-    def __init__(self, embed_dim: int):
+    Uses pre-norm architecture (LayerNorm before attention/FFN) for better
+    training stability.
+    """
+
+    def __init__(self, d_model: int, nhead: int, ff_dim: int, dropout: float = 0.0):
         super().__init__()
-        self.query = nn.Linear(embed_dim, embed_dim)
-        self.key = nn.Linear(embed_dim, embed_dim)
-        self.value = nn.Linear(embed_dim, embed_dim)
-        self.scale = embed_dim ** 0.5
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Pre-norm: LayerNorm before attention
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            d_model,
+            nhead,
+            dropout=dropout,
+            batch_first=True  # (batch, seq, feature) format
+        )
+
+        # Pre-norm: LayerNorm before feedforward
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, ff_dim),
+            nn.GELU(),  # GELU activation, consistent with MLP/UNet
+            nn.Linear(ff_dim, d_model),
+        )
+
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
-        Single-head self-attention.
+        Forward pass with pre-norm architecture.
 
         Args:
-            x: Input (batch, seq_len, embed_dim)
+            x: Input (batch, seq_len, d_model)
+            key_padding_mask: Optional padding mask (batch, seq_len)
 
         Returns:
-            output: Attention output
-            attn_weights: Attention weights
+            Output (batch, seq_len, d_model)
         """
-        Q = self.query(x)
-        K = self.key(x)
-        V = self.value(x)
-
-        # Attention scores
-        scores = torch.bmm(Q, K.transpose(1, 2)) / self.scale
-        attn_weights = F.softmax(scores, dim=-1)
-
-        # Weighted sum
-        out = torch.bmm(attn_weights, V)
-        return out, attn_weights
-
-
-class TransformerEncoderBlock(nn.Module):
-    """Single transformer encoder block"""
-
-    def __init__(self, embed_dim: int, ff_dim: int, dropout: float = 0.1):
-        super().__init__()
-        self.attn = SingleHeadAttention(embed_dim)
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.ff = nn.Sequential(
-            nn.Linear(embed_dim, ff_dim),
-            nn.ReLU(),
-            nn.Linear(ff_dim, embed_dim),
+        # Pre-norm multi-head attention with residual
+        x_norm = self.norm1(x)
+        attn_out, _ = self.attn(
+            x_norm, x_norm, x_norm,
+            key_padding_mask=key_padding_mask
         )
-        self.norm2 = nn.LayerNorm(embed_dim)
-        self.dropout = nn.Dropout(dropout)
+        x = x + self.dropout(attn_out)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass with residual connections"""
-        # Attention + Residual
-        attn_out, attn_weights = self.attn(x)
-        x = self.norm1(x + self.dropout(attn_out))
+        # Pre-norm feedforward with residual
+        x_norm = self.norm2(x)
+        ff_out = self.ff(x_norm)
+        x = x + self.dropout(ff_out)
 
-        # Feedforward + Residual
-        ff_out = self.ff(x)
-        x = self.norm2(x + self.dropout(ff_out))
-
-        return x, attn_weights
+        return x
 
 
-class TransformerEncoder(nn.Module):
-    """Stack of transformer encoder blocks"""
+class Downsample1D(nn.Module):
+    """Downsample sequence by factor of 2 using strided convolution"""
 
-    def __init__(self, embed_dim: int, ff_dim: int, num_layers: int = 1, dropout: float = 0.1):
+    def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        self.layers = nn.ModuleList([
-            TransformerEncoderBlock(embed_dim, ff_dim, dropout)
-            for _ in range(num_layers)
+        self.conv = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=2,
+            padding=1
+        )
+        self.norm = nn.LayerNorm(out_channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, seq_len, channels)
+        Returns:
+            (batch, seq_len//2, out_channels)
+        """
+        # Transpose to (batch, channels, seq_len)
+        x = x.transpose(1, 2)
+        x = self.conv(x)
+        # Transpose back to (batch, seq_len//2, channels)
+        x = x.transpose(1, 2)
+        x = self.norm(x)
+        return x
+
+
+class Upsample1D(nn.Module):
+    """Upsample sequence by factor of 2 using transposed convolution"""
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.conv = nn.ConvTranspose1d(
+            in_channels,
+            out_channels,
+            kernel_size=4,
+            stride=2,
+            padding=1
+        )
+        self.norm = nn.LayerNorm(out_channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, seq_len, channels)
+        Returns:
+            (batch, seq_len*2, out_channels)
+        """
+        # Transpose to (batch, channels, seq_len)
+        x = x.transpose(1, 2)
+        x = self.conv(x)
+        # Transpose back to (batch, seq_len*2, channels)
+        x = x.transpose(1, 2)
+        x = self.norm(x)
+        return x
+
+
+class HierarchicalTransformerEncoder(nn.Module):
+    """
+    Hierarchical U-Net-style Transformer encoder.
+
+    Progressive downsampling with Transformer blocks at each level.
+    Stores skip connections for decoder.
+    """
+
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        print(f"Building Hierarchical Transformer Encoder with {config.num_layers} levels")
+
+        self.num_layers = config.num_layers
+        self.encoder_dims = config.encoder_dims
+
+        # Initial embedding layer
+        self.embedding = nn.Sequential(
+            nn.Linear(config.input_dim, config.encoder_dims[0]),
+            nn.LayerNorm(config.encoder_dims[0]),
+            nn.GELU(),
+        )
+
+        # Positional encoding (optional, for time-series)
+        self.pos_encoding = TimeChannelPositionalEncoding(
+            config.encoder_dims[0],
+            config.min_period,
+            config.max_period
+        )
+
+        # Encoder levels with downsampling
+        self.encoder_levels = nn.ModuleList()
+        for i in range(self.num_layers):
+            in_dim = config.encoder_dims[i]
+            out_dim = config.encoder_dims[i+1] if i+1 < len(config.encoder_dims) else config.encoder_dims[-1]
+
+            # Transformer blocks at CURRENT resolution (in_dim, before downsampling)
+            transformer_blocks = nn.ModuleList([
+                TransformerBlock(
+                    d_model=in_dim,  # Process at current resolution
+                    nhead=config.nhead,
+                    ff_dim=in_dim * 4,  # Standard 4x expansion
+                    dropout=config.dropout
+                )
+                for _ in range(config.num_transformer_blocks)
+            ])
+
+            # Downsampling layer (applies after transformer blocks)
+            downsample = Downsample1D(in_dim, out_dim)
+
+            self.encoder_levels.append(nn.ModuleDict({
+                'downsample': downsample,
+                'transformer_blocks': transformer_blocks
+            }))
+
+        # Bottleneck
+        bottleneck_dim = config.encoder_dims[-1]
+        self.bottleneck = nn.ModuleList([
+            TransformerBlock(
+                d_model=bottleneck_dim,
+                nhead=config.nhead,
+                ff_dim=bottleneck_dim * 4,
+                dropout=config.dropout
+            )
+            for _ in range(config.num_transformer_blocks)
         ])
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, list]:
-        """Forward through all layers, collecting attention maps"""
-        attn_maps = []
-        for layer in self.layers:
-            x, attn_weights = layer(x)
-            attn_maps.append(attn_weights)
-        return x, attn_maps
+        # Calculate expected bottleneck size
+        self.expected_bottleneck_length = config.input_length // (2 ** self.num_layers)
+        print(f"Expected bottleneck spatial size: {self.expected_bottleneck_length}")
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        Forward pass through hierarchical encoder.
+
+        Args:
+            x: Input (batch, seq_len, input_dim) where input_dim = [flux, mask]
+            t: Timestamps (batch, seq_len) - optional for positional encoding
+            key_padding_mask: Optional padding mask (batch, seq_len)
+
+        Returns:
+            bottleneck_features: Encoded representation (batch, seq_len_small, d_model)
+            skip_connections: List of skip connection tensors
+        """
+        # Initial embedding
+        x = self.embedding(x)
+
+        # Add positional encoding if timestamps provided
+        if t is not None:
+            x = self.pos_encoding(x, t)
+
+        skip_connections = []
+
+        # Progressive downsampling with Transformer blocks
+        for i, level in enumerate(self.encoder_levels):
+            # Apply Transformer blocks at CURRENT resolution (before downsampling)
+            for transformer_block in level['transformer_blocks']:
+                # Adjust padding mask for current resolution
+                level_padding_mask = None
+                if key_padding_mask is not None:
+                    # Adjust padding mask for current resolution
+                    level_padding_mask = key_padding_mask[:, ::2**i] if i > 0 else key_padding_mask
+
+                x = transformer_block(x, level_padding_mask)
+
+            # Store skip connection BEFORE downsampling (like UNet)
+            skip_connections.append(x.clone())
+
+            # Downsample for next level
+            x = level['downsample'](x)
+
+        # Apply bottleneck Transformer blocks
+        for transformer_block in self.bottleneck:
+            bottleneck_padding_mask = None
+            if key_padding_mask is not None:
+                bottleneck_padding_mask = key_padding_mask[:, ::2**self.num_layers]
+
+            x = transformer_block(x, bottleneck_padding_mask)
+
+        return x, skip_connections
+
+
+class HierarchicalTransformerDecoder(nn.Module):
+    """
+    Hierarchical U-Net-style Transformer decoder.
+
+    Progressive upsampling with skip connections from encoder.
+    """
+
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        print(f"Building Hierarchical Transformer Decoder with {config.num_layers} levels")
+
+        self.num_layers = config.num_layers
+        self.encoder_dims = config.encoder_dims
+
+        # Decoder levels with upsampling
+        self.decoder_levels = nn.ModuleList()
+        for i in reversed(range(self.num_layers)):
+            in_dim = config.encoder_dims[i+1] if i+1 < len(config.encoder_dims) else config.encoder_dims[-1]
+            out_dim = config.encoder_dims[i]
+
+            # Upsampling layer
+            upsample = Upsample1D(in_dim, out_dim)
+
+            # Fusion layer (combine skip connection)
+            # After concatenation: out_dim (from upsample) + out_dim (from skip) = 2*out_dim
+            fusion = nn.Sequential(
+                nn.Linear(out_dim * 2, out_dim),
+                nn.LayerNorm(out_dim),
+                nn.GELU()
+            )
+
+            # Transformer blocks at this resolution
+            transformer_blocks = nn.ModuleList([
+                TransformerBlock(
+                    d_model=out_dim,
+                    nhead=config.nhead,
+                    ff_dim=out_dim * 4,
+                    dropout=config.dropout
+                )
+                for _ in range(config.num_transformer_blocks)
+            ])
+
+            self.decoder_levels.append(nn.ModuleDict({
+                'upsample': upsample,
+                'fusion': fusion,
+                'transformer_blocks': transformer_blocks
+            }))
+
+        # Final output projection
+        self.output_proj = nn.Linear(config.encoder_dims[0], 1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        skip_connections: List[torch.Tensor],
+        key_padding_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Forward pass through hierarchical decoder.
+
+        Args:
+            x: Bottleneck features (batch, seq_len_small, d_model)
+            skip_connections: List of skip connections from encoder (reversed order)
+            key_padding_mask: Optional padding mask (batch, original_seq_len)
+
+        Returns:
+            Reconstructed output (batch, seq_len, 1)
+        """
+        # Reverse skip connections to match decoder order
+        skip_connections = list(reversed(skip_connections))
+
+        # Progressive upsampling with skip connections
+        for i, level in enumerate(self.decoder_levels):
+            # Upsample
+            x = level['upsample'](x)
+
+            # Get skip connection
+            skip = skip_connections[i]
+
+            # Handle size mismatches due to downsampling/upsampling
+            if x.shape[1] != skip.shape[1]:
+                # Interpolate to match sizes
+                if x.shape[1] < skip.shape[1]:
+                    x = F.interpolate(
+                        x.transpose(1, 2),
+                        size=skip.shape[1],
+                        mode='linear',
+                        align_corners=False
+                    ).transpose(1, 2)
+                else:
+                    skip = F.interpolate(
+                        skip.transpose(1, 2),
+                        size=x.shape[1],
+                        mode='linear',
+                        align_corners=False
+                    ).transpose(1, 2)
+
+            # Concatenate with skip connection
+            x = torch.cat([x, skip], dim=-1)
+
+            # Fusion
+            x = level['fusion'](x)
+
+            # Apply Transformer blocks at this resolution
+            for transformer_block in level['transformer_blocks']:
+                # Adjust padding mask for current resolution
+                level_padding_mask = None
+                if key_padding_mask is not None:
+                    # Upsample padding mask to current resolution
+                    current_scale = 2 ** (self.num_layers - i)
+                    level_padding_mask = key_padding_mask[:, ::current_scale]
+                    if level_padding_mask.shape[1] != x.shape[1]:
+                        # Pad or truncate to match
+                        if level_padding_mask.shape[1] < x.shape[1]:
+                            pad_size = x.shape[1] - level_padding_mask.shape[1]
+                            level_padding_mask = F.pad(level_padding_mask, (0, pad_size))
+                        else:
+                            level_padding_mask = level_padding_mask[:, :x.shape[1]]
+
+                x = transformer_block(x, level_padding_mask)
+
+        # Final output projection
+        x = self.output_proj(x)
+
+        return x
 
 
 class TimeSeriesTransformer(BaseAutoencoder):
     """
-    Basic transformer for light curve time series.
+    Hierarchical U-Net-style Transformer for time-series reconstruction.
 
-    Uses time-aware positional encoding based on actual timestamps.
+    Features:
+    - Multi-scale hierarchical processing (like UNet)
+    - Skip connections from encoder to decoder
+    - Pre-norm multi-head attention at each level
+    - Time-aware positional encoding (optional)
+    - Explicit mask channel
+    - O(n²/4 + n²/16 + ...) complexity vs flat O(n²)
     """
 
     def __init__(self, config: TransformerConfig):
         super().__init__(config)
+        self.config = config
 
-        self.input_proj = nn.Linear(config.input_dim, config.embed_dim)
-        self.pos_encoding = TimeChannelPositionalEncoding(
-            config.embed_dim,
-            config.min_period,
-            config.max_period
-        )
-        self.encoder_module = TransformerEncoder(
-            config.embed_dim,
-            config.ff_dim,
-            config.num_layers,
-            config.dropout
-        )
-        self.output_proj = nn.Linear(config.embed_dim, 1)  # Output flux only
+        # Hierarchical encoder
+        self.encoder = HierarchicalTransformerEncoder(config)
 
-    def encode(self, x: torch.Tensor, t: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Hierarchical decoder
+        self.decoder = HierarchicalTransformerDecoder(config)
+
+        print(f"Hierarchical Transformer: {self.count_parameters():,} parameters")
+
+    def encode(
+        self,
+        x: torch.Tensor,
+        t: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Encode time series to latent representation.
 
         Args:
-            x: Input (batch, seq_len, channels) or (batch, seq_len, 2)
-            t: Timestamps (batch, seq_len, 1)
+            x: Input (batch, seq_len, input_dim) where input_dim = [flux, mask]
+            t: Timestamps (batch, seq_len) - optional for positional encoding
+            key_padding_mask: Optional padding mask (batch, seq_len)
 
         Returns:
-            Encoded representation
+            encoded: Bottleneck representation (batch, seq_len_small, d_model)
+            skip_connections: List of skip connections
         """
-        if t is None:
-            # If no timestamps provided, use indices
-            seq_len = x.shape[1]
-            t = torch.arange(seq_len, device=x.device).unsqueeze(0).unsqueeze(-1)
-            t = t.expand(x.shape[0], -1, -1).float()
+        return self.encoder(x, t, key_padding_mask)
 
-        x = self.input_proj(x)
-        x = self.pos_encoding(x, t)
-        encoded, _ = self.encoder_module(x)
-        return encoded
-
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
+    def decode(
+        self,
+        z: torch.Tensor,
+        skip_connections: List[torch.Tensor],
+        key_padding_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Decode latent representation to flux values.
 
         Args:
-            z: Latent representation
+            z: Latent representation (batch, seq_len_small, d_model)
+            skip_connections: Skip connections from encoder
+            key_padding_mask: Optional padding mask (batch, original_seq_len)
 
         Returns:
-            Reconstructed flux
+            Reconstructed flux (batch, seq_len, 1)
         """
-        return self.output_proj(z)
+        return self.decoder(z, skip_connections, key_padding_mask)
 
-    def forward(self, x: torch.Tensor, t: Optional[torch.Tensor] = None) -> dict:
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None
+    ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass through transformer.
+        Forward pass through hierarchical transformer.
 
         Args:
-            x: Input (batch, seq_len, channels)
-            t: Timestamps (batch, seq_len, 1)
+            x: Input (batch, seq_len, input_dim) where input_dim = [flux, mask]
+            t: Timestamps (batch, seq_len) - optional for positional encoding
+            key_padding_mask: Optional padding mask (batch, seq_len)
 
         Returns:
-            Dictionary with reconstructed flux and encoded representation
+            Dictionary with:
+                - 'reconstructed': Reconstructed flux (batch, seq_len, 1)
+                - 'encoded': Bottleneck representation
         """
-        encoded = self.encode(x, t)
-        reconstructed = self.decode(encoded)
+        encoded, skip_connections = self.encode(x, t, key_padding_mask)
+        reconstructed = self.decode(encoded, skip_connections, key_padding_mask)
 
         return {
             'reconstructed': reconstructed,
             'encoded': encoded
         }
-
-
-class MaskedTimeSeriesTransformer(BaseAutoencoder):
-    """
-    Transformer with learnable mask tokens for masked reconstruction.
-
-    Useful for training with masked autoencoding objectives.
-    """
-
-    def __init__(self, config: TransformerConfig):
-        super().__init__(config)
-
-        # Input projection
-        self.input_projection = nn.Linear(config.input_dim, config.d_model)
-
-        # Learnable mask token - one per feature dimension
-        self.mask_token = nn.Parameter(torch.randn(1, 1, config.d_model) * 0.02)
-
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.d_model,
-            nhead=config.nhead,
-            dim_feedforward=config.d_model * 4,
-            dropout=config.dropout,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
-
-        # Output projection back to original space
-        self.output_projection = nn.Linear(config.d_model, 1)
-
-    def create_positional_encoding(self, timestamps: torch.Tensor, d_model: int) -> torch.Tensor:
-        """
-        Create sinusoidal positional encoding based on actual timestamps.
-
-        Args:
-            timestamps: (batch, seq_len) - actual time values
-            d_model: Dimension of model
-
-        Returns:
-            Positional encoding (batch, seq_len, d_model)
-        """
-        batch_size, seq_len = timestamps.shape
-        pe = torch.zeros(batch_size, seq_len, d_model, device=timestamps.device)
-
-        # Create sinusoidal features
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2, device=timestamps.device) *
-            -(np.log(10000.0) / d_model)
-        )
-
-        # Expand timestamps for broadcasting
-        pos = timestamps.unsqueeze(-1)  # [batch, seq_len, 1]
-
-        # Apply sinusoidal transformation
-        pe[..., 0::2] = torch.sin(pos * div_term)
-        pe[..., 1::2] = torch.cos(pos * div_term)
-
-        return pe
-
-    def encode(self, x: torch.Tensor, timestamps: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Encode time series with optional masking.
-
-        Args:
-            x: Input (batch, seq_len, input_dim)
-            timestamps: Timestamps (batch, seq_len)
-            mask: Boolean mask (batch, seq_len), True for masked positions
-
-        Returns:
-            Encoded representation
-        """
-        batch_size, seq_len, _ = x.shape
-
-        # Project input to model dimension
-        x_projected = self.input_projection(x)
-
-        # Add positional encoding
-        pos_encoding = self.create_positional_encoding(timestamps, self.input_projection.out_features)
-        x_with_pos = x_projected + pos_encoding
-
-        # Apply mask tokens if provided
-        if mask is not None:
-            mask_expanded = mask.unsqueeze(-1).expand_as(x_with_pos)
-            mask_tokens = self.mask_token.expand(batch_size, seq_len, -1)
-            # Keep positional encoding but replace values with mask token
-            x_with_pos = torch.where(
-                mask_expanded,
-                mask_tokens + pos_encoding,  # mask token + positional info
-                x_with_pos
-            )
-
-        # Pass through transformer
-        transformer_out = self.transformer(x_with_pos)
-
-        return transformer_out
-
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """Decode latent representation to flux"""
-        return self.output_projection(z)
-
-    def forward(self, x: torch.Tensor, timestamps: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Forward pass with optional masking.
-
-        Args:
-            x: Input (batch, seq_len, input_dim)
-            timestamps: Timestamps (batch, seq_len)
-            mask: Boolean mask (batch, seq_len), True for masked positions
-
-        Returns:
-            output: Reconstructed flux
-            mask: Mask used (for loss calculation)
-        """
-        encoded = self.encode(x, timestamps, mask)
-        output = self.decode(encoded)
-
-        return output, mask

@@ -4,20 +4,17 @@
 model:
   model_type: transformer
   model_name: transformer_lc
-  input_dim: 2  # flux + flux_err
-  embed_dim: 128
-  d_model: 128
-  nhead: 4
-  num_layers: 4
-  ff_dim: 512
-  dropout: 0.1
+  input_dim: 2  # flux + mask (explicit mask channel)
+  input_length: 512  # Sequence length
+  encoder_dims: [64, 128, 256, 512]  # Hierarchical dimensions (like UNet)
+  num_layers: 4  # Number of hierarchical levels
+  nhead: 4  # Number of attention heads
+  num_transformer_blocks: 2  # Transformer blocks per level
+  dropout: 0.0  # No dropout, consistent with MLP/UNet
 
-  # Positional encoding
+  # Positional encoding (log-spaced frequencies for multi-scale coverage)
   min_period: 0.00278  # ~4 minutes
   max_period: 1640.0   # ~45 hours
-
-  # Masking
-  use_learnable_mask: true
 
 # Data configuration
 data:
@@ -38,30 +35,29 @@ data:
 
 # Training configuration
 training:
-  epochs: 100
+  epochs: 50
   learning_rate: 0.0001  # Lower LR for transformers
-  weight_decay: 0.01     # Higher weight decay
+  weight_decay: 0.01     # Weight decay for AdamW
   optimizer: adamw
 
   use_scheduler: true
-  scheduler_type: plateau
-  scheduler_patience: 5
-  scheduler_factor: 0.5
+  scheduler_type: onecycle  # OneCycleLR for faster convergence
+  pct_start: 0.1  # 10% warmup
+  div_factor: 1e2  # Initial LR = max_lr / 1e2
+  final_div_factor: 1e2  # Final LR = max_lr / 1e4
 
-  loss_fn: chi_squared  # Use chi-squared loss with uncertainties
+  loss_fn: mse  # MSE loss for reconstruction
 
   save_every: 10
   save_best_only: false
-  early_stopping: true
-  early_stopping_patience: 20
+  early_stopping: false  # Not needed with OneCycleLR
 
   log_every: 1
   plot_examples: true
   plot_every: 10
 
   mixed_precision: false
-  clip_gradients: true  # Important for transformers
-  max_grad_norm: 1.0
+  clip_gradients: false  # Not needed with pre-norm architecture
 
 # Paths
 output_dir: ./experiments/results/transformer

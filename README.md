@@ -4,29 +4,35 @@ Multi-modal deep learning framework for stellar light curve analysis using autoe
 
 ## Overview
 
-LC-Gen is a research project focused on learning compressed latent representations of stellar light curves using various deep learning architectures. The project combines multiple data modalities (power spectra, autocorrelation functions, F-statistics, time series, and tabular data) to reconstruct and predict light curves.
+LC-Gen is a research project focused on learning compressed latent representations of stellar light curves using various deep learning architectures. The project combines multiple data modalities (power spectra, autocorrelation functions, F-statistics, and time series) to reconstruct and predict light curves.
 
 ## Features
 
 - **Multiple Model Architectures**:
-  - UNet-based CNN autoencoders for power spectra/ACF
-  - MLP autoencoders for compact representations
-  - Transformer models for time-series light curves
+  - **Hierarchical U-Net Transformer** - Multi-scale transformer with skip connections for time-series
+  - **UNet CNN Autoencoder** - Convolutional architecture for power spectra/ACF
+  - **MLP Autoencoder** - Fully-connected networks for compact representations
 
-- **Multitaper Spectral Analysis** (NEW):
+- **Optimized Training Pipeline**:
+  - Fast dynamic block masking with power-of-2 sampling (3.2x speedup)
+  - OneCycleLR scheduler for efficient training
+  - Gradient clipping for stable transformer training
+  - Unified output format across all models
+
+- **Multitaper Spectral Analysis**:
   - Compute PSD, ACF, and F-statistics from irregular time series
   - Integrated tapify for multitaper methods (NW, K parameters)
   - Proper handling of irregular sampling via mtNUFFT
 
 - **Flexible Training**:
   - Masked autoencoding for robust representations
-  - Chi-squared loss for uncertainty-aware training
-  - Configurable via YAML files or Python API
+  - Configurable via command-line arguments or YAML files
+  - Separate losses for masked/unmasked regions
 
 - **Comprehensive Evaluation**:
-  - Multiple metrics (MSE, MAE, chi-squared, R²)
+  - Multiple metrics (MSE on masked/unmasked regions)
   - Visualization utilities for reconstructions
-  - Latent space analysis tools
+  - Training curve plotting
 
 ## Installation
 
@@ -44,76 +50,172 @@ pip install -e .
 
 ## Quick Start
 
-### Using Python API
+### 1. Generate Mock Data
+
+```bash
+# Generate 50K light curves
+python scripts/generate_mock_data.py --n_samples 50000 --output_dir data/mock_lightcurves
+
+# Preprocess for MLP/UNet (spectral features)
+python scripts/preprocess_mock_data.py \
+  --input data/mock_lightcurves/mock_lightcurves.pkl \
+  --output data/mock_lightcurves/preprocessed.h5 \
+  --batch_size 100
+
+# Convert for Transformer (time-series)
+python scripts/convert_timeseries_to_h5.py \
+  --input data/mock_lightcurves/mock_lightcurves.pkl \
+  --output data/mock_lightcurves/timeseries.h5 \
+  --max_length 512
+```
+
+### 2. Train Models
+
+```bash
+# Train MLP autoencoder on PSD
+python scripts/train_mlp_autoencoder.py \
+  --channel psd \
+  --epochs 50 \
+  --batch_size 128 \
+  --lr 1e-3
+
+# Train UNet autoencoder on ACF
+python scripts/train_unet_autoencoder.py \
+  --channel acf \
+  --epochs 50 \
+  --batch_size 128
+
+# Train Hierarchical Transformer on time-series
+python scripts/train_transformer_autoencoder.py \
+  --epochs 50 \
+  --batch_size 32 \
+  --lr 1e-4
+```
+
+All scripts use sensible defaults and will automatically use the mock data if available.
+
+### 3. Using Python API
 
 ```python
-from lcgen.models import PowerSpectrumUNetAutoencoder, UNetConfig
-from lcgen.data import normalize_ps
+from lcgen.models import TimeSeriesTransformer, TransformerConfig
 import torch
 
-# Create model
-config = UNetConfig(
+# Create hierarchical transformer
+config = TransformerConfig(
+    input_dim=2,  # flux + mask
+    input_length=512,
+    encoder_dims=[64, 128, 256, 512],  # Multi-scale hierarchy
+    nhead=4,
+    num_layers=4,
+    num_transformer_blocks=2  # Blocks per resolution
+)
+model = TimeSeriesTransformer(config)
+
+# Forward pass
+x = torch.randn(32, 512, 2)  # [batch, seq_len, channels]
+t = torch.randn(32, 512)      # timestamps
+output = model(x, t)
+reconstructed = output['reconstructed']  # (32, 512, 1)
+encoded = output['encoded']              # (32, 32, 512) bottleneck
+```
+
+## Model Architectures
+
+### Hierarchical Transformer
+
+**Key Features:**
+- **Multi-scale processing** - Attention at 512, 256, 128, 64, 32 sequence lengths
+- **Skip connections** - Like UNet, preserves fine-scale information
+- **Pre-norm architecture** - Better training stability
+- **Time-aware positional encoding** - Log-spaced frequencies for astrophysical timescales
+- **~34% fewer attention operations** compared to flat transformers
+
+**Architecture:**
+```
+Input (512 length, 2 channels)
+  ↓ Embedding (64 dim)
+  ↓ Positional Encoding
+  ↓ Level 0: Transform @ 64 dim → Skip → Downsample (256 length, 128 dim)
+  ↓ Level 1: Transform @ 128 dim → Skip → Downsample (128 length, 256 dim)
+  ↓ Level 2: Transform @ 256 dim → Skip → Downsample (64 length, 512 dim)
+  ↓ Level 3: Transform @ 512 dim → Skip → Downsample (32 length, 512 dim)
+  ↓ Bottleneck: Transform @ 512 dim (32 length)
+  ↓ Upsample + Skip fusion (64 length, 512 dim)
+  ↓ Decode Level 3: Transform @ 512 dim
+  ↓ Upsample + Skip fusion (128 length, 256 dim)
+  ↓ ... (continue back to original resolution)
+Output (512 length, 1 channel)
+```
+
+**Parameters:** ~26.8M
+
+### UNet Autoencoder
+
+**Key Features:**
+- Progressive downsampling with skip connections
+- GELU activation, LayerNorm
+- Explicit mask channel
+- Optimized for spectral data (PSD/ACF/Fstat)
+
+**Configuration:**
+```python
+UNetConfig(
     input_length=1024,
+    in_channels=2,  # data + mask
     encoder_dims=[64, 128, 256, 512],
     num_layers=4,
     activation='gelu'
 )
-model = PowerSpectrumUNetAutoencoder(config)
-
-# Forward pass
-power_spectrum = torch.randn(32, 1024)  # Batch of power spectra
-output = model(power_spectrum)
-reconstructed = output['reconstructed']
-latent = output['encoded']
 ```
 
-### Computing Spectral Features
+### MLP Autoencoder
 
+**Key Features:**
+- Symmetric encoder-decoder
+- Compact latent bottleneck
+- Fast training and inference
+- LayerNorm for stability
+
+**Configuration:**
 ```python
-from lcgen.data import compute_multitaper_psd, psd_to_acf
-import numpy as np
-
-# Load light curve (time, flux, flux_err)
-time = np.array([...])  # Irregular sampling
-flux = np.array([...])
-flux_err = np.array([...])
-
-# Compute multitaper PSD and F-statistics
-result = compute_multitaper_psd(
-    time, flux, flux_err,
-    NW=4.0,  # Time-bandwidth parameter
-    K=7,      # Number of tapers
-    return_fstat=True
+MLPConfig(
+    input_dim=2048,  # data + mask concatenated
+    encoder_hidden_dims=[512, 256, 128],
+    latent_dim=64,
+    activation='gelu'
 )
-
-# Extract features
-psd = result['psd']
-frequency = result['frequency']
-fstat = result['fstat']
-
-# Derive ACF from PSD
-lags, acf = psd_to_acf(frequency, psd)
 ```
 
-### Using CLI Scripts
+## Performance Optimizations
 
-```bash
-# Compute spectra from light curves
-python scripts/compute_spectra.py --input data/star_dataset.pt --NW 4.0 --fstat
+### Fast Dynamic Block Masking
 
-# Train a model
-python scripts/train.py --config configs/unet_ps.yaml
+We use an optimized masking strategy:
+- **Power-of-2 block sizes** for log-style distribution
+- **No validation overhead** - samples directly without pre-computing valid combinations
+- **3.2x speedup** compared to validated masking (97-104ms → 33ms per batch)
+- Applied per-sample in collate function for flexibility
 
-# Evaluate trained model
-python scripts/evaluate.py --checkpoint experiments/results/best_model.pt --visualize
+### Training Speed
+
+On 50K light curves (RTX 5080):
+- **MLP**: ~14 sec/epoch
+- **UNet**: ~20-30 sec/epoch (estimated)
+- **Transformer**: ~60-90 sec/epoch (hierarchical architecture saves ~33% vs flat)
+
+### OneCycleLR Scheduler
+
+All training scripts use OneCycleLR for faster convergence:
+```python
+OneCycleLR(
+    optimizer,
+    max_lr=lr,
+    total_steps=epochs * steps_per_epoch,
+    pct_start=0.1,       # 10% warmup
+    div_factor=1e2,      # Initial LR = max_lr / 100
+    final_div_factor=1e2 # Final LR = max_lr / 10000
+)
 ```
-
-### Using Notebooks
-
-Explore the `experiments/notebooks/` directory for interactive examples:
-- `unet_exploration.ipynb` - UNet training and analysis
-- `mlp_exploration.ipynb` - MLP autoencoder experiments
-- `transformer_exploration.ipynb` - Transformer models for light curves
 
 ## Project Structure
 
@@ -121,51 +223,85 @@ Explore the `experiments/notebooks/` directory for interactive examples:
 lc-gen/
 ├── src/lcgen/              # Main package
 │   ├── models/             # Model architectures
-│   ├── data/               # Data processing utilities
-│   ├── training/           # Training infrastructure
-│   ├── evaluation/         # Metrics and visualization
-│   └── utils/              # Configuration and logging
+│   │   ├── transformer.py # Hierarchical Transformer (NEW)
+│   │   ├── unet.py        # UNet autoencoder
+│   │   ├── mlp.py         # MLP autoencoder
+│   │   └── base.py        # Base classes
+│   ├── data/               # Data processing
+│   │   ├── preprocessing.py # Multitaper spectral analysis
+│   │   ├── masking.py      # Fast dynamic block masking (OPTIMIZED)
+│   │   └── datasets.py     # PyTorch datasets
+│   └── utils/              # Utilities
+├── scripts/                # Training and data preparation
+│   ├── train_transformer_autoencoder.py  # Transformer training (NEW)
+│   ├── train_mlp_autoencoder.py         # MLP training
+│   ├── train_unet_autoencoder.py        # UNet training
+│   ├── generate_mock_data.py            # Mock LC generation
+│   ├── preprocess_mock_data.py          # Spectral preprocessing
+│   └── convert_timeseries_to_h5.py      # Time-series conversion
 ├── configs/                # YAML configuration files
-├── scripts/                # CLI tools for training/evaluation
-├── experiments/            # Notebooks and results
-├── tests/                  # Unit tests
-├── docs/                   # Documentation
+│   ├── transformer_lc.yaml
+│   ├── mlp_ps.yaml
+│   └── unet_ps.yaml
+├── models/                 # Saved model checkpoints
 └── data/                   # Data directory (gitignored)
+    └── mock_lightcurves/   # Generated mock data
 ```
 
 ## Data Format
 
-### Power Spectra / ACF
-- Length: 1024 frequency bins
-- Format: Normalized using arcsinh transformation
-- File type: `.pt` (PyTorch tensors) or `.pickle`
+### Spectral Features (PSD/ACF/Fstat)
+- **Format**: HDF5 with keys `['psd', 'acf', 'fstat']`
+- **Shape**: (N, 1024) for N light curves
+- **Normalization**: Arcsinh transformation
+- **Used by**: MLP and UNet autoencoders
 
-### Light Curves
-- Flux values with uncertainties
-- Irregular time sampling
-- Typical length: 720 timesteps (padded)
+### Time Series
+- **Format**: HDF5 with keys `['flux', 'time']`
+- **Shape**: (N, 512) for N light curves
+- **Normalization**: Median-centered, IQR-scaled
+- **Used by**: Hierarchical Transformer
 
-See [data/README.md](data/README.md) for detailed data format specifications.
+## Training Output
+
+All training scripts produce consistent output:
+
+```
+Using device: cuda:0
+
+Loading data from data/mock_lightcurves/preprocessed.h5...
+
+Dataset statistics:
+  Shape: (50000, 1024)
+  Range: [-3.562, 29.530]
+  Mean: -0.000
+  Std: 1.000
+
+Dataset split:
+  Train: 45000 samples
+  Val: 5000 samples
+
+Creating Hierarchical Transformer autoencoder...
+Model parameters: 26,812,289
+
+Starting training for 50 epochs...
+Dynamic masking: block size [1, 50], mask ratio [10%, 70%]
+
+Epoch 1/50
+  Train - Loss: 0.123456 | Masked: 0.234567 | Unmasked: 0.012345
+  Val   - Loss: 0.234567 | Masked: 0.345678 | Unmasked: 0.023456
+  Saved best model to models/transformer/transformer_best.pt
+...
+```
 
 ## Long-term Vision
 
 The project aims to develop a unified multi-modal architecture that:
-1. Processes power spectra, ACF, and F-statistics via CNN branches
-2. Handles irregular time series via transformers
-3. Incorporates auxiliary tabular features via MLPs
-4. Learns a shared latent representation
-5. Reconstructs/predicts light curves with uncertainties
-6. Supports forecasting and gap-filling
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full architectural vision.
-
-## Development
-
-See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for:
-- How to add new models
-- How to run tests
-- How to benchmark performance
-- Contribution guidelines
+1. Processes power spectra, ACF, and F-statistics via CNN branches ✓
+2. Handles irregular time series via hierarchical transformers ✓
+3. Learns a shared latent representation (In progress)
+4. Reconstructs/predicts light curves with uncertainties (In progress)
+5. Supports forecasting and gap-filling (Future)
 
 ## Citation
 
@@ -173,7 +309,7 @@ If you use this code in your research, please cite:
 
 ```bibtex
 @software{lc_gen2025,
-  title={LC-Gen: Multi-Modal Light Curve Reconstruction},
+  title={LC-Gen: Multi-Modal Light Curve Reconstruction with Hierarchical Transformers},
   author={LC-Gen Team},
   year={2025},
   url={https://github.com/pvl19/lc-gen}
@@ -182,7 +318,7 @@ If you use this code in your research, please cite:
 
 ## License
 
-[Add license information]
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## Contact
 
