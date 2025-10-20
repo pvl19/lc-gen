@@ -15,7 +15,8 @@ class MLPConfig(ModelConfig):
     model_name: str = "mlp_autoencoder"
 
     # Architecture
-    input_dim: int = 1024
+    input_dim: int = 2048  # 1024 data + 1024 binary mask
+    output_dim: int = 1024  # Reconstruct only the data, not the mask
     encoder_hidden_dims: List[int] = field(default_factory=lambda: [512, 256, 128])
     latent_dim: int = 64
     decoder_hidden_dims: Optional[List[int]] = None  # If None, use reverse of encoder
@@ -131,7 +132,7 @@ class MLPAutoencoder(BaseAutoencoder):
         self.decoder_module = MLPDecoder(
             config.latent_dim,
             decoder_hidden_dims,
-            config.input_dim,
+            config.output_dim,
             config.dropout,
             config.activation
         )

@@ -8,6 +8,7 @@ import numpy as np
 import argparse
 import sys
 from pathlib import Path
+from functools import partial
 from tqdm import tqdm
 import h5py
 import torch
@@ -26,44 +27,69 @@ from lcgen.data.masking import dynamic_block_mask
 class SpectralDataset(Dataset):
     """Dataset for single-channel spectral data (PSD, ACF, or F-stat)."""
 
-    def __init__(self, data, min_block_size=1, max_block_size=None,
-                 min_mask_ratio=0.1, max_mask_ratio=0.9):
+    def __init__(self, data):
         """
         Args:
             data: Numpy array of shape (N, n_bins)
-            min_block_size: Minimum block size for dynamic masking
-            max_block_size: Maximum block size (default: n_bins // 2)
-            min_mask_ratio: Minimum masking fraction
-            max_mask_ratio: Maximum masking fraction
         """
         self.data = torch.from_numpy(data).float()
-        self.min_block_size = min_block_size
-        self.max_block_size = max_block_size
-        self.min_mask_ratio = min_mask_ratio
-        self.max_mask_ratio = max_mask_ratio
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        x = self.data[idx]
+        # Just return the data - masking will be applied in collate_fn
+        return self.data[idx]
 
-        # Apply dynamic block masking (random block size and mask ratio each time)
+
+def collate_with_masking(batch, min_block_size=1, max_block_size=None,
+                         min_mask_ratio=0.1, max_mask_ratio=0.9):
+    """
+    Custom collate function that applies masking per-sample in collate_fn.
+
+    Per-sample masking with simplified power-of-2 sampling is fast enough.
+    """
+    # Stack batch into tensor
+    batch_data = torch.stack(batch, dim=0)  # [batch_size, seq_len]
+
+    batch_size, seq_len = batch_data.shape
+
+    if max_block_size is None:
+        max_block_size = seq_len // 2
+
+    # Apply masking per sample
+    batch_inputs = []
+    batch_targets = []
+    batch_masks = []
+    batch_block_sizes = []
+    batch_mask_ratios = []
+
+    for i in range(batch_size):
+        x = batch_data[i]
+
         x_masked, mask, block_size, mask_ratio = dynamic_block_mask(
             x,
-            min_block_size=self.min_block_size,
-            max_block_size=self.max_block_size,
-            min_mask_ratio=self.min_mask_ratio,
-            max_mask_ratio=self.max_mask_ratio
+            min_block_size=min_block_size,
+            max_block_size=max_block_size,
+            min_mask_ratio=min_mask_ratio,
+            max_mask_ratio=max_mask_ratio
         )
 
-        return {
-            'masked': x_masked,
-            'target': x,
-            'mask': mask,
-            'block_size': block_size,
-            'mask_ratio': mask_ratio
-        }
+        input_with_mask = torch.cat([x_masked, mask.float()], dim=0)
+
+        batch_inputs.append(input_with_mask)
+        batch_targets.append(x)
+        batch_masks.append(mask)
+        batch_block_sizes.append(block_size)
+        batch_mask_ratios.append(mask_ratio)
+
+    return {
+        'input': torch.stack(batch_inputs),
+        'target': torch.stack(batch_targets),
+        'mask': torch.stack(batch_masks),
+        'block_size': torch.tensor(batch_block_sizes),
+        'mask_ratio': torch.tensor(batch_mask_ratios)
+    }
 
 
 def load_preprocessed_data(hdf5_file, channel='psd'):
@@ -91,7 +117,7 @@ def load_preprocessed_data(hdf5_file, channel='psd'):
         return data
 
 
-def train_epoch(model, dataloader, optimizer, criterion, device):
+def train_epoch(model, dataloader, optimizer, criterion, device, scheduler=None):
     """Train for one epoch."""
     model.train()
     total_loss = 0
@@ -100,13 +126,13 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
     n_batches = 0
 
     for batch in dataloader:
-        x_masked = batch['masked'].to(device)
+        x_input = batch['input'].to(device)  # Data + mask concatenated
         x_target = batch['target'].to(device)
         mask = batch['mask'].to(device)
 
         # Forward pass
         optimizer.zero_grad()
-        output = model(x_masked)
+        output = model(x_input)
         x_recon = output['reconstructed']
 
         # Compute loss over ALL regions (both masked and unmasked)
@@ -119,6 +145,10 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
         # Backprop and optimize on full reconstruction loss
         loss.backward()
         optimizer.step()
+
+        # Step scheduler after each batch (for OneCycleLR)
+        if scheduler is not None:
+            scheduler.step()
 
         total_loss += loss.item()
         total_masked_loss += masked_loss.item()
@@ -142,12 +172,12 @@ def validate(model, dataloader, criterion, device):
 
     with torch.no_grad():
         for batch in dataloader:
-            x_masked = batch['masked'].to(device)
+            x_input = batch['input'].to(device)  # Data + mask concatenated
             x_target = batch['target'].to(device)
             mask = batch['mask'].to(device)
 
             # Forward pass
-            output = model(x_masked)
+            output = model(x_input)
             x_recon = output['reconstructed']
 
             # Compute loss over ALL regions
@@ -169,7 +199,9 @@ def validate(model, dataloader, criterion, device):
     }
 
 
-def plot_reconstruction_samples(model, dataset, device, save_path, n_samples=4):
+def plot_reconstruction_samples(model, dataset, device, save_path, n_samples=4,
+                                min_block_size=1, max_block_size=None,
+                                min_mask_ratio=0.1, max_mask_ratio=0.9):
     """Plot sample reconstructions."""
     model.eval()
 
@@ -181,12 +213,22 @@ def plot_reconstruction_samples(model, dataset, device, save_path, n_samples=4):
 
     with torch.no_grad():
         for i, idx in enumerate(indices):
-            batch = dataset[idx]
-            x_masked = batch['masked'].unsqueeze(0).to(device)
-            x_target = batch['target'].cpu().numpy()
-            mask = batch['mask'].cpu().numpy()
+            # Get raw data and apply masking
+            x = dataset[idx]
+            x_masked, mask, block_size, mask_ratio = dynamic_block_mask(
+                x,
+                min_block_size=min_block_size,
+                max_block_size=max_block_size,
+                min_mask_ratio=min_mask_ratio,
+                max_mask_ratio=max_mask_ratio
+            )
 
-            output = model(x_masked)
+            # Prepare input
+            x_input = torch.cat([x_masked, mask.float()], dim=0).unsqueeze(0).to(device)
+            x_target = x.cpu().numpy()
+            mask_np = mask.cpu().numpy()
+
+            output = model(x_input)
             x_recon = output['reconstructed'].cpu().numpy()[0]
 
             ax = axes[i]
@@ -194,7 +236,7 @@ def plot_reconstruction_samples(model, dataset, device, save_path, n_samples=4):
             ax.plot(x_recon, 'r-', label='Reconstructed', alpha=0.7, linewidth=1)
 
             # Highlight masked regions
-            masked_indices = np.where(mask)[0]
+            masked_indices = np.where(mask_np)[0]
             if len(masked_indices) > 0:
                 ax.scatter(masked_indices, x_recon[masked_indices],
                           c='red', s=10, alpha=0.5, label='Masked regions')
@@ -202,7 +244,7 @@ def plot_reconstruction_samples(model, dataset, device, save_path, n_samples=4):
             ax.legend()
             ax.set_xlabel('Bin')
             ax.set_ylabel('Value')
-            ax.set_title(f'Sample {idx}')
+            ax.set_title(f'Sample {idx} (masked {mask_ratio*100:.1f}%, block size {block_size})')
             ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -233,14 +275,8 @@ def main(args):
     print(f"  Mean: {np.mean(data):.3f}")
     print(f"  Std: {np.std(data):.3f}")
 
-    # Create dataset with dynamic masking
-    dataset = SpectralDataset(
-        data,
-        min_block_size=args.min_block_size,
-        max_block_size=args.max_block_size,
-        min_mask_ratio=args.min_mask_ratio,
-        max_mask_ratio=args.max_mask_ratio
-    )
+    # Create dataset (masking will be applied in collate_fn)
+    dataset = SpectralDataset(data)
 
     # Train/val split
     n_train = int(len(dataset) * args.train_split)
@@ -255,13 +291,23 @@ def main(args):
     print(f"  Train: {n_train} samples")
     print(f"  Val: {n_val} samples")
 
+    # Create custom collate function with masking parameters
+    collate_fn = partial(
+        collate_with_masking,
+        min_block_size=args.min_block_size,
+        max_block_size=args.max_block_size,
+        min_mask_ratio=args.min_mask_ratio,
+        max_mask_ratio=args.max_mask_ratio
+    )
+
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=0,  # Windows compatibility
-        pin_memory=True if torch.cuda.is_available() else False
+        pin_memory=True if torch.cuda.is_available() else False,
+        collate_fn=collate_fn
     )
 
     val_loader = DataLoader(
@@ -269,13 +315,15 @@ def main(args):
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=0,
-        pin_memory=True if torch.cuda.is_available() else False
+        pin_memory=True if torch.cuda.is_available() else False,
+        collate_fn=collate_fn
     )
 
     # Create model
     print(f"\nCreating MLP autoencoder...")
     config = MLPConfig(
-        input_dim=n_bins,
+        input_dim=n_bins * 2,  # Data + mask concatenated
+        output_dim=n_bins,     # Reconstruct only data
         encoder_hidden_dims=args.encoder_dims,
         latent_dim=args.latent_dim,
         dropout=args.dropout,
@@ -297,12 +345,17 @@ def main(args):
 
     criterion = nn.MSELoss()
 
-    # Learning rate scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    # Learning rate scheduler - OneCycleLR
+    steps_per_epoch = len(train_loader)
+    total_steps = args.epochs * steps_per_epoch
+    scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
-        mode='min',
-        factor=0.5,
-        patience=5
+        max_lr=args.max_lr,
+        total_steps=total_steps,
+        pct_start=args.pct_start,
+        anneal_strategy='cos',
+        div_factor=args.div_factor,
+        final_div_factor=args.final_div_factor
     )
 
     # Training loop
@@ -319,14 +372,11 @@ def main(args):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(args.epochs):
-        # Train
-        train_metrics = train_epoch(model, train_loader, optimizer, criterion, device)
+        # Train (scheduler steps per batch inside train_epoch)
+        train_metrics = train_epoch(model, train_loader, optimizer, criterion, device, scheduler)
 
         # Validate
         val_metrics = validate(model, val_loader, criterion, device)
-
-        # Update scheduler
-        scheduler.step(val_metrics['loss'])
 
         # Track losses
         train_losses.append(train_metrics['loss'])
@@ -358,7 +408,13 @@ def main(args):
         # Plot samples every 10 epochs
         if (epoch + 1) % 10 == 0 or epoch == 0:
             plot_path = output_dir / f'mlp_{args.channel}_recon_epoch{epoch+1}.png'
-            plot_reconstruction_samples(model, val_dataset, device, plot_path)
+            plot_reconstruction_samples(
+                model, val_dataset, device, plot_path,
+                min_block_size=args.min_block_size,
+                max_block_size=args.max_block_size,
+                min_mask_ratio=args.min_mask_ratio,
+                max_mask_ratio=args.max_mask_ratio
+            )
 
     # Save final model
     final_path = output_dir / f'mlp_{args.channel}_final.pt'
@@ -437,12 +493,28 @@ if __name__ == "__main__":
         help='Batch size'
     )
     parser.add_argument(
-        '--lr', type=float, default=1e-3,
-        help='Learning rate'
+        '--lr', type=float, default=1e-4,
+        help='Initial learning rate (for OneCycleLR: this is starting LR = max_lr / div_factor)'
+    )
+    parser.add_argument(
+        '--max_lr', type=float, default=1e-3,
+        help='Maximum learning rate for OneCycleLR'
     )
     parser.add_argument(
         '--weight_decay', type=float, default=1e-5,
         help='Weight decay for AdamW'
+    )
+    parser.add_argument(
+        '--pct_start', type=float, default=0.1,
+        help='Percentage of cycle spent increasing LR (OneCycleLR)'
+    )
+    parser.add_argument(
+        '--div_factor', type=float, default=1e2,
+        help='Initial LR = max_lr / div_factor (OneCycleLR)'
+    )
+    parser.add_argument(
+        '--final_div_factor', type=float, default=1e2,
+        help='Final LR = max_lr / (div_factor * final_div_factor) (OneCycleLR)'
     )
     parser.add_argument(
         '--train_split', type=float, default=0.9,
