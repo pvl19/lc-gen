@@ -29,8 +29,10 @@ setup(
         "numpy>=1.24.0",
         "matplotlib>=3.7.0",
         "pyyaml>=6.0",
-        "tapify>=1.0.0",
+        "tapify @ git+https://github.com/aaryapatil/tapify.git",
         "scipy>=1.10.0",
+        "nfft>=0.1",  # Required by tapify
+        "statsmodels>=0.14.0",  # Required by tapify
         "tqdm>=4.66.0",
     ],
     extras_require={
