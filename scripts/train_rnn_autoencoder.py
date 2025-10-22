@@ -36,16 +36,20 @@ class LightCurveDataset(Dataset):
         """
         self.flux = torch.from_numpy(flux).float()
         self.timestamps = torch.from_numpy(timestamps).float()
+        self.flux_err = None
 
     def __len__(self):
         return len(self.flux)
 
     def __getitem__(self, idx):
         # Return flux and timestamps - masking will be applied in collate_fn
-        return {
+        item = {
             'flux': self.flux[idx],
             'time': self.timestamps[idx]
         }
+        if self.flux_err is not None:
+            item['flux_err'] = self.flux_err[idx]
+        return item
 
 
 def collate_with_masking(batch, min_block_size=1, max_block_size=None,
@@ -71,8 +75,20 @@ def collate_with_masking(batch, min_block_size=1, max_block_size=None,
     batch_block_sizes = []
     batch_mask_ratios = []
 
+    # Determine whether flux_err exists in items and stack once
+    flux_err_exists = 'flux_err' in batch[0]
+    if flux_err_exists:
+        batch_flux_err = torch.stack([item['flux_err'] for item in batch], dim=0)
+    else:
+        batch_flux_err = None
+
     for i in range(batch_size):
         flux = batch_flux[i]
+        # Get per-sample flux_err (or zeros)
+        if batch_flux_err is not None:
+            flux_err = batch_flux_err[i]
+        else:
+            flux_err = torch.zeros_like(flux)
 
         # Apply dynamic block masking to flux
         flux_masked, mask, block_size, mask_ratio = dynamic_block_mask(
@@ -83,9 +99,9 @@ def collate_with_masking(batch, min_block_size=1, max_block_size=None,
             max_mask_ratio=max_mask_ratio
         )
 
-        # Stack flux and mask as two channels: [masked_flux, mask_indicator]
-        # Shape: (seq_len, 2)
-        input_with_mask = torch.stack([flux_masked, mask.float()], dim=-1)
+        # Stack channels as: [masked_flux, flux_err, mask_indicator]
+        # Shape: (seq_len, 3)
+        input_with_mask = torch.stack([flux_masked, flux_err, mask.float()], dim=-1)
 
         batch_inputs.append(input_with_mask)
         batch_targets.append(flux)
@@ -94,7 +110,7 @@ def collate_with_masking(batch, min_block_size=1, max_block_size=None,
         batch_mask_ratios.append(mask_ratio)
 
     return {
-        'input': torch.stack(batch_inputs),  # (batch, seq_len, 2)
+        'input': torch.stack(batch_inputs),  # (batch, seq_len, 3)
         'target': torch.stack(batch_targets),  # (batch, seq_len)
         'time': batch_time,  # (batch, seq_len)
         'mask': torch.stack(batch_masks),  # (batch, seq_len)
@@ -121,6 +137,10 @@ def load_lightcurve_data(hdf5_file):
     with h5py.File(hdf5_file, 'r') as f:
         flux = f['flux'][:]
         timestamps = f['time'][:]
+        # Optional flux_err dataset
+        flux_err = None
+        if 'flux_err' in f:
+            flux_err = f['flux_err'][:]
         print(f"Loaded flux: {flux.shape}, time: {timestamps.shape}")
 
         # Check for NaNs
@@ -133,7 +153,7 @@ def load_lightcurve_data(hdf5_file):
             print(f"Warning: {n_nans_time} NaN values found in timestamps")
             timestamps = np.nan_to_num(timestamps, nan=0.0)
 
-        return flux, timestamps
+    return flux, timestamps, flux_err
 
 
 def train_epoch(model, dataloader, optimizer, criterion, device, scheduler=None):
@@ -145,7 +165,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, scheduler=None)
     n_batches = 0
 
     for batch in dataloader:
-        x_input = batch['input'].to(device)  # (batch, seq_len, 2) [flux, mask]
+        x_input = batch['input'].to(device)  # (batch, seq_len, 3) [flux, flux_err, mask]
         x_target = batch['target'].to(device)  # (batch, seq_len)
         timestamps = batch['time'].to(device)  # (batch, seq_len)
         mask = batch['mask'].to(device)  # (batch, seq_len)
@@ -284,7 +304,7 @@ def plot_reconstruction_examples(model, dataloader, device, save_path, n_example
 def main():
     parser = argparse.ArgumentParser(description='Train hierarchical RNN (minLSTM/minGRU) autoencoder on light curves')
     parser.add_argument('--input', type=str,
-                        default='data/mock_lightcurves/timeseries.h5',
+                        default='data/real_lightcurves/timeseries.h5',
                         help='Path to HDF5 file with light curve time series')
     parser.add_argument('--output_dir', type=str, default='models/rnn',
                         help='Directory to save model checkpoints')
@@ -334,7 +354,7 @@ def main():
 
     # Load data
     print(f"\nLoading data from {args.input}...")
-    flux, timestamps = load_lightcurve_data(args.input)
+    flux, timestamps, flux_err = load_lightcurve_data(args.input)
 
     print(f"\nDataset statistics:")
     print(f"  Shape: {flux.shape}")
@@ -345,6 +365,9 @@ def main():
 
     # Create dataset
     dataset = LightCurveDataset(flux, timestamps)
+    if flux_err is not None:
+        # Attach flux_err to dataset (as torch tensor)
+        dataset.flux_err = torch.from_numpy(flux_err).float()
 
     # Split into train/val
     val_size = int(len(dataset) * args.val_split)
@@ -391,7 +414,7 @@ def main():
     seq_len = flux.shape[1]
     print(f"\nCreating Hierarchical RNN ({args.rnn_type}) autoencoder...")
     config = RNNConfig(
-        input_dim=2,  # [flux, mask]
+        input_dim=3,  # [flux, flux_err, mask]
         input_length=seq_len,
         encoder_dims=args.encoder_dims,
         rnn_type=args.rnn_type,
@@ -402,6 +425,24 @@ def main():
     )
 
     model = HierarchicalRNN(config).to(device)
+
+    # --- Sanity check: single forward pass to verify input shapes / device placement ---
+    try:
+        sample_batch = next(iter(train_loader))
+        x_input_sample = sample_batch['input'].to(device)
+        timestamps_sample = sample_batch['time'].to(device)
+        print("Sanity check - sample input shapes:", x_input_sample.shape, timestamps_sample.shape)
+        sample_out = model(x_input_sample, timestamps_sample)
+        if isinstance(sample_out, dict) and 'reconstructed' in sample_out:
+            print("Sanity check forward OK. Reconstructed shape:", sample_out['reconstructed'].shape)
+        else:
+            print("Sanity check forward returned unexpected type:", type(sample_out))
+    except Exception as e:
+        import traceback
+        print("Sanity check forward FAILED. Traceback:")
+        traceback.print_exc()
+        # Re-raise so the user sees the original error and training stops
+        raise
 
     # Count parameters
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -435,8 +476,10 @@ def main():
     val_losses = []
 
     for epoch in range(args.epochs):
+        print(f"\nEpoch {epoch+1}/{args.epochs}")
         # Train
         train_metrics = train_epoch(model, train_loader, optimizer, criterion, device, scheduler)
+        print("Training metrics:", train_metrics)
         train_losses.append(train_metrics['total_loss'])
 
         # Validate
@@ -468,7 +511,7 @@ def main():
 
         # Plot samples every 10 epochs
         if (epoch + 1) % 10 == 0 or epoch == 0:
-            plot_path = output_dir / f'rnn_recon_epoch{epoch+1}.png'
+            plot_path = output_dir / f'rnn_recon_v2_epoch{epoch+1}.png'
             plot_reconstruction_examples(
                 model, val_loader, device, plot_path
             )
@@ -502,7 +545,7 @@ def main():
     plt.title(f'Hierarchical RNN ({args.rnn_type}) Training')
     plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.savefig(output_dir / 'rnn_training_curve.png', dpi=150)
+    plt.savefig(output_dir / 'rnn_training_curve_v2.png', dpi=150)
     plt.close()
 
     print(f"\nTraining complete!")
