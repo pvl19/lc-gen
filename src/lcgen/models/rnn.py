@@ -103,7 +103,7 @@ class RNNConfig(ModelConfig):
     model_name: str = "hierarchical_rnn"
 
     # Input configuration
-    input_dim: int = 2  # flux + mask
+    input_dim: int = 3  # flux + flux_err + mask
     input_length: int = 512
 
     # Architecture

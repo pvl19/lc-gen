@@ -54,6 +54,7 @@ CLAUDE.md
 # Data files
 data/
 !data/README.md
+*.pickle
 
 # Experiment results
 experiments/results/*/
@@ -68,6 +69,7 @@ wandb/
 
 # Model artifacts
 model_artifacts/
+convolution/model_artifacts/
 checkpoints/
 *.pt.tar
 
