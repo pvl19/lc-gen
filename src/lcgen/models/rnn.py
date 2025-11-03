@@ -249,28 +249,21 @@ class StackedRNN(nn.Module):
     def __init__(self, rnn_type: str, input_size: int, hidden_size: int,
                  num_layers: int, dropout: float = 0.0, bidirectional: bool = True):
         super().__init__()
+        # Keep public API (including bidirectional arg) for compatibility,
+        # but this implementation uses only the forward pass.
         self.num_layers = num_layers
-        self.bidirectional = bidirectional
+        self.bidirectional = False
 
         # Choose RNN cell type
         RNNCell = minLSTMCell if rnn_type == "minlstm" else minGRUCell
 
-        # Forward layers
+        # Forward-only layers
         self.forward_layers = nn.ModuleList()
         for i in range(num_layers):
             layer_input_size = input_size if i == 0 else hidden_size
             self.forward_layers.append(RNNCell(layer_input_size, hidden_size))
 
-        # Backward layers (if bidirectional)
-        if bidirectional:
-            self.backward_layers = nn.ModuleList()
-            for i in range(num_layers):
-                layer_input_size = input_size if i == 0 else hidden_size
-                self.backward_layers.append(RNNCell(layer_input_size, hidden_size))
-
-            # Fusion layer to combine forward and backward
-            self.fusion = nn.Linear(2 * hidden_size, hidden_size)
-
+        # No backward/fusion layers in forward-only mode
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.norm = nn.LayerNorm(hidden_size)
 
@@ -281,7 +274,7 @@ class StackedRNN(nn.Module):
         Returns:
             (batch, seq_len, hidden_size)
         """
-        # Forward pass
+        # Forward-only pass
         h_fwd = x
         for i, layer in enumerate(self.forward_layers):
             h_new = layer(h_fwd)
@@ -292,27 +285,7 @@ class StackedRNN(nn.Module):
 
             h_fwd = self.dropout(self.norm(h_new))
 
-        if not self.bidirectional:
-            return h_fwd
-
-        # Backward pass (process reversed sequence)
-        h_bwd = x.flip(dims=[1])  # Reverse time dimension
-        for i, layer in enumerate(self.backward_layers):
-            h_new = layer(h_bwd)
-
-            # Residual connection
-            if i > 0 and h_new.shape == h_bwd.shape:
-                h_new = h_new + h_bwd
-
-            h_bwd = self.dropout(self.norm(h_new))
-
-        h_bwd = h_bwd.flip(dims=[1])  # Flip back to original order
-
-        # Concatenate and fuse
-        h_combined = torch.cat([h_fwd, h_bwd], dim=-1)
-        h = self.fusion(h_combined)
-
-        return h
+        return h_fwd
 
 
 class Downsample1D(nn.Module):
@@ -519,9 +492,9 @@ class HierarchicalRNN(BaseAutoencoder):
         # Encoder and Decoder
         self.encoder = HierarchicalRNNEncoder(config)
         self.decoder = HierarchicalRNNDecoder(config)
-
-        # Output projection
-        self.output_proj = nn.Linear(config.encoder_dims[0], 1)
+        # Output projection: predict mean and log-std for Gaussian output
+        # output channels: [mean, log_sigma]
+        self.output_proj = nn.Linear(config.encoder_dims[0], 2)
 
     def encode(self, x, t):
         """
@@ -554,11 +527,12 @@ class HierarchicalRNN(BaseAutoencoder):
             latent: (batch, seq_len//16, hidden_dim)
             skip_connections: List from encoder
         Returns:
-            (batch, seq_len, 1)
+            (batch, seq_len, 2)  # [mean, log_sigma]
         """
         x = self.decoder(latent, skip_connections)
         x = F.gelu(x)  # Non-linearity before output projection
         x = self.output_proj(x)
+        # x shape: (batch, seq_len, 2) -> [mean, log_sigma]
         return x
 
     def forward(self, x, t=None):
@@ -568,8 +542,8 @@ class HierarchicalRNN(BaseAutoencoder):
         Args:
             x: (batch, seq_len, input_dim) where input_dim = [flux, mask]
             t: (batch, seq_len) timestamps (optional, will use indices if None)
-        Returns:
-            dict with 'reconstructed', 'latent', 'skip_connections'
+            Returns:
+            dict with 'reconstructed' (batch, seq_len, 2 -> mean, log_sigma), 'latent', 'skip_connections'
         """
         batch_size, seq_len, _ = x.shape
 

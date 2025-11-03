@@ -6,6 +6,7 @@ Supports training with block masking and time-aware positional encoding.
 """
 
 import numpy as np
+import math
 import argparse
 import sys
 from pathlib import Path
@@ -169,20 +170,27 @@ def train_epoch(model, dataloader, optimizer, criterion, device, scheduler=None)
         x_target = batch['target'].to(device)  # (batch, seq_len)
         timestamps = batch['time'].to(device)  # (batch, seq_len)
         mask = batch['mask'].to(device)  # (batch, seq_len)
-
         # Forward pass
         optimizer.zero_grad()
         output = model(x_input, timestamps)
-        x_recon = output['reconstructed'].squeeze(-1)  # (batch, seq_len)
+        # output['reconstructed']: (batch, seq_len, 2) -> mean, log_sigma
+        recon = output['reconstructed']
+        pred_mean = recon[..., 0]
+        pred_logsigma = recon[..., 1]
+        # To ensure positive scale, convert log-sigma to sigma via softplus or exp
+        pred_sigma = torch.nn.functional.softplus(pred_logsigma)
 
-        # Compute loss over ALL regions (both masked and unmasked)
-        loss = criterion(x_recon, x_target)
+        # Negative log-likelihood per element for Gaussian: 0.5*log(2*pi*sigma^2) + 0.5*((y - mu)^2 / sigma^2)
+        # Compute full NLL over all timesteps
+        var = pred_sigma ** 2 + 1e-8
+        nll = 0.5 * (torch.log(2 * math.pi * var) + (pred_mean - x_target) ** 2 / var)
+        loss = nll.mean()
 
-        # Also track masked vs unmasked separately for monitoring
-        masked_loss = criterion(x_recon[mask], x_target[mask])
-        unmasked_loss = criterion(x_recon[~mask], x_target[~mask])
+        # Also compute masked/unmasked NLL for monitoring
+        masked_nll = nll[mask].mean() if mask.any() else torch.tensor(0.0, device=device)
+        unmasked_nll = nll[~mask].mean() if (~mask).any() else torch.tensor(0.0, device=device)
 
-        # Backprop and optimize on full reconstruction loss
+        # Backprop and optimize on full NLL loss
         loss.backward()
 
         # Gradient clipping to prevent exploding gradients
@@ -195,8 +203,8 @@ def train_epoch(model, dataloader, optimizer, criterion, device, scheduler=None)
             scheduler.step()
 
         total_loss += loss.item()
-        total_masked_loss += masked_loss.item()
-        total_unmasked_loss += unmasked_loss.item()
+        total_masked_loss += masked_nll.item()
+        total_unmasked_loss += unmasked_nll.item()
         n_batches += 1
 
     return {
@@ -223,12 +231,17 @@ def validate_epoch(model, dataloader, criterion, device):
 
             # Forward pass
             output = model(x_input, timestamps)
-            x_recon = output['reconstructed'].squeeze(-1)
+            recon = output['reconstructed']
+            pred_mean = recon[..., 0]
+            pred_logsigma = recon[..., 1]
+            pred_sigma = torch.nn.functional.softplus(pred_logsigma)
 
-            # Compute loss
-            loss = criterion(x_recon, x_target)
-            masked_loss = criterion(x_recon[mask], x_target[mask])
-            unmasked_loss = criterion(x_recon[~mask], x_target[~mask])
+            var = pred_sigma ** 2 + 1e-8
+            nll = 0.5 * (torch.log(2 * math.pi * var) + (pred_mean - x_target) ** 2 / var)
+
+            loss = nll.mean()
+            masked_loss = nll[mask].mean() if mask.any() else torch.tensor(0.0, device=device)
+            unmasked_loss = nll[~mask].mean() if (~mask).any() else torch.tensor(0.0, device=device)
 
             total_loss += loss.item()
             total_masked_loss += masked_loss.item()
@@ -255,13 +268,25 @@ def plot_reconstruction_examples(model, dataloader, device, save_path, n_example
     block_sizes = batch['block_size'][:n_examples].numpy()
     mask_ratios = batch['mask_ratio'][:n_examples].numpy()
 
+    # Draw a few stochastic samples from the predictive distribution to visualise uncertainty
+    num_samples = 5
+    smooth_noise = True
+    smooth_kernel_width = 5  # in timesteps; small value for gentle temporal correlation
+
     with torch.no_grad():
         output = model(x_input, timestamps)
-        x_recon = output['reconstructed'].squeeze(-1)
+        # output['reconstructed']: (batch, seq_len, 2) -> mean, log_sigma
+        recon = output['reconstructed']
+        recon_mean = recon[..., 0]
+        recon_logsigma = recon[..., 1]
+        recon_sigma = torch.nn.functional.softplus(recon_logsigma)
+        x_recon_mean = recon_mean
+        x_recon_sigma = recon_sigma
 
     # Move to CPU for plotting
     x_target = x_target.cpu().numpy()
-    x_recon = x_recon.cpu().numpy()
+    x_recon_mean = x_recon_mean.cpu().numpy()
+    x_recon_sigma = x_recon_sigma.cpu().numpy()
     timestamps_np = timestamps.cpu().numpy()
     mask = mask.cpu().numpy()
 
@@ -273,21 +298,40 @@ def plot_reconstruction_examples(model, dataloader, device, save_path, n_example
     for i, ax in enumerate(axes):
         t = timestamps_np[i]
         target = x_target[i]
-        recon = x_recon[i]
+        recon_mean = x_recon_mean[i]
+        recon_sigma = x_recon_sigma[i]
         m = mask[i]
         block_size = block_sizes[i]
         mask_ratio = mask_ratios[i]
 
         # Plot target and reconstruction
         ax.plot(t, target, 'k-', alpha=0.6, label='Target', linewidth=1.5)
-        ax.plot(t, recon, 'b-', alpha=0.8, label='Reconstruction', linewidth=1.5)
+        # Plot reconstruction mean and uncertainty band
+        ax.plot(t, recon_mean, 'b-', alpha=0.8, label='Reconstruction (mean)', linewidth=1.5)
+        # Uncertainty band: mean ± 2*sigma
+        ax.fill_between(t, recon_mean - 2 * recon_sigma, recon_mean + 2 * recon_sigma,
+                        color='blue', alpha=0.15, step=None, label='Uncertainty (±2σ)')
 
-        # Highlight masked regions
+        # Draw several sampled stochastic reconstructions from N(mean, sigma^2)
+        # Optionally smooth the noise to introduce temporal correlation
+        samples = np.random.normal(loc=recon_mean[None, :], scale=recon_sigma[None, :], size=(num_samples, recon_mean.shape[0]))
+        if smooth_noise and smooth_kernel_width > 1:
+            # simple moving-average kernel
+            kernel = np.ones(smooth_kernel_width, dtype=float) / float(smooth_kernel_width)
+            for k in range(samples.shape[0]):
+                noise = samples[k] - recon_mean
+                noise_smooth = np.convolve(noise, kernel, mode='same')
+                samples[k] = recon_mean + noise_smooth
+
+        for k in range(samples.shape[0]):
+            ax.plot(t, samples[k], color='orange', alpha=0.18, linewidth=1)
+
+        # Highlight masked regions: scatter sampled values so their spread reflects predicted sigma
         if m.sum() > 0:
-            # Find contiguous masked regions
             masked_indices = np.where(m)[0]
-            ax.scatter(t[masked_indices], recon[masked_indices],
-                      c='red', s=10, alpha=0.5, label='Masked regions')
+            # use the first sample for scatter points (could randomise)
+            ax.scatter(t[masked_indices], samples[0, masked_indices],
+                      c='red', s=10, alpha=0.6, label='Masked regions (sampled)')
 
         ax.legend()
         ax.set_xlabel('Time')
@@ -314,8 +358,8 @@ def main():
                         help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-3,
                         help='Learning rate')
-    parser.add_argument('--encoder_dims', type=int, nargs='+', default=[64, 128, 256, 512],
-                        help='Encoder dimensions for hierarchical levels')
+    parser.add_argument('--encoder_dims', type=int, nargs='+', default=[64, 128],
+                        help='Encoder dimensions for hierarchical levels (default: 2 levels)')
     parser.add_argument('--rnn_type', type=str, default='minlstm', choices=['minlstm', 'minGRU'],
                         help='RNN cell type (minlstm or minGRU)')
     parser.add_argument('--num_layers', type=int, default=4,
@@ -511,7 +555,7 @@ def main():
 
         # Plot samples every 10 epochs
         if (epoch + 1) % 10 == 0 or epoch == 0:
-            plot_path = output_dir / f'rnn_recon_v2_epoch{epoch+1}.png'
+            plot_path = output_dir / f'rnn_recon_v3_epoch{epoch+1}.png'
             plot_reconstruction_examples(
                 model, val_loader, device, plot_path
             )
@@ -545,7 +589,7 @@ def main():
     plt.title(f'Hierarchical RNN ({args.rnn_type}) Training')
     plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.savefig(output_dir / 'rnn_training_curve_v2.png', dpi=150)
+    plt.savefig(output_dir / 'rnn_training_curve_v3.png', dpi=150)
     plt.close()
 
     print(f"\nTraining complete!")
