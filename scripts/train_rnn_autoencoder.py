@@ -167,6 +167,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, scheduler=None)
 
     for batch in dataloader:
         x_input = batch['input'].to(device)  # (batch, seq_len, 3) [flux, flux_err, mask]
+        x_flux_err = x_input[..., 1]
         x_target = batch['target'].to(device)  # (batch, seq_len)
         timestamps = batch['time'].to(device)  # (batch, seq_len)
         mask = batch['mask'].to(device)  # (batch, seq_len)
@@ -182,8 +183,9 @@ def train_epoch(model, dataloader, optimizer, criterion, device, scheduler=None)
 
         # Negative log-likelihood per element for Gaussian: 0.5*log(2*pi*sigma^2) + 0.5*((y - mu)^2 / sigma^2)
         # Compute full NLL over all timesteps
-        var = pred_sigma ** 2 + 1e-8
-        nll = 0.5 * (torch.log(2 * math.pi * var) + (pred_mean - x_target) ** 2 / var)
+        var_scatter = pred_sigma ** 2 + 1e-8
+        var_measure = x_flux_err ** 2 + 1e-8
+        nll = 0.5 * (torch.log(2 * math.pi * (var_measure + var_scatter)) + (pred_mean - x_target) ** 2 / (var_measure + var_scatter))
         loss = nll.mean()
 
         # Also compute masked/unmasked NLL for monitoring
@@ -465,7 +467,7 @@ def main():
         num_layers_per_level=args.num_layers_per_level,
         dropout=0.0,  # No dropout
         min_period=0.00278,
-        max_period=1640.0
+        max_period=28
     )
 
     model = HierarchicalRNN(config).to(device)

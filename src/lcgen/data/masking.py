@@ -267,7 +267,7 @@ def dynamic_block_mask(x, min_block_size=1, max_block_size=None,
         max_block_size = seq_len // 2
 
     # Ensure max_block_size is valid
-    max_block_size = min(max_block_size, seq_len)
+    max_block_size = min(max_block_size, seq_len // 2)
 
     # Sample block size from powers of 2 (log-style distribution) - FAST!
     min_power = int(np.floor(np.log2(max(1, min_block_size))))
