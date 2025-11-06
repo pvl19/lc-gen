@@ -104,19 +104,19 @@ class RNNConfig(ModelConfig):
 
     # Input configuration
     input_dim: int = 3  # flux + flux_err + mask
-    input_length: int = 512
+    input_length: int = 1024
 
     # Architecture
-    encoder_dims: List[int] = field(default_factory=lambda: [64, 128, 256, 512])
+    encoder_dims: List[int] = field(default_factory=lambda: [64, 128])
     rnn_type: Literal["minlstm", "minGRU"] = "minGRU"  # minGRU is simpler and often performs better
-    num_layers_per_level: int = 1  # RNN layers per hierarchy level
+    num_layers_per_level: int = 2  # RNN layers per hierarchy level
     bidirectional: bool = False  # Bidirectional RNN for reconstruction
     dropout: float = 0.0
 
     # Positional encoding (time-aware)
     min_period: float = 0.00278  # ~4 minutes in days
     max_period: float = 28   # ~4.5 years in days
-    num_freqs: int = 32
+    num_freqs: int = 16
 
 
 class TimeAwarePositionalEncoding(nn.Module):
