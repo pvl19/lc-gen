@@ -270,11 +270,6 @@ def plot_reconstruction_examples(model, dataloader, device, save_path, n_example
     block_sizes = batch['block_size'][:n_examples].numpy()
     mask_ratios = batch['mask_ratio'][:n_examples].numpy()
 
-    # Draw a few stochastic samples from the predictive distribution to visualise uncertainty
-    num_samples = 5
-    smooth_noise = True
-    smooth_kernel_width = 5  # in timesteps; small value for gentle temporal correlation
-
     with torch.no_grad():
         output = model(x_input, timestamps)
         # output['reconstructed']: (batch, seq_len, 2) -> mean, log_sigma
@@ -313,27 +308,6 @@ def plot_reconstruction_examples(model, dataloader, device, save_path, n_example
         # Uncertainty band: mean ± 2*sigma
         ax.fill_between(t, recon_mean - 2 * recon_sigma, recon_mean + 2 * recon_sigma,
                         color='blue', alpha=0.15, step=None, label='Uncertainty (±2σ)')
-
-        # Draw several sampled stochastic reconstructions from N(mean, sigma^2)
-        # Optionally smooth the noise to introduce temporal correlation
-        samples = np.random.normal(loc=recon_mean[None, :], scale=recon_sigma[None, :], size=(num_samples, recon_mean.shape[0]))
-        if smooth_noise and smooth_kernel_width > 1:
-            # simple moving-average kernel
-            kernel = np.ones(smooth_kernel_width, dtype=float) / float(smooth_kernel_width)
-            for k in range(samples.shape[0]):
-                noise = samples[k] - recon_mean
-                noise_smooth = np.convolve(noise, kernel, mode='same')
-                samples[k] = recon_mean + noise_smooth
-
-        for k in range(samples.shape[0]):
-            ax.plot(t, samples[k], color='orange', alpha=0.18, linewidth=1)
-
-        # Highlight masked regions: scatter sampled values so their spread reflects predicted sigma
-        if m.sum() > 0:
-            masked_indices = np.where(m)[0]
-            # use the first sample for scatter points (could randomise)
-            ax.scatter(t[masked_indices], samples[0, masked_indices],
-                      c='red', s=10, alpha=0.6, label='Masked regions (sampled)')
 
         ax.legend()
         ax.set_xlabel('Time')
@@ -557,7 +531,7 @@ def main():
 
         # Plot samples every 10 epochs
         if (epoch + 1) % 10 == 0 or epoch == 0:
-            plot_path = output_dir / f'rnn_recon_v3_epoch{epoch+1}.png'
+            plot_path = output_dir / f'rnn_recon_v4_epoch{epoch+1}.png'
             plot_reconstruction_examples(
                 model, val_loader, device, plot_path
             )
@@ -591,7 +565,7 @@ def main():
     plt.title(f'Hierarchical RNN ({args.rnn_type}) Training')
     plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.savefig(output_dir / 'rnn_training_curve_v3.png', dpi=150)
+    plt.savefig(output_dir / 'rnn_training_curve_v4.png', dpi=150)
     plt.close()
 
     print(f"\nTraining complete!")
