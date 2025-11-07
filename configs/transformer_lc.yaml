@@ -1,0 +1,73 @@
+# Configuration for Transformer on light curves
+
+# Model configuration
+model:
+  model_type: transformer
+  model_name: transformer_lc
+  input_dim: 2  # flux + mask (explicit mask channel)
+  input_length: 512  # Sequence length
+  encoder_dims: [64, 128, 256, 512]  # Hierarchical dimensions (like UNet)
+  num_layers: 4  # Number of hierarchical levels
+  nhead: 4  # Number of attention heads
+  num_transformer_blocks: 2  # Transformer blocks per level
+  dropout: 0.0  # No dropout, consistent with MLP/UNet
+
+  # Positional encoding (log-spaced frequencies for multi-scale coverage)
+  min_period: 0.00278  # ~4 minutes
+  max_period: 1640.0   # ~45 hours
+
+# Data configuration
+data:
+  data_path: ./data
+  dataset_type: flux
+  batch_size: 32
+  num_workers: 4
+  shuffle: true
+  val_split: 0.2
+  test_split: 0.1
+
+  normalize: false  # Light curves typically standardized differently
+
+  # Masking for training
+  use_masking: true
+  mask_ratio: 0.3
+  mask_block_size: 10
+
+# Training configuration
+training:
+  epochs: 50
+  learning_rate: 0.0001  # Lower LR for transformers
+  weight_decay: 0.01     # Weight decay for AdamW
+  optimizer: adamw
+
+  use_scheduler: true
+  scheduler_type: onecycle  # OneCycleLR for faster convergence
+  pct_start: 0.1  # 10% warmup
+  div_factor: 1e2  # Initial LR = max_lr / 1e2
+  final_div_factor: 1e2  # Final LR = max_lr / 1e4
+
+  loss_fn: mse  # MSE loss for reconstruction
+
+  save_every: 10
+  save_best_only: false
+  early_stopping: false  # Not needed with OneCycleLR
+
+  log_every: 1
+  plot_examples: true
+  plot_every: 10
+
+  mixed_precision: false
+  clip_gradients: false  # Not needed with pre-norm architecture
+
+# Paths
+output_dir: ./experiments/results/transformer
+checkpoint_dir: ./experiments/results/transformer/checkpoints
+log_dir: ./experiments/results/transformer/logs
+
+# Experiment tracking
+experiment_name: transformer_lc
+version: v01
+notes: "Transformer for light curve reconstruction with time-aware positional encoding"
+
+device: auto
+seed: 42

@@ -1,0 +1,26 @@
+# Core dependencies
+torch>=2.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+pyyaml>=6.0
+
+# Spectral analysis for irregular time series
+tapify @ git+https://github.com/aaryapatil/tapify.git
+scipy>=1.10.0
+nfft>=0.1  # Required by tapify
+statsmodels>=0.14.0  # Required by tapify
+
+# Development and testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Jupyter notebooks for exploration
+jupyter>=1.0.0
+notebook>=7.0.0
+ipykernel>=6.25.0
+
+# Optional: Progress bars and logging
+tqdm>=4.66.0
+
+# Optional: Weights & Biases for experiment tracking
+# wandb>=0.15.0
