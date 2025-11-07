@@ -52,7 +52,8 @@ CLAUDE.md
 *.ckpt
 
 # Data files
-data/
+data/mock_lightcurves
+data/real_lightcurves
 !data/README.md
 *.pickle
 
