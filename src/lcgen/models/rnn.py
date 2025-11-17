@@ -110,7 +110,9 @@ class RNNConfig(ModelConfig):
     encoder_dims: List[int] = field(default_factory=lambda: [64, 128])
     rnn_type: Literal["minlstm", "minGRU"] = "minGRU"  # minGRU is simpler and often performs better
     num_layers_per_level: int = 2  # RNN layers per hierarchy level
-    bidirectional: bool = False  # Bidirectional RNN for reconstruction
+    bidirectional: bool = False  # legacy boolean; kept for backward compatibility
+    # Direction mode: 'forward' | 'backward' | 'both'. If set, overrides `bidirectional`.
+    direction: Literal['forward', 'backward', 'both'] = 'forward'
     dropout: float = 0.0
 
     # Positional encoding (time-aware)
@@ -394,7 +396,8 @@ class HierarchicalRNNEncoder(nn.Module):
                     hidden_size=in_dim,  # Process at CURRENT resolution
                     num_layers=config.num_layers_per_level,
                     dropout=config.dropout,
-                    bidirectional=config.bidirectional
+                    bidirectional=config.bidirectional,
+                    direction=config.direction
                 ),
                 'downsample': Downsample1D(in_dim, out_dim)
             })
@@ -408,7 +411,8 @@ class HierarchicalRNNEncoder(nn.Module):
             hidden_size=bottleneck_dim,
             num_layers=config.num_layers_per_level,
             dropout=config.dropout,
-            bidirectional=config.bidirectional
+            bidirectional=config.bidirectional,
+            direction=config.direction
         )
 
     def forward(self, x):
@@ -466,7 +470,8 @@ class HierarchicalRNNDecoder(nn.Module):
                     hidden_size=out_dim,
                     num_layers=config.num_layers_per_level,
                     dropout=config.dropout,
-                    bidirectional=config.bidirectional
+                    bidirectional=config.bidirectional,
+                    direction=config.direction
                 )
             })
             self.decoder_levels.append(level)
