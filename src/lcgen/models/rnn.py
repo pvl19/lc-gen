@@ -245,25 +245,50 @@ class minGRUCell(nn.Module):
 
 
 class StackedRNN(nn.Module):
-    """Stack multiple RNN layers with residual connections and bidirectional support"""
+    """Stack multiple RNN layers with residual connections and flexible direction modes.
+
+    Supports three modes controlled by `direction`:
+      - 'forward' (default): run forward-only layers
+      - 'backward': run layers on reversed time sequence
+      - 'both': run forward and backward, then fuse (learned linear) the two outputs
+
+    For backward compatibility the `bidirectional` boolean is still accepted; when
+    bidirectional=True it maps to direction='both'.
+    """
     def __init__(self, rnn_type: str, input_size: int, hidden_size: int,
-                 num_layers: int, dropout: float = 0.0, bidirectional: bool = True):
+                 num_layers: int, dropout: float = 0.0, bidirectional: bool = True,
+                 direction: str | None = None):
         super().__init__()
-        # Keep public API (including bidirectional arg) for compatibility,
-        # but this implementation uses only the forward pass.
+
+        # Resolve direction: explicit `direction` overrides `bidirectional` flag.
+        if direction is None:
+            self.direction = 'both' if bidirectional else 'forward'
+        else:
+            assert direction in ('forward', 'backward', 'both'), "direction must be 'forward','backward', or 'both'"
+            self.direction = direction
+
         self.num_layers = num_layers
-        self.bidirectional = False
 
         # Choose RNN cell type
         RNNCell = minLSTMCell if rnn_type == "minlstm" else minGRUCell
 
-        # Forward-only layers
+        # Forward layers (always created)
         self.forward_layers = nn.ModuleList()
         for i in range(num_layers):
             layer_input_size = input_size if i == 0 else hidden_size
             self.forward_layers.append(RNNCell(layer_input_size, hidden_size))
 
-        # No backward/fusion layers in forward-only mode
+        # Backward layers (created only if needed)
+        if self.direction in ('backward', 'both'):
+            self.backward_layers = nn.ModuleList()
+            for i in range(num_layers):
+                layer_input_size = input_size if i == 0 else hidden_size
+                self.backward_layers.append(RNNCell(layer_input_size, hidden_size))
+
+        # Fusion when bidirectional ('both') to map 2*hidden -> hidden
+        if self.direction == 'both':
+            self.fusion = nn.Linear(2 * hidden_size, hidden_size)
+
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.norm = nn.LayerNorm(hidden_size)
 
@@ -274,18 +299,34 @@ class StackedRNN(nn.Module):
         Returns:
             (batch, seq_len, hidden_size)
         """
-        # Forward-only pass
-        h_fwd = x
-        for i, layer in enumerate(self.forward_layers):
-            h_new = layer(h_fwd)
+        # Helper to run a sequence of layers (with residual behavior)
+        def run_layers(layers, inp):
+            h = inp
+            for i, layer in enumerate(layers):
+                h_new = layer(h)
+                if i > 0 and h_new.shape == h.shape:
+                    h_new = h_new + h
+                h = self.dropout(self.norm(h_new))
+            return h
 
-            # Residual connection (if dimensions match)
-            if i > 0 and h_new.shape == h_fwd.shape:
-                h_new = h_new + h_fwd
+        # Forward pass
+        out_fwd = run_layers(self.forward_layers, x)
 
-            h_fwd = self.dropout(self.norm(h_new))
+        if self.direction == 'forward':
+            return out_fwd
 
-        return h_fwd
+        # Backward-only
+        x_rev = x.flip(dims=[1])
+        out_bwd = run_layers(self.backward_layers, x_rev)
+        out_bwd = out_bwd.flip(dims=[1])
+
+        if self.direction == 'backward':
+            return out_bwd
+
+        # Both: fuse forward+backward
+        out_comb = torch.cat([out_fwd, out_bwd], dim=-1)
+        out = self.fusion(out_comb)
+        return out
 
 
 class Downsample1D(nn.Module):
