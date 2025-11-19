@@ -22,7 +22,7 @@ Architecture:
 """
 
 from dataclasses import dataclass, field
-from typing import List, Literal
+from typing import List, Literal, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -115,10 +115,16 @@ class RNNConfig(ModelConfig):
     direction: Literal['forward', 'backward', 'both'] = 'forward'
     dropout: float = 0.0
 
+    # Autoregressive generation
+    autoregressive: bool = False
+    teacher_forcing: bool = True
+
     # Positional encoding (time-aware)
     min_period: float = 0.00278  # ~4 minutes in days
     max_period: float = 28   # ~4.5 years in days
     num_freqs: int = 16
+    # Variance propagation weight (0..1) when autoregressive; how much previous variance contributes
+    var_propagation_alpha: float = 0.5
 
 
 class TimeAwarePositionalEncoding(nn.Module):
@@ -204,6 +210,23 @@ class minLSTMCell(nn.Module):
 
         return c
 
+    def step(self, x_t, c_prev=None):
+        """Single-step update for minLSTMCell.
+
+        x_t: (batch, input_size)
+        c_prev: (batch, hidden_size) or None -> treated as zeros
+        returns c: (batch, hidden_size)
+        """
+        # If previous cell state not provided, assume zeros
+        if c_prev is None:
+            batch_size = x_t.shape[0]
+            c_prev = x_t.new_zeros(batch_size, self.hidden_size)
+
+        f_t = torch.sigmoid(self.W_f(x_t))
+        i_t = self.W_i(x_t)
+        c = f_t * c_prev + (1 - f_t) * i_t
+        return c
+
 
 class minGRUCell(nn.Module):
     """
@@ -245,6 +268,22 @@ class minGRUCell(nn.Module):
 
         return h
 
+    def step(self, x_t, h_prev=None):
+        """Single-step update for minGRUCell.
+
+        x_t: (batch, input_size)
+        h_prev: (batch, hidden_size) or None -> treated as zeros
+        returns h: (batch, hidden_size)
+        """
+        if h_prev is None:
+            batch_size = x_t.shape[0]
+            h_prev = x_t.new_zeros(batch_size, self.hidden_size)
+
+        z = torch.sigmoid(self.W_z(x_t))
+        h_tilde = torch.tanh(self.W_h(x_t))
+        h = (1.0 - z) * h_prev + z * h_tilde
+        return h
+
 
 class StackedRNN(nn.Module):
     """Stack multiple RNN layers with residual connections and flexible direction modes.
@@ -259,7 +298,7 @@ class StackedRNN(nn.Module):
     """
     def __init__(self, rnn_type: str, input_size: int, hidden_size: int,
                  num_layers: int, dropout: float = 0.0, bidirectional: bool = True,
-                 direction: str | None = None):
+                 direction: Optional[str] = None):
         super().__init__()
 
         # Resolve direction: explicit `direction` overrides `bidirectional` flag.
@@ -329,6 +368,35 @@ class StackedRNN(nn.Module):
         out_comb = torch.cat([out_fwd, out_bwd], dim=-1)
         out = self.fusion(out_comb)
         return out
+
+    def step(self, x_t, h_prev=None):
+        """Run a single timestep through the stacked RNN.
+
+        Args:
+            x_t: (batch, input_size) input at current timestep
+            h_prev: optional list of previous hidden states per layer (not used by minimal cells)
+        Returns:
+            h_out: (batch, hidden_size) output for this timestep
+        """
+        # Run single-step through forward layers
+        h = x_t
+        for i, layer in enumerate(self.forward_layers):
+            # each layer has .step
+            h_prev_layer = None
+            if hasattr(layer, 'step'):
+                h = layer.step(h, h_prev_layer) if h.dim() == 2 else layer.step(h, None)
+            else:
+                # fallback - treat layer as stateless mapping
+                h = layer(h.unsqueeze(1)).squeeze(1)
+            # residual if shapes match and not first layer
+            # here h is (batch, hidden)
+        if self.direction == 'forward':
+            return self.dropout(self.norm(h))
+
+        # For backward or both modes we'll rely on sequence-level forward for now
+        # since per-step backward generation is done by reversing input externally.
+        # The `both` fusion happens at sequence level, so step() only returns forward output.
+        return self.dropout(self.norm(h))
 
 
 class Downsample1D(nn.Module):
@@ -541,6 +609,19 @@ class HierarchicalRNN(BaseAutoencoder):
         # Output projection: predict mean and log-std for Gaussian output
         # output channels: [mean, log_sigma]
         self.output_proj = nn.Linear(config.encoder_dims[0], 2)
+        # small projection to mix previous mean into step input
+        self.prev_mean_proj = nn.Linear(1, config.encoder_dims[0])
+        # Stepwise stacked RNN used for autoregressive decoding (operates at base resolution)
+        # Use same rnn_type and width as level 0
+        self.step_rnn = StackedRNN(
+            rnn_type=config.rnn_type,
+            input_size=config.encoder_dims[0],
+            hidden_size=config.encoder_dims[0],
+            num_layers=config.num_layers_per_level,
+            dropout=config.dropout,
+            bidirectional=False,
+            direction='forward'
+        )
 
     def encode(self, x, t):
         """
@@ -581,7 +662,7 @@ class HierarchicalRNN(BaseAutoencoder):
         # x shape: (batch, seq_len, 2) -> [mean, log_sigma]
         return x
 
-    def forward(self, x, t=None):
+    def forward(self, x, t=None, target=None, mask=None, seed: 'Optional[int]' = None):
         """
         Full forward pass.
 
@@ -600,14 +681,184 @@ class HierarchicalRNN(BaseAutoencoder):
         # Encode
         latent, skip_connections = self.encode(x, t)
 
-        # Decode
-        reconstructed = self.decode(latent, skip_connections)
+        # If autoregressive mode requested, use sequential generation
+        if getattr(self.config, 'autoregressive', False):
+            ar_out = self.generate_autoregressive(x, t, target=target, mask=mask, seed=seed)
+            # ar_out is a dict {'reconstructed': tensor, 'sampled': tensor or None}
+            ar_out['latent'] = latent
+            ar_out['skip_connections'] = skip_connections
+            return ar_out
+        else:
+            reconstructed = self.decode(latent, skip_connections)
+            return {
+                'reconstructed': reconstructed,
+                'latent': latent,
+                'skip_connections': skip_connections
+            }
 
-        return {
-            'reconstructed': reconstructed,
-            'latent': latent,
-            'skip_connections': skip_connections
-        }
+    def generate_autoregressive(self, x, t, target=None, mask=None, seed: 'Optional[int]' = None):
+        """Generate predictions sequentially using teacher forcing when available.
+
+        Args:
+            x: (batch, seq_len, 3) input channels [masked_flux, flux_err, mask]
+            t: (batch, seq_len) timestamps
+            target: optional (batch, seq_len) ground truth flux for teacher forcing
+            mask: optional (batch, seq_len) boolean mask where True indicates masked positions
+
+        Returns:
+            reconstructed: (batch, seq_len, 2) mean and log_sigma
+        """
+        device = x.device
+        batch_size, seq_len, _ = x.shape
+
+        # Project input once and get encoder context (not strictly used here but kept)
+        latent, skip_connections = self.encode(x, t)
+
+        # Prepare per-timestep input features: use projected input feature at each step
+        proj_x = self.input_proj(x)  # (B, L, D)
+        pos_enc = self.pos_encoder(t)
+        proj_x = proj_x + pos_enc
+
+        # helper: inverse softplus so we can convert sigma back to pre-activation
+        def inv_softplus(y):
+            # numerically stable inverse softplus: inv_sp(y) = log(exp(y) - 1)
+            # handle large y with approximation
+            thresh = 20.0
+            y_clip = torch.clamp(y, max=thresh)
+            out = torch.log(torch.expm1(y_clip).clamp_min(1e-12))
+            out = torch.where(y > thresh, y - math.log(1.0), out)
+            return out
+
+        # Prepare a random generator for reproducible sampling when a seed is provided
+        gen = None
+        if seed is not None:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(int(seed))
+
+        def run_direction(forward=True):
+            # returns means (B,L), sigmas (B,L), samples (B,L or None) for the direction
+            if forward:
+                indices = range(seq_len)
+            else:
+                indices = range(seq_len - 1, -1, -1)
+
+            prev_mean = torch.zeros(batch_size, device=device)
+
+            means = []
+            sigmas = []
+            samples = []  # store sampled values when sampling is active
+
+            for ti in indices:
+                step_feat = proj_x[:, ti, :]
+
+                # mix previous mean via a small projection
+                prev_mean_emb = self.prev_mean_proj(prev_mean.unsqueeze(-1))
+                step_in = step_feat + prev_mean_emb
+
+                step_out = self.step_rnn.step(step_in)
+                out2 = self.output_proj(step_out)
+                mean_t = out2[:, 0]
+                logsigma_raw = out2[:, 1]
+
+                # process sigma from raw via softplus
+                sigma_process = F.softplus(logsigma_raw)
+                var_process = sigma_process ** 2
+
+                # measurement error at this timestep
+                meas_err = x[:, ti, 1]
+                var_meas = meas_err ** 2
+
+                # predictive variance: process variance (model) plus measurement variance
+                predictive_var = var_process + var_meas + 1e-12
+                predictive_sigma = torch.sqrt(predictive_var)
+
+                # convert back to raw logsigma such that softplus(raw) ~= predictive_sigma
+                raw_combined = inv_softplus(predictive_sigma)
+
+                means.append(mean_t.unsqueeze(1))
+                sigmas.append(raw_combined.unsqueeze(1))
+
+                # Determine per-sample whether this timestep is masked (True => masked)
+                if mask is not None:
+                    mask_t = mask[:, ti].to(device).bool()
+                else:
+                    mask_t = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+                # Decide per-sample whether to use teacher forcing:
+                # If target is None or teacher_forcing disabled in config -> no teacher forcing
+                if (target is None) or (not getattr(self.config, 'teacher_forcing', True)):
+                    use_teacher = torch.zeros(batch_size, dtype=torch.bool, device=device)
+                else:
+                    # Use teacher forcing when the timestep is NOT masked (observed)
+                    use_teacher = (~mask_t)
+
+                # Prepare container for the value that will be used as previous mean next step
+                sampled_vals = torch.empty(batch_size, device=device)
+
+                # Fill in values where teacher forcing applies (use ground truth)
+                if use_teacher.any():
+                    sampled_vals[use_teacher] = target[use_teacher, ti]
+
+                # For remaining samples, draw from predictive distribution
+                non_teacher_idx = (~use_teacher)
+                n_non_teacher = int(non_teacher_idx.sum().item())
+                if n_non_teacher > 0:
+                    # Draw epsilons for the entries that need sampling
+                    eps = torch.randn(n_non_teacher, device=device, generator=gen) if gen is not None else torch.randn(n_non_teacher, device=device)
+                    sampled_vals[non_teacher_idx] = mean_t[non_teacher_idx] + predictive_sigma[non_teacher_idx] * eps
+
+                samples.append(sampled_vals.unsqueeze(1))
+                prev_mean = sampled_vals
+
+            if not forward:
+                # reverse collected lists
+                means = means[::-1]
+                sigmas = sigmas[::-1]
+
+            means = torch.cat(means, dim=1)
+            sigmas = torch.cat(sigmas, dim=1)
+            samples = torch.cat(samples, dim=1) if len(samples) > 0 else None
+            return means, sigmas, samples
+
+        # Run according to direction: 'forward', 'backward', or 'both'
+        dir_mode = getattr(self.config, 'direction', 'forward')
+        if dir_mode == 'forward':
+            means_f, sig_raw_f, samples_f = run_direction(forward=True)
+            recon = torch.stack([means_f, sig_raw_f], dim=-1)
+            return {'reconstructed': recon, 'sampled': samples_f}
+        elif dir_mode == 'backward':
+            means_b, sig_raw_b, samples_b = run_direction(forward=False)
+            recon = torch.stack([means_b, sig_raw_b], dim=-1)
+            return {'reconstructed': recon, 'sampled': samples_b}
+        else:
+            # both: run forward and backward and fuse by precision weighting
+            means_f, sig_raw_f, samples_f = run_direction(forward=True)
+            means_b, sig_raw_b, samples_b = run_direction(forward=False)
+
+            sigma_f = F.softplus(sig_raw_f)
+            sigma_b = F.softplus(sig_raw_b)
+            var_f = sigma_f ** 2 + 1e-12
+            var_b = sigma_b ** 2 + 1e-12
+
+            prec_f = 1.0 / var_f
+            prec_b = 1.0 / var_b
+
+            combined_prec = prec_f + prec_b
+            combined_mean = (means_f * prec_f + means_b * prec_b) / combined_prec
+            combined_var = 1.0 / combined_prec
+            combined_sigma = torch.sqrt(combined_var)
+            combined_raw = inv_softplus(combined_sigma)
+
+            recon = torch.stack([combined_mean, combined_raw], dim=-1)
+
+            # If sampling was performed in both directions, sample from combined mean/var
+            samples_combined = None
+            if (samples_f is not None) or (samples_b is not None):
+                # draw samples from combined distribution
+                eps = torch.randn_like(combined_mean, device=device, generator=gen) if gen is not None else torch.randn_like(combined_mean, device=device)
+                samples_combined = combined_mean + combined_sigma * eps
+
+            return {'reconstructed': recon, 'sampled': samples_combined}
 
 
 # Alias for consistency

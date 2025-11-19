@@ -171,9 +171,11 @@ def train_epoch(model, dataloader, optimizer, criterion, device, scheduler=None)
         x_target = batch['target'].to(device)  # (batch, seq_len)
         timestamps = batch['time'].to(device)  # (batch, seq_len)
         mask = batch['mask'].to(device)  # (batch, seq_len)
+
         # Forward pass
         optimizer.zero_grad()
-        output = model(x_input, timestamps)
+        # Pass target and mask to support autoregressive teacher forcing when enabled
+        output = model(x_input, timestamps, target=x_target, mask=mask)
         # output['reconstructed']: (batch, seq_len, 2) -> mean, log_sigma
         recon = output['reconstructed']
         pred_mean = recon[..., 0]
@@ -209,6 +211,9 @@ def train_epoch(model, dataloader, optimizer, criterion, device, scheduler=None)
         total_unmasked_loss += unmasked_nll.item()
         n_batches += 1
 
+    if n_batches == 0:
+        return {'total_loss': 0.0, 'masked_loss': 0.0, 'unmasked_loss': 0.0}
+
     return {
         'total_loss': total_loss / n_batches,
         'masked_loss': total_masked_loss / n_batches,
@@ -232,7 +237,8 @@ def validate_epoch(model, dataloader, criterion, device):
             mask = batch['mask'].to(device)
 
             # Forward pass
-            output = model(x_input, timestamps)
+            # Provide target and mask so the model can use teacher forcing in autoregressive mode
+            output = model(x_input, timestamps, target=x_target, mask=mask)
             recon = output['reconstructed']
             pred_mean = recon[..., 0]
             pred_logsigma = recon[..., 1]
@@ -250,6 +256,9 @@ def validate_epoch(model, dataloader, criterion, device):
             total_unmasked_loss += unmasked_loss.item()
             n_batches += 1
 
+    if n_batches == 0:
+        return {'total_loss': 0.0, 'masked_loss': 0.0, 'unmasked_loss': 0.0}
+
     return {
         'total_loss': total_loss / n_batches,
         'masked_loss': total_masked_loss / n_batches,
@@ -257,12 +266,16 @@ def validate_epoch(model, dataloader, criterion, device):
     }
 
 
-def plot_reconstruction_examples(model, dataloader, device, save_path, n_examples=4):
-    """Plot reconstruction examples."""
+def plot_reconstruction_examples(model, dataloader, device, save_path, n_examples=4, sample_eval=False, num_samples=3, base_seed=0, eval_teacher_forcing=False):
+    """Plot reconstruction examples. If sample_eval is True, generate multiple sampled
+    reconstructions per example (saved as separate files)."""
     model.eval()
 
     # Get one batch
     batch = next(iter(dataloader))
+    actual_batch_size = batch['input'].shape[0]
+    n_examples = min(n_examples, actual_batch_size)
+
     x_input = batch['input'].to(device)[:n_examples]
     x_target = batch['target'].to(device)[:n_examples]
     timestamps = batch['time'].to(device)[:n_examples]
@@ -271,54 +284,272 @@ def plot_reconstruction_examples(model, dataloader, device, save_path, n_example
     mask_ratios = batch['mask_ratio'][:n_examples].numpy()
 
     with torch.no_grad():
-        output = model(x_input, timestamps)
-        # output['reconstructed']: (batch, seq_len, 2) -> mean, log_sigma
-        recon = output['reconstructed']
-        recon_mean = recon[..., 0]
-        recon_logsigma = recon[..., 1]
-        recon_sigma = torch.nn.functional.softplus(recon_logsigma)
-        x_recon_mean = recon_mean
-        x_recon_sigma = recon_sigma
+        # Base reconstruction: either pass target/mask (teacher forcing) or not
+        if eval_teacher_forcing:
+            base_out = model(x_input, timestamps, target=x_target, mask=mask)
+        else:
+            base_out = model(x_input, timestamps)
+
+        if isinstance(base_out, dict) and 'reconstructed' in base_out:
+            recon = base_out['reconstructed']
+            recon_mean = recon[..., 0]
+            recon_logsigma = recon[..., 1]
+            recon_sigma = torch.nn.functional.softplus(recon_logsigma)
+            sampled_initial = base_out.get('sampled', None)
+        else:
+            recon = base_out
+            recon_mean = recon[..., 0]
+            recon_sigma = torch.nn.functional.softplus(recon[..., 1])
+            sampled_initial = None
+
+        sampled_list = []
+        if sample_eval:
+            for s in range(num_samples):
+                seed = int(base_seed + s + 1)
+                # When sampling, we do not pass target/mask to ensure the model
+                # runs autoregressively and samples its own previous predictions.
+                # If the user requested teacher forcing during evaluation, pass
+                # target/mask to get deterministic mean traces instead.
+                # For sampled reconstructions, always pass target+mask so observed
+                # (unmasked) points are conditioned on the true values. The
+                # seeding ensures each sample is different.
+                out_s = model(x_input, timestamps, target=x_target, mask=mask, seed=seed)
+                if isinstance(out_s, dict):
+                    sampled_list.append(out_s.get('sampled', None))
+                else:
+                    sampled_list.append(None)
 
     # Move to CPU for plotting
     x_target = x_target.cpu().numpy()
-    x_recon_mean = x_recon_mean.cpu().numpy()
-    x_recon_sigma = x_recon_sigma.cpu().numpy()
+    recon_mean_np = recon_mean.cpu().numpy()
+    recon_sigma_np = recon_sigma.cpu().numpy()
     timestamps_np = timestamps.cpu().numpy()
-    mask = mask.cpu().numpy()
+    mask_np = mask.cpu().numpy()
 
-    # Create plots
-    fig, axes = plt.subplots(n_examples, 1, figsize=(12, 3*n_examples))
+    if not sample_eval:
+        fig, axes = plt.subplots(n_examples, 1, figsize=(12, 3*n_examples))
+        if n_examples == 1:
+            axes = [axes]
+
+        for i, ax in enumerate(axes):
+            t = timestamps_np[i]
+            target = x_target[i]
+            recon_mean_i = recon_mean_np[i]
+            recon_sigma_i = recon_sigma_np[i]
+            m = mask_np[i].astype(bool)
+            block_size = block_sizes[i]
+            mask_ratio = mask_ratios[i]
+
+            # Shade masked and unmasked intervals to make regions obvious
+            # We'll compute contiguous segments for masked/unmasked and axvspan them
+            def shade_regions(ax, t, mask_bool):
+                """Shade only masked (True) contiguous segments without gaps.
+
+                Uses t[idx] as the end boundary so adjacent segments touch.
+                """
+                labeled_mask = False
+                n = len(mask_bool)
+                if n == 0:
+                    return
+                cur = mask_bool[0]
+                start = 0
+                for idx in range(1, n):
+                    if mask_bool[idx] != cur:
+                        if cur:
+                            x0 = float(t[start])
+                            x1 = float(t[idx])
+                            ax.axvspan(x0, x1, color='red', alpha=0.10, zorder=0, label='Masked region' if not labeled_mask else None)
+                            labeled_mask = True
+                        start = idx
+                        cur = mask_bool[idx]
+                # last segment
+                if cur:
+                    x0 = float(t[start])
+                    x1 = float(t[-1])
+                    ax.axvspan(x0, x1, color='red', alpha=0.10, zorder=0, label='Masked region' if not labeled_mask else None)
+
+            shade_regions(ax, t, m)
+
+            # Plot target thicker so it's obvious
+            ax.plot(t, target, color='k', alpha=0.9, label='Target', linewidth=3.0, zorder=5)
+            ax.plot(t, recon_mean_i, 'b-', alpha=0.85, label='Reconstruction (mean)', linewidth=1.5, zorder=4)
+            ax.fill_between(t, recon_mean_i - 2 * recon_sigma_i, recon_mean_i + 2 * recon_sigma_i,
+                            color='blue', alpha=0.12, step=None, label='Uncertainty (±2σ)', zorder=1)
+            ax.legend(loc='upper right', fontsize='small')
+            ax.set_xlabel('Time')
+            ax.set_ylabel('Flux')
+            ax.set_title(f'Example {i+1} (masked {mask_ratio*100:.1f}%, block size {block_size})')
+            ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150)
+        plt.close()
+        print(f"Saved reconstruction plot to {save_path}")
+        return
+
+    # sample_eval True: create a single consolidated figure with one row per example.
+    fig, axes = plt.subplots(n_examples, 1, figsize=(12, 3 * n_examples))
     if n_examples == 1:
         axes = [axes]
+
+    def shade_regions(ax, t, mask_bool):
+        """Shade only masked (True) contiguous segments without gaps.
+
+        Uses t[idx] as the end boundary so adjacent segments touch.
+        """
+        labeled_mask = False
+        n = len(mask_bool)
+        if n == 0:
+            return
+        cur = mask_bool[0]
+        start = 0
+        for idx in range(1, n):
+            if mask_bool[idx] != cur:
+                if cur:
+                    x0 = float(t[start])
+                    x1 = float(t[idx])
+                    ax.axvspan(x0, x1, color='red', alpha=0.10, zorder=0, label='Masked region' if not labeled_mask else None)
+                    labeled_mask = True
+                start = idx
+                cur = mask_bool[idx]
+        # last segment
+        if cur:
+            x0 = float(t[start])
+            x1 = float(t[-1])
+            ax.axvspan(x0, x1, color='red', alpha=0.10, zorder=0, label='Masked region' if not labeled_mask else None)
 
     for i, ax in enumerate(axes):
         t = timestamps_np[i]
         target = x_target[i]
-        recon_mean = x_recon_mean[i]
-        recon_sigma = x_recon_sigma[i]
-        m = mask[i]
+        recon_mean_i = recon_mean_np[i]
+        recon_sigma_i = recon_sigma_np[i]
+        m = mask_np[i].astype(bool)
         block_size = block_sizes[i]
         mask_ratio = mask_ratios[i]
 
-        # Plot target and reconstruction
-        ax.plot(t, target, 'k-', alpha=0.6, label='Target', linewidth=1.5)
-        # Plot reconstruction mean and uncertainty band
-        ax.plot(t, recon_mean, 'b-', alpha=0.8, label='Reconstruction (mean)', linewidth=1.5)
-        # Uncertainty band: mean ± 2*sigma
-        ax.fill_between(t, recon_mean - 2 * recon_sigma, recon_mean + 2 * recon_sigma,
-                        color='blue', alpha=0.15, step=None, label='Uncertainty (±2σ)')
+        # Shade masked/observed regions
+        shade_regions(ax, t, m)
 
-        ax.legend()
+        # Plot target thicker so it's obvious
+        ax.plot(t, target, color='k', alpha=0.95, label='Target', linewidth=3.0, zorder=5)
+        ax.plot(t, recon_mean_i, 'b--', alpha=0.9, label='Mean reconstruction', linewidth=1.5, zorder=4)
+        ax.fill_between(t, recon_mean_i - 2 * recon_sigma_i, recon_mean_i + 2 * recon_sigma_i,
+                        color='blue', alpha=0.12, step=None, label='Uncertainty (±2σ)', zorder=1)
+
+        # Overlay samples (use model-provided samples when available, otherwise draw from mean+sigma)
+        for s_idx in range(num_samples):
+            s_arr = sampled_list[s_idx] if s_idx < len(sampled_list) else None
+            if s_arr is not None:
+                sample_vals = s_arr.cpu().numpy()[i]
+            else:
+                seed = int(base_seed + s_idx + 1)
+                rng = np.random.default_rng(seed)
+                eps = rng.standard_normal(size=recon_mean_i.shape)
+                sample_vals = recon_mean_i + recon_sigma_i * eps
+
+            ax.plot(t, sample_vals, alpha=0.7, label=f'Sample {s_idx+1}')
+
         ax.set_xlabel('Time')
         ax.set_ylabel('Flux')
-        ax.set_title(f'Example {i+1} (masked {mask_ratio*100:.1f}%, block size {block_size})')
+        ax.set_title(f'Example {i+1} (masked {mask_ratio*100:.1f}%, block {block_size})')
+        ax.legend(loc='upper right', fontsize='small')
         ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
     plt.close()
     print(f"Saved reconstruction plot to {save_path}")
+
+    # --- Zoomed-in view: for each example show a close-up of ~100 timesteps ---
+    # Use a fixed window length (100 timesteps or seq_len if smaller). Center the
+    # window on the largest masked segment (or sequence center if none).
+    zoom_windows = []
+    seq_len = timestamps_np.shape[1]
+    window_len = min(100, seq_len)
+    for i in range(n_examples):
+        mask_bool = mask_np[i].astype(bool)
+        # find contiguous True runs and pick the longest
+        best_start, best_end, best_len = None, None, 0
+        cur_start = None
+        for j in range(seq_len):
+            if mask_bool[j]:
+                if cur_start is None:
+                    cur_start = j
+            else:
+                if cur_start is not None:
+                    l = j - cur_start
+                    if l > best_len:
+                        best_start, best_end, best_len = cur_start, j, l
+                    cur_start = None
+        # tail
+        if cur_start is not None:
+            l = seq_len - cur_start
+            if l > best_len:
+                best_start, best_end, best_len = cur_start, seq_len, l
+
+        if best_start is None:
+            # fallback: center window
+            center = seq_len // 2
+        else:
+            center = (best_start + best_end) // 2
+
+        s = max(0, center - window_len // 2)
+        e = s + window_len
+        if e > seq_len:
+            e = seq_len
+            s = max(0, e - window_len)
+        zoom_windows.append((s, e))
+
+    # Create zoomed figure
+    zoom_path = Path(str(save_path)).with_suffix('')
+    zoom_path = Path(f"{zoom_path}_zoom.png")
+    fig_z, axes_z = plt.subplots(n_examples, 1, figsize=(12, 3 * n_examples))
+    if n_examples == 1:
+        axes_z = [axes_z]
+
+    for i, ax in enumerate(axes_z):
+        t = timestamps_np[i]
+        recon_mean_i = recon_mean_np[i]
+        recon_sigma_i = recon_sigma_np[i]
+        start, end = zoom_windows[i]
+        t_win = t[start:end]
+        mean_win = recon_mean_i[start:end]
+        sigma_win = recon_sigma_i[start:end]
+        target_win = x_target[i][start:end]
+
+        # shade masked area in this window
+        mask_seg = mask_np[i][start:end].astype(bool)
+        if mask_seg.any():
+            # shade the entire masked points range (contiguous) for visibility
+            seg_idx = np.where(mask_seg)[0]
+            ax.axvspan(float(t_win[seg_idx[0]]), float(t_win[seg_idx[-1]]), color='red', alpha=0.12, zorder=0)
+
+        ax.plot(t_win, target_win, color='k', linewidth=3.0, label='Target')
+        ax.plot(t_win, mean_win, 'b--', linewidth=1.5, label='Mean')
+        ax.fill_between(t_win, mean_win - 2 * sigma_win, mean_win + 2 * sigma_win, color='blue', alpha=0.12)
+
+        # plot samples
+        for s_idx in range(num_samples):
+            s_arr = sampled_list[s_idx] if s_idx < len(sampled_list) else None
+            if s_arr is not None:
+                sample_vals = s_arr.cpu().numpy()[i][start:end]
+            else:
+                seed = int(base_seed + s_idx + 1)
+                rng = np.random.default_rng(seed)
+                eps = rng.standard_normal(size=mean_win.shape)
+                sample_vals = mean_win + sigma_win * eps
+            ax.plot(t_win, sample_vals, alpha=0.8, label=f'Sample {s_idx+1}')
+
+        ax.set_xlabel('Time')
+        ax.set_ylabel('Flux')
+        ax.set_title(f'Zoom Example {i+1} (t[{start}:{end}])')
+        ax.legend(loc='upper right', fontsize='small')
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(zoom_path, dpi=150)
+    plt.close()
+    print(f"Saved zoomed reconstruction plot to {zoom_path}")
 
 
 def main():
@@ -348,8 +579,16 @@ def main():
                         help='Maximum block size for masking')
     parser.add_argument('--val_split', type=float, default=0.15,
                         help='Validation set fraction')
+    parser.add_argument('--subset_size', type=int, default=0,
+                        help='If >0, randomly sample this many examples from the dataset for quick tests')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
+    parser.add_argument('--sample_eval', action='store_true',
+                        help='When set, generate sampled reconstructions during evaluation/plotting')
+    parser.add_argument('--num_samples', type=int, default=3,
+                        help='Number of stochastic samples to generate per example when --sample_eval is set')
+    parser.add_argument('--eval_teacher_forcing', action='store_true',
+                        help='When set, use teacher forcing (pass target+mask) during evaluation and plotting; otherwise sample autoregressively')
     parser.add_argument('--device', type=str, default='auto',
                         help='Device (cuda/cpu/auto)')
     parser.add_argument('--save_every', type=int, default=10,
@@ -375,6 +614,17 @@ def main():
     # Load data
     print(f"\nLoading data from {args.input}...")
     flux, timestamps, flux_err = load_lightcurve_data(args.input)
+
+    # Optionally subsample the dataset for quick tests
+    if args.subset_size and args.subset_size > 0:
+        n_total = flux.shape[0]
+        subset = min(args.subset_size, n_total)
+        rng = np.random.default_rng(args.seed)
+        idx = rng.choice(n_total, size=subset, replace=False)
+        flux = flux[idx]
+        timestamps = timestamps[idx]
+        if flux_err is not None:
+            flux_err = flux_err[idx]
 
     print(f"\nDataset statistics:")
     print(f"  Shape: {flux.shape}")
@@ -452,7 +702,13 @@ def main():
         x_input_sample = sample_batch['input'].to(device)
         timestamps_sample = sample_batch['time'].to(device)
         print("Sanity check - sample input shapes:", x_input_sample.shape, timestamps_sample.shape)
-        sample_out = model(x_input_sample, timestamps_sample)
+        # Provide sample target and mask for sanity-check forward pass (supports autoregressive mode)
+        sample_out = model(
+            x_input_sample,
+            timestamps_sample,
+            target=sample_batch['target'].to(device),
+            mask=sample_batch['mask'].to(device)
+        )
         if isinstance(sample_out, dict) and 'reconstructed' in sample_out:
             print("Sanity check forward OK. Reconstructed shape:", sample_out['reconstructed'].shape)
         else:
@@ -471,16 +727,22 @@ def main():
     # Optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
 
-    # OneCycleLR scheduler
+    # OneCycleLR scheduler: only create if there are >0 total steps
     total_steps = len(train_loader) * args.epochs
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=args.lr,
-        total_steps=total_steps,
-        pct_start=0.1,
-        div_factor=1e2,
-        final_div_factor=1e2
-    )
+    if total_steps > 0:
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=args.lr,
+            total_steps=total_steps,
+            pct_start=0.1,
+            div_factor=1e2,
+            final_div_factor=1e2,
+            anneal_strategy='cos',
+            # AdamW doesn't use momentum like SGD - disable cycling momentum
+            cycle_momentum=False
+        )
+    else:
+        scheduler = None
 
     # Loss function
     criterion = nn.MSELoss()
@@ -533,7 +795,12 @@ def main():
         if (epoch + 1) % 10 == 0 or epoch == 0:
             plot_path = output_dir / f'rnn_recon_v4_epoch{epoch+1}.png'
             plot_reconstruction_examples(
-                model, val_loader, device, plot_path
+                model, val_loader, device, plot_path,
+                n_examples=min(4, args.batch_size),
+                sample_eval=args.sample_eval,
+                num_samples=args.num_samples,
+                base_seed=args.seed,
+                eval_teacher_forcing=args.eval_teacher_forcing
             )
 
         # Save periodic checkpoints
