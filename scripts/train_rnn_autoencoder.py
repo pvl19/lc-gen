@@ -551,6 +551,49 @@ def plot_reconstruction_examples(model, dataloader, device, save_path, n_example
     plt.close()
     print(f"Saved zoomed reconstruction plot to {zoom_path}")
 
+    # Also save individual zoom figures for each example
+    for i in range(n_examples):
+        s, e = zoom_windows[i]
+        t = timestamps_np[i][s:e]
+        mean_win = recon_mean_np[i][s:e]
+        sigma_win = recon_sigma_np[i][s:e]
+        target_win = x_target[i][s:e]
+
+        fig_i, ax_i = plt.subplots(1, 1, figsize=(10, 3))
+        # Shade masked region within this window if present
+        mask_seg = mask_np[i][s:e].astype(bool)
+        if mask_seg.any():
+            seg_idx = np.where(mask_seg)[0]
+            ax_i.axvspan(float(t[seg_idx[0]]), float(t[seg_idx[-1]]), color='red', alpha=0.12, zorder=0)
+
+        ax_i.plot(t, target_win, color='k', linewidth=3.0, label='Target')
+        ax_i.plot(t, mean_win, 'b--', linewidth=1.5, label='Mean')
+        ax_i.fill_between(t, mean_win - 2 * sigma_win, mean_win + 2 * sigma_win, color='blue', alpha=0.12)
+
+        for s_idx in range(num_samples):
+            s_arr = sampled_list[s_idx] if s_idx < len(sampled_list) else None
+            if s_arr is not None:
+                sample_vals = s_arr.cpu().numpy()[i][s:e]
+            else:
+                seed = int(base_seed + s_idx + 1)
+                rng = np.random.default_rng(seed)
+                eps = rng.standard_normal(size=mean_win.shape)
+                sample_vals = mean_win + sigma_win * eps
+            ax_i.plot(t, sample_vals, alpha=0.8, label=f'Sample {s_idx+1}')
+
+        ax_i.set_xlabel('Time')
+        ax_i.set_ylabel('Flux')
+        ax_i.set_title(f'Zoom Example {i+1} (t[{s}:{e}])')
+        ax_i.legend(loc='upper right', fontsize='small')
+        ax_i.grid(True, alpha=0.3)
+
+        per_zoom_path = Path(str(save_path)).with_suffix('')
+        per_zoom_path = Path(f"{per_zoom_path}_example{i+1}_zoom.png")
+        plt.tight_layout()
+        plt.savefig(per_zoom_path, dpi=150)
+        plt.close()
+        print(f"Saved per-example zoom plot to {per_zoom_path}")
+
 
 def main():
     parser = argparse.ArgumentParser(description='Train hierarchical RNN (minLSTM/minGRU) autoencoder on light curves')
