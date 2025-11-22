@@ -176,23 +176,50 @@ def train_epoch(model, dataloader, optimizer, criterion, device, scheduler=None)
         optimizer.zero_grad()
         # Pass target and mask to support autoregressive teacher forcing when enabled
         output = model(x_input, timestamps, target=x_target, mask=mask)
-        # output['reconstructed']: (batch, seq_len, 2) -> mean, log_sigma
-        recon = output['reconstructed']
-        pred_mean = recon[..., 0]
-        pred_logsigma = recon[..., 1]
-        # To ensure positive scale, convert log-sigma to sigma via softplus or exp
-        pred_sigma = torch.nn.functional.softplus(pred_logsigma)
 
-        # Negative log-likelihood per element for Gaussian: 0.5*log(2*pi*sigma^2) + 0.5*((y - mu)^2 / sigma^2)
-        # Compute full NLL over all timesteps
-        var_scatter = pred_sigma ** 2 + 1e-8
-        var_measure = x_flux_err ** 2 + 1e-8
-        nll = 0.5 * (torch.log(2 * math.pi * (var_measure + var_scatter)) + (pred_mean - x_target) ** 2 / (var_measure + var_scatter))
-        loss = nll.mean()
+        # If model provides flow context, use zuko flow log-prob with data augmentation
+        if isinstance(output, dict) and 'flow_context' in output and output['flow_context'] is not None:
+            flow_ctx = output['flow_context']  # (B, L, C)
+            # We'll sample one noisy target per data point: y_noisy ~ N(y_true, meas_err^2)
+            eps = torch.randn_like(x_target)  # standard normal
+            y_noisy = x_target + x_flux_err * eps
 
-        # Also compute masked/unmasked NLL for monitoring
-        masked_nll = nll[mask].mean() if mask.any() else torch.tensor(0.0, device=device)
-        unmasked_nll = nll[~mask].mean() if (~mask).any() else torch.tensor(0.0, device=device)
+            # Reshape to (B*L, C) contexts and (B*L, 1) targets for flow
+            B, L = x_target.shape
+            ctx_flat = flow_ctx.view(B * L, -1)
+            y_flat = y_noisy.view(B * L, 1)
+
+            # Evaluate flow log_prob (zuko distribution expects context passed when constructing)
+            # The model stores a flow_posterior module inside; access via model.flow_posterior
+            if getattr(model, 'flow_posterior', None) is None:
+                raise RuntimeError('Model configured to output flow_context but no flow_posterior module found (zuko missing?)')
+
+            dist = model.flow_posterior(ctx_flat)
+            # log_prob returns (...,) for scalar event shape
+            logp = dist.log_prob(y_flat).view(B, L)
+            # Negative log-likelihood (we maximize logp) -> loss = -mean(logp)
+            loss = -logp.mean()
+            masked_nll = (-logp)[mask].mean() if mask.any() else torch.tensor(0.0, device=device)
+            unmasked_nll = (-logp)[~mask].mean() if (~mask).any() else torch.tensor(0.0, device=device)
+
+        else:
+            # output['reconstructed']: (batch, seq_len, 2) -> mean, log_sigma
+            recon = output['reconstructed']
+            pred_mean = recon[..., 0]
+            pred_logsigma = recon[..., 1]
+            # To ensure positive scale, convert log-sigma to sigma via softplus or exp
+            pred_sigma = torch.nn.functional.softplus(pred_logsigma)
+
+            # Negative log-likelihood per element for Gaussian: 0.5*log(2*pi*sigma^2) + 0.5*((y - mu)^2 / sigma^2)
+            # Compute full NLL over all timesteps
+            var_scatter = pred_sigma ** 2 + 1e-8
+            var_measure = x_flux_err ** 2 + 1e-8
+            nll = 0.5 * (torch.log(2 * math.pi * (var_measure + var_scatter)) + (pred_mean - x_target) ** 2 / (var_measure + var_scatter))
+            loss = nll.mean()
+            masked_nll = nll[mask].mean() if mask.any() else torch.tensor(0.0, device=device)
+            unmasked_nll = nll[~mask].mean() if (~mask).any() else torch.tensor(0.0, device=device)
+
+    # (masked_nll and unmasked_nll already computed per-branch above)
 
         # Backprop and optimize on full NLL loss
         loss.backward()
@@ -221,7 +248,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, scheduler=None)
     }
 
 
-def validate_epoch(model, dataloader, criterion, device):
+def validate_epoch(model, dataloader, criterion, device, mc_samples=32):
     """Validate for one epoch."""
     model.eval()
     total_loss = 0
@@ -239,17 +266,64 @@ def validate_epoch(model, dataloader, criterion, device):
             # Forward pass
             # Provide target and mask so the model can use teacher forcing in autoregressive mode
             output = model(x_input, timestamps, target=x_target, mask=mask)
-            recon = output['reconstructed']
-            pred_mean = recon[..., 0]
-            pred_logsigma = recon[..., 1]
-            pred_sigma = torch.nn.functional.softplus(pred_logsigma)
 
-            var = pred_sigma ** 2 + 1e-8
-            nll = 0.5 * (torch.log(2 * math.pi * var) + (pred_mean - x_target) ** 2 / var)
+            if isinstance(output, dict) and 'flow_context' in output and output['flow_context'] is not None:
+                flow_ctx = output['flow_context']  # (B, L, C)
+                B, L = x_target.shape
+                ctx_flat = flow_ctx.view(B * L, -1)
+                y_flat = x_target.view(B * L, 1)
+                meas_err = x_input[..., 1].view(B * L, 1)
+                if getattr(model, 'flow_posterior', None) is None:
+                    raise RuntimeError('Model provided flow_context but no flow_posterior module found')
 
-            loss = nll.mean()
-            masked_loss = nll[mask].mean() if mask.any() else torch.tensor(0.0, device=device)
-            unmasked_loss = nll[~mask].mean() if (~mask).any() else torch.tensor(0.0, device=device)
+                dist = model.flow_posterior(ctx_flat)
+                # Compute flow log_prob at the observed target (useful when meas_err~0)
+                logp_flow = dist.log_prob(y_flat).view(B, L)
+
+                # Prepare measurement error thresholding to avoid division-by-zero explosions
+                meas_err_flat = meas_err.view(B * L, 1)
+                thresh = 1e-6
+                small_mask = (meas_err_flat.squeeze(-1) <= thresh)  # (B*L,)
+
+                # For small measurement error, use flow density directly; otherwise use MC convolution
+                logp_obs = torch.empty(B * L, device=device)
+
+                if (~small_mask).any():
+                    idx = (~small_mask).nonzero(as_tuple=False).squeeze(-1)
+                    # sample shape: (S, N_small, 1)
+                    ctx_small = ctx_flat[idx]
+                    y_small = y_flat[idx]
+                    meas_small = meas_err_flat[idx]
+                    dist_small = model.flow_posterior(ctx_small)
+                    samples_z = dist_small.sample((mc_samples,))  # (S, N_small, 1)
+                    y_rep = y_small.unsqueeze(0).expand(samples_z.shape[0], -1, -1)
+                    meas_rep = meas_small.unsqueeze(0).expand(samples_z.shape[0], -1, -1)
+                    var = meas_rep ** 2 + 1e-8
+                    log_gauss = -0.5 * (torch.log(2 * math.pi * var) + (y_rep - samples_z) ** 2 / var)
+                    logp_obs_small = torch.logsumexp(log_gauss.squeeze(-1), dim=0) - math.log(float(samples_z.shape[0]))
+                    logp_obs[idx] = logp_obs_small
+
+                # Fill small-meas entries with direct flow log-prob
+                small_idx = small_mask.nonzero(as_tuple=False).squeeze(-1)
+                if small_idx.numel() > 0:
+                    logp_obs[small_idx] = logp_flow.view(-1)[small_idx]
+
+                logp_obs = logp_obs.view(B, L)
+                loss = -logp_obs.mean()
+                masked_loss = (-logp_obs)[mask].mean() if mask.any() else torch.tensor(0.0, device=device)
+                unmasked_loss = (-logp_obs)[~mask].mean() if (~mask).any() else torch.tensor(0.0, device=device)
+            else:
+                recon = output['reconstructed']
+                pred_mean = recon[..., 0]
+                pred_logsigma = recon[..., 1]
+                pred_sigma = torch.nn.functional.softplus(pred_logsigma)
+
+                var = pred_sigma ** 2 + 1e-8
+                nll = 0.5 * (torch.log(2 * math.pi * var) + (pred_mean - x_target) ** 2 / var)
+
+                loss = nll.mean()
+                masked_loss = nll[mask].mean() if mask.any() else torch.tensor(0.0, device=device)
+                unmasked_loss = nll[~mask].mean() if (~mask).any() else torch.tensor(0.0, device=device)
 
             total_loss += loss.item()
             total_masked_loss += masked_loss.item()
@@ -271,17 +345,48 @@ def plot_reconstruction_examples(model, dataloader, device, save_path, n_example
     reconstructions per example (saved as separate files)."""
     model.eval()
 
-    # Get one batch
-    batch = next(iter(dataloader))
-    actual_batch_size = batch['input'].shape[0]
-    n_examples = min(n_examples, actual_batch_size)
+    # Collect up to `n_examples` examples from the dataloader. This allows the
+    # plotting routine to display 4 examples even when the dataloader's batch
+    # size is smaller than 4 by concatenating multiple batches.
+    inputs_list = []
+    targets_list = []
+    times_list = []
+    masks_list = []
+    block_sizes_list = []
+    mask_ratios_list = []
 
-    x_input = batch['input'].to(device)[:n_examples]
-    x_target = batch['target'].to(device)[:n_examples]
-    timestamps = batch['time'].to(device)[:n_examples]
-    mask = batch['mask'].to(device)[:n_examples]
-    block_sizes = batch['block_size'][:n_examples].numpy()
-    mask_ratios = batch['mask_ratio'][:n_examples].numpy()
+    collected = 0
+    data_iter = iter(dataloader)
+    while collected < n_examples:
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            break
+
+        bs = batch['input'].shape[0]
+        need = n_examples - collected
+        take = min(need, bs)
+
+        inputs_list.append(batch['input'][:take])
+        targets_list.append(batch['target'][:take])
+        times_list.append(batch['time'][:take])
+        masks_list.append(batch['mask'][:take])
+        block_sizes_list.append(batch['block_size'][:take])
+        mask_ratios_list.append(batch['mask_ratio'][:take])
+
+        collected += take
+
+    if collected == 0:
+        print("No data available from dataloader to plot examples.")
+        return
+
+    # Stack and ensure we only keep up to n_examples (in case more were collected)
+    x_input = torch.cat(inputs_list, dim=0)[:n_examples].to(device)
+    x_target = torch.cat(targets_list, dim=0)[:n_examples].to(device)
+    timestamps = torch.cat(times_list, dim=0)[:n_examples].to(device)
+    mask = torch.cat(masks_list, dim=0)[:n_examples].to(device)
+    block_sizes = torch.cat(block_sizes_list, dim=0)[:n_examples].numpy()
+    mask_ratios = torch.cat(mask_ratios_list, dim=0)[:n_examples].numpy()
 
     with torch.no_grad():
         # Base reconstruction: either pass target/mask (teacher forcing) or not
@@ -373,8 +478,6 @@ def plot_reconstruction_examples(model, dataloader, device, save_path, n_example
             # Plot target thicker so it's obvious
             ax.plot(t, target, color='k', alpha=0.9, label='Target', linewidth=3.0, zorder=5)
             ax.plot(t, recon_mean_i, 'b-', alpha=0.85, label='Reconstruction (mean)', linewidth=1.5, zorder=4)
-            ax.fill_between(t, recon_mean_i - 2 * recon_sigma_i, recon_mean_i + 2 * recon_sigma_i,
-                            color='blue', alpha=0.12, step=None, label='Uncertainty (±2σ)', zorder=1)
             ax.legend(loc='upper right', fontsize='small')
             ax.set_xlabel('Time')
             ax.set_ylabel('Flux')
@@ -433,8 +536,6 @@ def plot_reconstruction_examples(model, dataloader, device, save_path, n_example
         # Plot target thicker so it's obvious
         ax.plot(t, target, color='k', alpha=0.95, label='Target', linewidth=3.0, zorder=5)
         ax.plot(t, recon_mean_i, 'b--', alpha=0.9, label='Mean reconstruction', linewidth=1.5, zorder=4)
-        ax.fill_between(t, recon_mean_i - 2 * recon_sigma_i, recon_mean_i + 2 * recon_sigma_i,
-                        color='blue', alpha=0.12, step=None, label='Uncertainty (±2σ)', zorder=1)
 
         # Overlay samples (use model-provided samples when available, otherwise draw from mean+sigma)
         for s_idx in range(num_samples):
@@ -464,6 +565,7 @@ def plot_reconstruction_examples(model, dataloader, device, save_path, n_example
     # Use a fixed window length (100 timesteps or seq_len if smaller). Center the
     # window on the largest masked segment (or sequence center if none).
     zoom_windows = []
+    zoom_centers = []
     seq_len = timestamps_np.shape[1]
     window_len = min(100, seq_len)
     for i in range(n_examples):
@@ -499,6 +601,7 @@ def plot_reconstruction_examples(model, dataloader, device, save_path, n_example
             e = seq_len
             s = max(0, e - window_len)
         zoom_windows.append((s, e))
+        zoom_centers.append(center)
 
     # Create zoomed figure
     zoom_path = Path(str(save_path)).with_suffix('')
@@ -526,7 +629,6 @@ def plot_reconstruction_examples(model, dataloader, device, save_path, n_example
 
         ax.plot(t_win, target_win, color='k', linewidth=3.0, label='Target')
         ax.plot(t_win, mean_win, 'b--', linewidth=1.5, label='Mean')
-        ax.fill_between(t_win, mean_win - 2 * sigma_win, mean_win + 2 * sigma_win, color='blue', alpha=0.12)
 
         # plot samples
         for s_idx in range(num_samples):
@@ -552,40 +654,54 @@ def plot_reconstruction_examples(model, dataloader, device, save_path, n_example
     print(f"Saved zoomed reconstruction plot to {zoom_path}")
 
     # Also save individual zoom figures for each example
+    window_lengths = [100, 200, 400]
     for i in range(n_examples):
-        s, e = zoom_windows[i]
-        t = timestamps_np[i][s:e]
-        mean_win = recon_mean_np[i][s:e]
-        sigma_win = recon_sigma_np[i][s:e]
-        target_win = x_target[i][s:e]
+        center = zoom_centers[i]
+        seq_len = timestamps_np.shape[1]
 
-        fig_i, ax_i = plt.subplots(1, 1, figsize=(10, 3))
-        # Shade masked region within this window if present
-        mask_seg = mask_np[i][s:e].astype(bool)
-        if mask_seg.any():
-            seg_idx = np.where(mask_seg)[0]
-            ax_i.axvspan(float(t[seg_idx[0]]), float(t[seg_idx[-1]]), color='red', alpha=0.12, zorder=0)
+        # Arrange zoom panels in a single column (one row per zoom length)
+        fig_i, axes_i = plt.subplots(len(window_lengths), 1, figsize=(8, 3 * len(window_lengths)))
+        if len(window_lengths) == 1:
+            axes_i = [axes_i]
 
-        ax_i.plot(t, target_win, color='k', linewidth=3.0, label='Target')
-        ax_i.plot(t, mean_win, 'b--', linewidth=1.5, label='Mean')
-        ax_i.fill_between(t, mean_win - 2 * sigma_win, mean_win + 2 * sigma_win, color='blue', alpha=0.12)
+        for ax_idx, win_len in enumerate(window_lengths):
+            s = max(0, center - win_len // 2)
+            e = s + win_len
+            if e > seq_len:
+                e = seq_len
+                s = max(0, e - win_len)
 
-        for s_idx in range(num_samples):
-            s_arr = sampled_list[s_idx] if s_idx < len(sampled_list) else None
-            if s_arr is not None:
-                sample_vals = s_arr.cpu().numpy()[i][s:e]
-            else:
-                seed = int(base_seed + s_idx + 1)
-                rng = np.random.default_rng(seed)
-                eps = rng.standard_normal(size=mean_win.shape)
-                sample_vals = mean_win + sigma_win * eps
-            ax_i.plot(t, sample_vals, alpha=0.8, label=f'Sample {s_idx+1}')
+            t = timestamps_np[i][s:e]
+            mean_win = recon_mean_np[i][s:e]
+            target_win = x_target[i][s:e]
+            sigma_win = recon_sigma_np[i][s:e]
 
-        ax_i.set_xlabel('Time')
-        ax_i.set_ylabel('Flux')
-        ax_i.set_title(f'Zoom Example {i+1} (t[{s}:{e}])')
-        ax_i.legend(loc='upper right', fontsize='small')
-        ax_i.grid(True, alpha=0.3)
+            ax = axes_i[ax_idx]
+            # Shade masked region within this window if present
+            mask_seg = mask_np[i][s:e].astype(bool)
+            if mask_seg.any():
+                seg_idx = np.where(mask_seg)[0]
+                ax.axvspan(float(t[seg_idx[0]]), float(t[seg_idx[-1]]), color='red', alpha=0.12, zorder=0)
+
+            ax.plot(t, target_win, color='k', linewidth=3.0, label='Target')
+            ax.plot(t, mean_win, 'b--', linewidth=1.5, label='Mean')
+
+            for s_idx in range(num_samples):
+                s_arr = sampled_list[s_idx] if s_idx < len(sampled_list) else None
+                if s_arr is not None:
+                    sample_vals = s_arr.cpu().numpy()[i][s:e]
+                else:
+                    seed = int(base_seed + s_idx + 1)
+                    rng = np.random.default_rng(seed)
+                    eps = rng.standard_normal(size=mean_win.shape)
+                    sample_vals = mean_win + sigma_win * eps
+                ax.plot(t, sample_vals, alpha=0.8, label=f'Sample {s_idx+1}')
+
+            ax.set_xlabel('Time')
+            ax.set_ylabel('Flux')
+            ax.set_title(f'Zoom {win_len} pts (t[{s}:{e}])')
+            ax.legend(loc='upper right', fontsize='small')
+            ax.grid(True, alpha=0.3)
 
         per_zoom_path = Path(str(save_path)).with_suffix('')
         per_zoom_path = Path(f"{per_zoom_path}_example{i+1}_zoom.png")
@@ -630,6 +746,8 @@ def main():
                         help='When set, generate sampled reconstructions during evaluation/plotting')
     parser.add_argument('--num_samples', type=int, default=3,
                         help='Number of stochastic samples to generate per example when --sample_eval is set')
+    parser.add_argument('--eval_mc_samples', type=int, default=32,
+                        help='Number of Monte Carlo samples to approximate convolution of flow with measurement noise during validation')
     parser.add_argument('--eval_teacher_forcing', action='store_true',
                         help='When set, use teacher forcing (pass target+mask) during evaluation and plotting; otherwise sample autoregressively')
     parser.add_argument('--device', type=str, default='auto',
@@ -808,7 +926,7 @@ def main():
         train_losses.append(train_metrics['total_loss'])
 
         # Validate
-        val_metrics = validate_epoch(model, val_loader, criterion, device)
+        val_metrics = validate_epoch(model, val_loader, criterion, device, mc_samples=args.eval_mc_samples)
         val_losses.append(val_metrics['total_loss'])
 
         # Print progress (match MLP format)
@@ -837,9 +955,11 @@ def main():
         # Plot samples every 10 epochs
         if (epoch + 1) % 10 == 0 or epoch == 0:
             plot_path = output_dir / f'rnn_recon_v4_epoch{epoch+1}.png'
+            # Request up to 4 examples for plotting; if the validation set is
+            # smaller than 4, the plotting function will clip accordingly.
             plot_reconstruction_examples(
                 model, val_loader, device, plot_path,
-                n_examples=min(4, args.batch_size),
+                n_examples=4,
                 sample_eval=args.sample_eval,
                 num_samples=args.num_samples,
                 base_seed=args.seed,

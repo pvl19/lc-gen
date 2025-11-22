@@ -29,6 +29,14 @@ import torch.nn.functional as F
 import math
 
 from .base import ModelConfig, BaseAutoencoder
+# zuko is required for normalizing-flow posterior
+try:
+    import zuko
+except Exception as e:
+    raise ImportError(
+        "The 'zuko' package is required for the normalizing-flow posterior."
+        " Install it with: pip install zuko"
+    ) from e
 
 
 def parallel_scan_log(coeffs, values):
@@ -116,7 +124,7 @@ class RNNConfig(ModelConfig):
     dropout: float = 0.0
 
     # Autoregressive generation
-    autoregressive: bool = False
+    autoregressive: bool = True
     teacher_forcing: bool = True
 
     # Positional encoding (time-aware)
@@ -606,11 +614,25 @@ class HierarchicalRNN(BaseAutoencoder):
         # Encoder and Decoder
         self.encoder = HierarchicalRNNEncoder(config)
         self.decoder = HierarchicalRNNDecoder(config)
-        # Output projection: predict mean and log-std for Gaussian output
+        # Output projection: keep a small Gaussian head for compatibility
         # output channels: [mean, log_sigma]
-        self.output_proj = nn.Linear(config.encoder_dims[0], 2)
+        self.output_proj_gauss = nn.Linear(config.encoder_dims[0], 2)
+        # Flow context projection: produces conditioning vector per timestep for the flow
+        self.flow_context_proj = nn.Linear(config.encoder_dims[0], config.encoder_dims[0])
+        # Conditional normalizing flow posterior (zuko). Lazy - may raise helpful error if missing at runtime.
+        self.flow_posterior = None
+        if zuko is not None:
+            # create a small NSF for 1D data conditioned on flow_context_dim
+            flow_context_dim = config.encoder_dims[0]
+            # Use a small number of transforms for speed; user can tune later
+            self.flow_posterior = zuko.flows.NSF(1, flow_context_dim, transforms=2, hidden_features=[64, 64])
+        else:
+            # Leave as None; code will raise a clear error if used without zuko installed
+            self.flow_posterior = None
         # small projection to mix previous mean into step input
         self.prev_mean_proj = nn.Linear(1, config.encoder_dims[0])
+        # small projection to inject per-timestep measurement error into step input
+        self.meas_proj = nn.Linear(1, config.encoder_dims[0])
         # Stepwise stacked RNN used for autoregressive decoding (operates at base resolution)
         # Use same rnn_type and width as level 0
         self.step_rnn = StackedRNN(
@@ -657,10 +679,16 @@ class HierarchicalRNN(BaseAutoencoder):
             (batch, seq_len, 2)  # [mean, log_sigma]
         """
         x = self.decoder(latent, skip_connections)
-        x = F.gelu(x)  # Non-linearity before output projection
-        x = self.output_proj(x)
-        # x shape: (batch, seq_len, 2) -> [mean, log_sigma]
-        return x
+        x = F.gelu(x)  # Non-linearity before output projections
+
+        # Gaussian head (compatibility)
+        gauss_out = self.output_proj_gauss(x)
+
+        # Flow conditioning context per timestep
+        flow_ctx = self.flow_context_proj(x)
+
+        # Return both so callers can use the flow when available
+        return gauss_out, flow_ctx
 
     def forward(self, x, t=None, target=None, mask=None, seed: 'Optional[int]' = None):
         """
@@ -689,9 +717,10 @@ class HierarchicalRNN(BaseAutoencoder):
             ar_out['skip_connections'] = skip_connections
             return ar_out
         else:
-            reconstructed = self.decode(latent, skip_connections)
+            gauss_out, flow_ctx = self.decode(latent, skip_connections)
             return {
-                'reconstructed': reconstructed,
+                'reconstructed': gauss_out,
+                'flow_context': flow_ctx,
                 'latent': latent,
                 'skip_connections': skip_connections
             }
@@ -714,10 +743,13 @@ class HierarchicalRNN(BaseAutoencoder):
         # Project input once and get encoder context (not strictly used here but kept)
         latent, skip_connections = self.encode(x, t)
 
-        # Prepare per-timestep input features: use projected input feature at each step
-        proj_x = self.input_proj(x)  # (B, L, D)
-        pos_enc = self.pos_encoder(t)
-        proj_x = proj_x + pos_enc
+        # Compute decoder features once: fuse latent + skip connections into
+        # per-timestep context that includes positional and skip information.
+        # Note: encode() already added positional encoding before the encoder,
+        # and the decoder output therefore contains time-aware features.
+        dec_feat = self.decoder(latent, skip_connections)  # (B, L, D)
+        # Decoder-level flow context (fused across skips/latent)
+        flow_ctx_dec = self.flow_context_proj(dec_feat)
 
         # helper: inverse softplus so we can convert sigma back to pre-activation
         def inv_softplus(y):
@@ -749,34 +781,38 @@ class HierarchicalRNN(BaseAutoencoder):
             samples = []  # store sampled values when sampling is active
 
             for ti in indices:
-                step_feat = proj_x[:, ti, :]
+                # Use decoder features as the per-step static context
+                step_feat = dec_feat[:, ti, :]
+
+                # measurement error at this timestep (scalar and 1-dim for projection)
+                meas_err_scalar = x[:, ti, 1]
+                meas_err = x[:, ti, 1:2]
 
                 # mix previous mean via a small projection
                 prev_mean_emb = self.prev_mean_proj(prev_mean.unsqueeze(-1))
-                step_in = step_feat + prev_mean_emb
+                # project measurement error and add it to step input so the
+                # autoregressive step conditions explicitly on local uncertainty
+                meas_emb = self.meas_proj(meas_err)
+
+                step_in = step_feat + prev_mean_emb + meas_emb
 
                 step_out = self.step_rnn.step(step_in)
-                out2 = self.output_proj(step_out)
+
+                # Gaussian head for compatibility (kept)
+                out2 = self.output_proj_gauss(step_out)
                 mean_t = out2[:, 0]
                 logsigma_raw = out2[:, 1]
 
-                # process sigma from raw via softplus
-                sigma_process = F.softplus(logsigma_raw)
-                var_process = sigma_process ** 2
+                # Flow context for this timestep
+                flow_ctx_t = self.flow_context_proj(step_out)  # (B, C)
 
-                # measurement error at this timestep
-                meas_err = x[:, ti, 1]
-                var_meas = meas_err ** 2
-
-                # predictive variance: process variance (model) plus measurement variance
-                predictive_var = var_process + var_meas + 1e-12
-                predictive_sigma = torch.sqrt(predictive_var)
-
-                # convert back to raw logsigma such that softplus(raw) ~= predictive_sigma
-                raw_combined = inv_softplus(predictive_sigma)
+                # keep scalar measurement error available for diagnostics / downstream use
+                # (meas_err_scalar set earlier)
+                meas_err = meas_err_scalar
 
                 means.append(mean_t.unsqueeze(1))
-                sigmas.append(raw_combined.unsqueeze(1))
+                # store raw flow context (not a sigma)
+                sigmas.append(logsigma_raw.unsqueeze(1))
 
                 # Determine per-sample whether this timestep is masked (True => masked)
                 if mask is not None:
@@ -785,27 +821,42 @@ class HierarchicalRNN(BaseAutoencoder):
                     mask_t = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
                 # Decide per-sample whether to use teacher forcing:
-                # If target is None or teacher_forcing disabled in config -> no teacher forcing
                 if (target is None) or (not getattr(self.config, 'teacher_forcing', True)):
                     use_teacher = torch.zeros(batch_size, dtype=torch.bool, device=device)
                 else:
                     # Use teacher forcing when the timestep is NOT masked (observed)
                     use_teacher = (~mask_t)
 
-                # Prepare container for the value that will be used as previous mean next step
+                # Prepare container for values used as previous mean for next step
                 sampled_vals = torch.empty(batch_size, device=device)
 
-                # Fill in values where teacher forcing applies (use ground truth)
+                # Fill in teacher-forced entries
                 if use_teacher.any():
                     sampled_vals[use_teacher] = target[use_teacher, ti]
 
-                # For remaining samples, draw from predictive distribution
+                # For remaining entries, sample from the conditional flow posterior if available
                 non_teacher_idx = (~use_teacher)
                 n_non_teacher = int(non_teacher_idx.sum().item())
                 if n_non_teacher > 0:
-                    # Draw epsilons for the entries that need sampling
-                    eps = torch.randn(n_non_teacher, device=device, generator=gen) if gen is not None else torch.randn(n_non_teacher, device=device)
-                    sampled_vals[non_teacher_idx] = mean_t[non_teacher_idx] + predictive_sigma[non_teacher_idx] * eps
+                        if self.flow_posterior is None:
+                            # fallback: sample from Gaussian head
+                            eps = torch.randn(n_non_teacher, device=device, generator=gen) if gen is not None else torch.randn(n_non_teacher, device=device)
+                            sampled_vals[non_teacher_idx] = mean_t[non_teacher_idx] + F.softplus(logsigma_raw[non_teacher_idx]) * eps
+                        else:
+                            # sample from flow conditioned on flow_ctx_t (step-level context)
+                            # select contexts for non-teacher indices and sample
+                            ctx_nt = flow_ctx_t[non_teacher_idx]
+                            # zuko expects context shape (..., C) and returns a Distribution
+                            dist = self.flow_posterior(ctx_nt)
+                            # Try to pass generator to make sampling deterministic when available
+                            try:
+                                s = dist.sample(generator=gen) if gen is not None else dist.sample()
+                            except TypeError:
+                                # Some distribution implementations may not accept generator
+                                s = dist.sample()
+                            # squeeze event dim
+                            s = s.view(-1)
+                            sampled_vals[non_teacher_idx] = s.to(device)
 
                 samples.append(sampled_vals.unsqueeze(1))
                 prev_mean = sampled_vals
@@ -851,12 +902,49 @@ class HierarchicalRNN(BaseAutoencoder):
 
             recon = torch.stack([combined_mean, combined_raw], dim=-1)
 
-            # If sampling was performed in both directions, sample from combined mean/var
+            # Prefer flow-resampling from the fused (decoder-level) context for
+            # masked entries; keep teacher-forcing for observed points.
             samples_combined = None
-            if (samples_f is not None) or (samples_b is not None):
-                # draw samples from combined distribution
-                eps = torch.randn_like(combined_mean, device=device, generator=gen) if gen is not None else torch.randn_like(combined_mean, device=device)
-                samples_combined = combined_mean + combined_sigma * eps
+
+            # Decide per-position whether to use teacher forcing (observed points)
+            if (target is None) or (not getattr(self.config, 'teacher_forcing', True)):
+                use_teacher_mask = torch.zeros_like(combined_mean, dtype=torch.bool, device=device)
+            else:
+                if mask is None:
+                    use_teacher_mask = torch.zeros_like(combined_mean, dtype=torch.bool, device=device)
+                else:
+                    use_teacher_mask = (~mask).to(device).bool()
+
+            # Initialize sampled tensor
+            B, L = combined_mean.shape
+            sampled_vals = torch.empty((B, L), device=device)
+
+            # Fill teacher-forced entries with ground truth when available
+            if use_teacher_mask.any():
+                sampled_vals[use_teacher_mask] = target[use_teacher_mask]
+
+            # Non-teacher positions should be sampled from the fused flow when available
+            non_teacher_mask = ~use_teacher_mask
+            if non_teacher_mask.any():
+                if self.flow_posterior is not None:
+                    # Use decoder-level flow context for fused sampling
+                    ctx_flat = flow_ctx_dec.view(B * L, -1)
+                    idx = non_teacher_mask.view(-1).nonzero(as_tuple=False).squeeze(-1)
+                    if idx.numel() > 0:
+                        ctx_sel = ctx_flat[idx]
+                        dist = self.flow_posterior(ctx_sel)
+                        try:
+                            s = dist.sample(generator=gen) if gen is not None else dist.sample()
+                        except TypeError:
+                            s = dist.sample()
+                        s = s.view(-1)
+                        sampled_vals.view(-1)[idx] = s.to(device)
+                else:
+                    # Fallback: sample from combined Gaussian
+                    eps = torch.randn_like(combined_mean, device=device, generator=gen) if gen is not None else torch.randn_like(combined_mean, device=device)
+                    sampled_vals[non_teacher_mask] = combined_mean[non_teacher_mask] + combined_sigma[non_teacher_mask] * eps[non_teacher_mask]
+
+            samples_combined = sampled_vals
 
             return {'reconstructed': recon, 'sampled': samples_combined}
 

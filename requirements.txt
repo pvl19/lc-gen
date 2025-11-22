@@ -24,3 +24,6 @@ tqdm>=4.66.0
 
 # Optional: Weights & Biases for experiment tracking
 # wandb>=0.15.0
+
+# Normalizing flows
+zuko>=1.5.0
