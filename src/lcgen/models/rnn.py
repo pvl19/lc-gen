@@ -767,6 +767,51 @@ class HierarchicalRNN(BaseAutoencoder):
             gen = torch.Generator(device=device)
             gen.manual_seed(int(seed))
 
+        # Helper to sample from a distribution deterministically when a torch.Generator
+        # is requested but the distribution implementation doesn't accept a generator
+        # kwarg (zuko NormalizingFlow.sample doesn't accept generator). Option A:
+        # derive an explicit per-context seed (seed_val) outside this helper and
+        # treat it as the exact seed to use. This makes sampling order-insensitive
+        # and reproducible: callers must compute a unique seed per (batch,timestep,...) context.
+        def safe_dist_sample(dist, gen_obj=None, seed_val=None):
+            # If no generator and no seed asked, just sample normally
+            if gen_obj is None and seed_val is None:
+                return dist.sample()
+
+            # Try direct generator-based sampling first (preferred)
+            if gen_obj is not None:
+                try:
+                    return dist.sample(generator=gen_obj)
+                except TypeError:
+                    # fall through to deterministic seed fallback
+                    pass
+
+            # If caller provided an explicit seed_val, use it deterministically.
+            # We DO NOT use any internal incrementing counter here (order-insensitive).
+            if seed_val is None:
+                # No seed provided; fall back to normal sampling
+                return dist.sample()
+
+            seed_use = int(seed_val)
+
+            # If distribution is batched (has batch_shape), try to sample the whole
+            # batch deterministically by seeding the global RNG, but avoid indexing
+            # into `dist` (some flow objects are not indexable). This is still
+            # deterministic and order-insensitive because callers should pass a
+            # seed that encodes the desired per-element variation (e.g. base + idx).
+            if device.type == 'cpu':
+                state = torch.get_rng_state()
+                torch.manual_seed(seed_use)
+                out = dist.sample()
+                torch.set_rng_state(state)
+                return out
+            else:
+                state_all = torch.cuda.get_rng_state_all()
+                torch.cuda.manual_seed_all(seed_use)
+                out = dist.sample()
+                torch.cuda.set_rng_state_all(state_all)
+                return out
+
         def run_direction(forward=True):
             # returns means (B,L), sigmas (B,L), samples (B,L or None) for the direction
             if forward:
@@ -827,39 +872,47 @@ class HierarchicalRNN(BaseAutoencoder):
                     # Use teacher forcing when the timestep is NOT masked (observed)
                     use_teacher = (~mask_t)
 
-                # Prepare container for values used as previous mean for next step
-                sampled_vals = torch.empty(batch_size, device=device)
+                # Always produce a sampled prediction for every position (for logging)
+                if self.flow_posterior is None:
+                    # Gaussian fallback: sample for all positions
+                    eps_all = torch.randn(batch_size, device=device, generator=gen) if gen is not None else torch.randn(batch_size, device=device)
+                    sampled_draws = mean_t + F.softplus(logsigma_raw) * eps_all
+                else:
+                    # Flow available: sample for all positions conditioned on step-level context
+                    dist_all = self.flow_posterior(flow_ctx_t)
+                    # Prefer generator-based sampling when possible
+                    try:
+                        s_all = dist_all.sample(generator=gen) if gen is not None else dist_all.sample()
+                        sampled_draws = s_all.view(-1).to(device)
+                    except TypeError:
+                        # Fallback: some flow implementations don't accept a generator
+                        # and may not be indexable; sample per-context by constructing
+                        # a per-context distribution and sampling with distinct seeds.
+                        s_list = []
+                        seed_base = seed if seed is not None else 0
+                        for b in range(batch_size):
+                            ctx_b = flow_ctx_t[b : b + 1]
+                            dist_b = self.flow_posterior(ctx_b)
+                            # derive a per-(timestep,batch) seed to be order-independent
+                            per_seed = int(seed_base) + ti * (batch_size + 7) + b
+                            sb = safe_dist_sample(dist_b, gen_obj=None, seed_val=per_seed)
+                            # sb may be scalar or tensor; ensure shape (1,)
+                            s_list.append(sb.view(-1))
+                        s_all = torch.stack(s_list, dim=0)
+                        sampled_draws = s_all.view(-1).to(device)
 
-                # Fill in teacher-forced entries
-                if use_teacher.any():
-                    sampled_vals[use_teacher] = target[use_teacher, ti]
+                # For prev_mean (used to condition the next timestep), use the
+                # true target where teacher forcing applies, otherwise use the sampled draw.
+                if (target is None) or (not getattr(self.config, 'teacher_forcing', True)):
+                    prev_mean = sampled_draws
+                else:
+                    # teacher applies where observed (~mask_t)
+                    prev_mean = sampled_draws.clone()
+                    use_teacher_local = (~mask_t)
+                    if use_teacher_local.any():
+                        prev_mean[use_teacher_local] = target[use_teacher_local, ti]
 
-                # For remaining entries, sample from the conditional flow posterior if available
-                non_teacher_idx = (~use_teacher)
-                n_non_teacher = int(non_teacher_idx.sum().item())
-                if n_non_teacher > 0:
-                        if self.flow_posterior is None:
-                            # fallback: sample from Gaussian head
-                            eps = torch.randn(n_non_teacher, device=device, generator=gen) if gen is not None else torch.randn(n_non_teacher, device=device)
-                            sampled_vals[non_teacher_idx] = mean_t[non_teacher_idx] + F.softplus(logsigma_raw[non_teacher_idx]) * eps
-                        else:
-                            # sample from flow conditioned on flow_ctx_t (step-level context)
-                            # select contexts for non-teacher indices and sample
-                            ctx_nt = flow_ctx_t[non_teacher_idx]
-                            # zuko expects context shape (..., C) and returns a Distribution
-                            dist = self.flow_posterior(ctx_nt)
-                            # Try to pass generator to make sampling deterministic when available
-                            try:
-                                s = dist.sample(generator=gen) if gen is not None else dist.sample()
-                            except TypeError:
-                                # Some distribution implementations may not accept generator
-                                s = dist.sample()
-                            # squeeze event dim
-                            s = s.view(-1)
-                            sampled_vals[non_teacher_idx] = s.to(device)
-
-                samples.append(sampled_vals.unsqueeze(1))
-                prev_mean = sampled_vals
+                samples.append(sampled_draws.unsqueeze(1))
 
             if not forward:
                 # reverse collected lists
@@ -926,23 +979,33 @@ class HierarchicalRNN(BaseAutoencoder):
             # Non-teacher positions should be sampled from the fused flow when available
             non_teacher_mask = ~use_teacher_mask
             if non_teacher_mask.any():
+                # Sample for all positions so we can report sampled predictions
+                ctx_flat = flow_ctx_dec.view(B * L, -1)
                 if self.flow_posterior is not None:
-                    # Use decoder-level flow context for fused sampling
-                    ctx_flat = flow_ctx_dec.view(B * L, -1)
-                    idx = non_teacher_mask.view(-1).nonzero(as_tuple=False).squeeze(-1)
-                    if idx.numel() > 0:
-                        ctx_sel = ctx_flat[idx]
-                        dist = self.flow_posterior(ctx_sel)
-                        try:
-                            s = dist.sample(generator=gen) if gen is not None else dist.sample()
-                        except TypeError:
-                            s = dist.sample()
-                        s = s.view(-1)
-                        sampled_vals.view(-1)[idx] = s.to(device)
+                    # Try generator-based sampling for the whole flattened context
+                    try:
+                        dist_all = self.flow_posterior(ctx_flat)
+                        s_all = dist_all.sample(generator=gen) if gen is not None else dist_all.sample()
+                        s_all = s_all.view(-1).to(device)
+                        sampled_vals.view(-1)[:] = s_all
+                    except TypeError:
+                        # Fallback: sample each context separately with deterministic per-index seeds
+                        seed_base = seed if seed is not None else 0
+                        flat_list = []
+                        N = B * L
+                        for idx in range(N):
+                            ctx_i = ctx_flat[idx : idx + 1]
+                            dist_i = self.flow_posterior(ctx_i)
+                            per_seed = int(seed_base) + idx + 1
+                            si = safe_dist_sample(dist_i, gen_obj=None, seed_val=per_seed)
+                            flat_list.append(si.view(-1))
+                        s_all = torch.stack(flat_list, dim=0).to(device)
+                        sampled_vals.view(-1)[:] = s_all
                 else:
-                    # Fallback: sample from combined Gaussian
-                    eps = torch.randn_like(combined_mean, device=device, generator=gen) if gen is not None else torch.randn_like(combined_mean, device=device)
-                    sampled_vals[non_teacher_mask] = combined_mean[non_teacher_mask] + combined_sigma[non_teacher_mask] * eps[non_teacher_mask]
+                    # Fallback: sample from combined Gaussian for all positions
+                    eps_all = torch.randn(B * L, device=device, generator=gen) if gen is not None else torch.randn(B * L, device=device)
+                    eps_all = eps_all.view(B, L)
+                    sampled_vals[:, :] = combined_mean + combined_sigma * eps_all
 
             samples_combined = sampled_vals
 

@@ -157,7 +157,7 @@ def load_lightcurve_data(hdf5_file):
     return flux, timestamps, flux_err
 
 
-def train_epoch(model, dataloader, optimizer, criterion, device, scheduler=None):
+def train_epoch(model, dataloader, optimizer, criterion, device, scheduler=None, train_mc_samples=0):
     """Train for one epoch."""
     model.train()
     total_loss = 0
@@ -177,30 +177,59 @@ def train_epoch(model, dataloader, optimizer, criterion, device, scheduler=None)
         # Pass target and mask to support autoregressive teacher forcing when enabled
         output = model(x_input, timestamps, target=x_target, mask=mask)
 
-        # If model provides flow context, use zuko flow log-prob with data augmentation
+        # If model provides flow context, we support two training modes:
+        #  - train_mc_samples > 0: estimate marginal p(y) by MC convolution using samples from the flow
+        #  - otherwise: evaluate flow.log_prob at a noisy target (fast augmentation-based MLE)
         if isinstance(output, dict) and 'flow_context' in output and output['flow_context'] is not None:
             flow_ctx = output['flow_context']  # (B, L, C)
-            # We'll sample one noisy target per data point: y_noisy ~ N(y_true, meas_err^2)
-            eps = torch.randn_like(x_target)  # standard normal
-            y_noisy = x_target + x_flux_err * eps
-
-            # Reshape to (B*L, C) contexts and (B*L, 1) targets for flow
             B, L = x_target.shape
-            ctx_flat = flow_ctx.view(B * L, -1)
-            y_flat = y_noisy.view(B * L, 1)
 
-            # Evaluate flow log_prob (zuko distribution expects context passed when constructing)
-            # The model stores a flow_posterior module inside; access via model.flow_posterior
             if getattr(model, 'flow_posterior', None) is None:
                 raise RuntimeError('Model configured to output flow_context but no flow_posterior module found (zuko missing?)')
 
-            dist = model.flow_posterior(ctx_flat)
-            # log_prob returns (...,) for scalar event shape
-            logp = dist.log_prob(y_flat).view(B, L)
-            # Negative log-likelihood (we maximize logp) -> loss = -mean(logp)
-            loss = -logp.mean()
-            masked_nll = (-logp)[mask].mean() if mask.any() else torch.tensor(0.0, device=device)
-            unmasked_nll = (-logp)[~mask].mean() if (~mask).any() else torch.tensor(0.0, device=device)
+            # Prepare measurement variance (flattened)
+            meas_var = (x_flux_err ** 2).view(B * L, 1) + 1e-8
+            ctx_flat = flow_ctx.view(B * L, -1)
+
+            # If train_mc_samples > 0, do MC convolution using K samples per context
+            try:
+                K = int(train_mc_samples)
+            except Exception:
+                K = 0
+
+            if K > 0:
+                dist = model.flow_posterior(ctx_flat)
+
+                # Draw samples: shape (K, B*L, 1)
+                samples_z = dist.sample((K,))
+
+                # Expand y and meas_var to (K, N, 1)
+                y_rep = x_target.view(1, B * L, 1).expand(K, -1, -1)
+                meas_rep = meas_var.view(1, B * L, 1).expand(K, -1, -1)
+
+                # Compute log Gaussian likelihoods of y given each sample z_k -> (K, N)
+                log_gauss = -0.5 * (torch.log(2 * math.pi * meas_rep) + (y_rep - samples_z) ** 2 / meas_rep)
+                log_gauss = log_gauss.squeeze(-1)
+
+                # log p(y) ≈ logsumexp(log_gauss, dim=0) - log K
+                logp_est = torch.logsumexp(log_gauss, dim=0) - math.log(float(K))
+                logp = logp_est.view(B, L)
+
+                loss = -logp.mean()
+                masked_nll = (-logp)[mask].mean() if mask.any() else torch.tensor(0.0, device=device)
+                unmasked_nll = (-logp)[~mask].mean() if (~mask).any() else torch.tensor(0.0, device=device)
+            else:
+                # Fast path: MLE on a single noisy target (data augmentation)
+                eps = torch.randn_like(x_target)
+                y_noisy = x_target + x_flux_err * eps
+                y_flat = y_noisy.view(B * L, 1)
+
+                dist = model.flow_posterior(ctx_flat)
+                logp = dist.log_prob(y_flat).view(B, L)
+
+                loss = -logp.mean()
+                masked_nll = (-logp)[mask].mean() if mask.any() else torch.tensor(0.0, device=device)
+                unmasked_nll = (-logp)[~mask].mean() if (~mask).any() else torch.tensor(0.0, device=device)
 
         else:
             # output['reconstructed']: (batch, seq_len, 2) -> mean, log_sigma
@@ -340,7 +369,7 @@ def validate_epoch(model, dataloader, criterion, device, mc_samples=32):
     }
 
 
-def plot_reconstruction_examples(model, dataloader, device, save_path, n_examples=4, sample_eval=False, num_samples=3, base_seed=0, eval_teacher_forcing=False):
+def plot_reconstruction_examples(model, dataloader, device, save_path, n_examples=4, sample_eval=False, num_samples=3, base_seed=0, eval_teacher_forcing=False, save_examples_data: bool = False):
     """Plot reconstruction examples. If sample_eval is True, generate multiple sampled
     reconstructions per example (saved as separate files)."""
     model.eval()
@@ -424,12 +453,55 @@ def plot_reconstruction_examples(model, dataloader, device, save_path, n_example
                 else:
                     sampled_list.append(None)
 
+        # (example data saving moved to after conversion to numpy below)
+
     # Move to CPU for plotting
     x_target = x_target.cpu().numpy()
     recon_mean_np = recon_mean.cpu().numpy()
     recon_sigma_np = recon_sigma.cpu().numpy()
     timestamps_np = timestamps.cpu().numpy()
     mask_np = mask.cpu().numpy()
+    # Also pull flux_err from inputs so we can save it with examples
+    try:
+        flux_err_np = x_input[..., 1].cpu().numpy()
+    except Exception:
+        flux_err_np = None
+
+    # Now optionally save raw example data (targets, recon mean/sigma, mask, timestamps, samples)
+    # This must happen after tensors are moved to CPU and converted to numpy arrays.
+    if save_examples_data and sample_eval:
+        try:
+            from pathlib import Path as _P
+            save_base = _P(str(save_path)).with_suffix('')
+            npz_path = _P(f"{save_base}_examples.npz")
+
+            # Build samples array: (num_samples, n_examples, seq_len)
+            if len(sampled_list) > 0 and sampled_list[0] is not None:
+                samples_np = np.stack([s.cpu().numpy() for s in sampled_list], axis=0)
+            else:
+                # Fallback: generate samples from mean+sigma using numpy RNG with base_seed
+                samples_np = np.empty((num_samples, recon_mean_np.shape[0], recon_mean_np.shape[1]), dtype=float)
+                for s in range(num_samples):
+                    seed = int(base_seed + s + 1)
+                    rng = np.random.default_rng(seed)
+                    for i in range(recon_mean_np.shape[0]):
+                        eps = rng.standard_normal(size=recon_mean_np.shape[1])
+                        samples_np[s, i, :] = recon_mean_np[i] + recon_sigma_np[i] * eps
+
+            # Save arrays: target, recon_mean, recon_sigma, mask, timestamps, samples
+            np.savez_compressed(
+                str(npz_path),
+                target=x_target,
+                recon_mean=recon_mean_np,
+                recon_sigma=recon_sigma_np,
+                flux_err=flux_err_np,
+                mask=mask_np,
+                timestamps=timestamps_np,
+                samples=samples_np
+            )
+            print(f"Saved reconstruction example data to {npz_path}")
+        except Exception as _e:
+            print(f"Warning: failed to save example data: {_e}")
 
     if not sample_eval:
         fig, axes = plt.subplots(n_examples, 1, figsize=(12, 3*n_examples))
@@ -726,7 +798,7 @@ def main():
                         help='Learning rate')
     parser.add_argument('--encoder_dims', type=int, nargs='+', default=[64, 128],
                         help='Encoder dimensions for hierarchical levels (default: 2 levels)')
-    parser.add_argument('--rnn_type', type=str, default='minlstm', choices=['minlstm', 'minGRU'],
+    parser.add_argument('--rnn_type', type=str, default='minGRU', choices=['minlstm', 'minGRU'],
                         help='RNN cell type (minlstm or minGRU)')
     parser.add_argument('--num_layers', type=int, default=4,
                         help='Number of hierarchical levels')
@@ -748,18 +820,33 @@ def main():
                         help='Number of stochastic samples to generate per example when --sample_eval is set')
     parser.add_argument('--eval_mc_samples', type=int, default=32,
                         help='Number of Monte Carlo samples to approximate convolution of flow with measurement noise during validation')
+    parser.add_argument('--train_mc_samples', type=int, default=0,
+                        help='If >0, use MC convolution with this many samples during training for flow-based likelihood (slower)')
     parser.add_argument('--eval_teacher_forcing', action='store_true',
                         help='When set, use teacher forcing (pass target+mask) during evaluation and plotting; otherwise sample autoregressively')
     parser.add_argument('--device', type=str, default='auto',
                         help='Device (cuda/cpu/auto)')
     parser.add_argument('--save_every', type=int, default=10,
                         help='Save checkpoint every N epochs')
+    parser.add_argument('--resume_checkpoint', type=str, default=None,
+                        help='Path to checkpoint .pt file to resume training')
 
     args = parser.parse_args()
 
     # Set random seed
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+
+    # Normalize rnn_type argument to canonical values used by the codebase.
+    # Accept case-insensitive inputs but map to 'minlstm' or 'minGRU'.
+    rnn_raw = args.rnn_type
+    if isinstance(rnn_raw, str) and rnn_raw.lower().startswith('mingru'):
+        args.rnn_type = 'minGRU'
+    elif isinstance(rnn_raw, str) and rnn_raw.lower().startswith('minlstm'):
+        args.rnn_type = 'minlstm'
+    else:
+        # fallback to default 'minGRU'
+        args.rnn_type = 'minGRU'
 
     # Device
     if args.device == 'auto':
@@ -857,6 +944,25 @@ def main():
 
     model = HierarchicalRNN(config).to(device)
 
+    # Optionally resume from checkpoint
+    start_epoch = 0
+    if args.resume_checkpoint is not None:
+        ckpt_path = Path(args.resume_checkpoint)
+        if ckpt_path.exists():
+            print(f"Loading checkpoint from {ckpt_path} to resume training...")
+            ckpt = torch.load(ckpt_path, map_location=device)
+            # Load model weights
+            if 'model_state_dict' in ckpt:
+                model.load_state_dict(ckpt['model_state_dict'])
+            else:
+                model.load_state_dict(ckpt)
+            # We'll recreate optimizer below and restore its state if available
+            start_epoch = int(ckpt.get('epoch', 0)) + 1
+            best_val_loss = float(ckpt.get('val_loss', best_val_loss if 'best_val_loss' in locals() else float('inf')))
+            print(f"Resuming from epoch {start_epoch}; best_val_loss={best_val_loss}")
+        else:
+            print(f"Resume checkpoint {ckpt_path} not found; starting from scratch.")
+
     # --- Sanity check: single forward pass to verify input shapes / device placement ---
     try:
         sample_batch = next(iter(train_loader))
@@ -921,7 +1027,7 @@ def main():
     for epoch in range(args.epochs):
         print(f"\nEpoch {epoch+1}/{args.epochs}")
         # Train
-        train_metrics = train_epoch(model, train_loader, optimizer, criterion, device, scheduler)
+        train_metrics = train_epoch(model, train_loader, optimizer, criterion, device, scheduler, train_mc_samples=args.train_mc_samples)
         print("Training metrics:", train_metrics)
         train_losses.append(train_metrics['total_loss'])
 
@@ -985,6 +1091,20 @@ def main():
         'config': config
     }, final_path)
     print(f"\nSaved final model to {final_path}")
+
+    # Always produce final-epoch reconstructions and save example data so user
+    # can inspect and re-plot offline. This ensures the final epoch is plotted
+    # even when epoch % 10 != 0.
+    final_plot_path = output_dir / f'rnn_recon_v4_epoch{args.epochs}_final.png'
+    plot_reconstruction_examples(
+        model, val_loader, device, final_plot_path,
+        n_examples=4,
+        sample_eval=args.sample_eval,
+        num_samples=args.num_samples,
+        base_seed=args.seed,
+        eval_teacher_forcing=args.eval_teacher_forcing,
+        save_examples_data=True
+    )
 
     # Plot training curves
     plt.figure(figsize=(10, 6))
