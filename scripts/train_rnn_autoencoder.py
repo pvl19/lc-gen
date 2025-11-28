@@ -15,6 +15,7 @@ from tqdm import tqdm
 import h5py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 import matplotlib.pyplot as plt
@@ -143,6 +144,13 @@ def load_lightcurve_data(hdf5_file):
         if 'flux_err' in f:
             flux_err = f['flux_err'][:]
         print(f"Loaded flux: {flux.shape}, time: {timestamps.shape}")
+        if flux_err is not None:
+            print(f"Loaded flux_err: {flux_err.shape}; min={float(np.nanmin(flux_err)):.3e}, max={float(np.nanmax(flux_err)):.3e}, mean={float(np.nanmean(flux_err)):.3e}")
+        else:
+            raise RuntimeError(
+                "HDF5 file is missing required dataset 'flux_err'. "
+                "Please recreate the HDF5 from the source 'star_sector_lc_formatted.pickle' so that per-observation measurement errors are included."
+            )
 
         # Check for NaNs
         n_nans_flux = np.sum(np.isnan(flux))
@@ -176,77 +184,35 @@ def train_epoch(model, dataloader, optimizer, criterion, device, scheduler=None,
         optimizer.zero_grad()
         # Pass target and mask to support autoregressive teacher forcing when enabled
         output = model(x_input, timestamps, target=x_target, mask=mask)
+        # New training loss: compute negative log-probability of the observed
+        # flux under the conditional flow posterior for each timestep.
+        # No samples are drawn from the flow during training; instead we use
+        # the flow's density evaluated at the observed target. This loss is
+        # computed over all timesteps (both masked and unmasked) as requested.
+        B, L = x_target.shape
+        if not (isinstance(output, dict) and output.get('flow_context', None) is not None and getattr(model, 'flow_posterior', None) is not None):
+            raise RuntimeError('train_epoch: flow posterior required for log-prob training loss (missing flow_context or model.flow_posterior)')
 
-        # If model provides flow context, we support two training modes:
-        #  - train_mc_samples > 0: estimate marginal p(y) by MC convolution using samples from the flow
-        #  - otherwise: evaluate flow.log_prob at a noisy target (fast augmentation-based MLE)
-        if isinstance(output, dict) and 'flow_context' in output and output['flow_context'] is not None:
-            flow_ctx = output['flow_context']  # (B, L, C)
-            B, L = x_target.shape
+        flow_ctx = output['flow_context']  # (B, L, C)
+        ctx_flat = flow_ctx.view(B * L, -1)
+        # Observations shaped as (B*L, 1) to match flow event shape
+        y_flat = x_target.view(B * L, 1)
 
-            if getattr(model, 'flow_posterior', None) is None:
-                raise RuntimeError('Model configured to output flow_context but no flow_posterior module found (zuko missing?)')
+        # Compute conditional distribution and evaluate log-prob at the observed targets
+        dist = model.flow_posterior(ctx_flat)
+        # dist.log_prob should return (B*L, 1) or (B*L,) depending on implementation
+        logp = dist.log_prob(y_flat)
+        # Ensure shape is (B*L,)
+        if logp.dim() > 1:
+            logp = logp.view(-1)
+        logp = logp.view(B, L)
 
-            # Prepare measurement variance (flattened)
-            meas_var = (x_flux_err ** 2).view(B * L, 1) + 1e-8
-            ctx_flat = flow_ctx.view(B * L, -1)
+        # Negative log-likelihood averaged over all timesteps
+        loss = -logp.mean()
 
-            # If train_mc_samples > 0, do MC convolution using K samples per context
-            try:
-                K = int(train_mc_samples)
-            except Exception:
-                K = 0
-
-            if K > 0:
-                dist = model.flow_posterior(ctx_flat)
-
-                # Draw samples: shape (K, B*L, 1)
-                samples_z = dist.sample((K,))
-
-                # Expand y and meas_var to (K, N, 1)
-                y_rep = x_target.view(1, B * L, 1).expand(K, -1, -1)
-                meas_rep = meas_var.view(1, B * L, 1).expand(K, -1, -1)
-
-                # Compute log Gaussian likelihoods of y given each sample z_k -> (K, N)
-                log_gauss = -0.5 * (torch.log(2 * math.pi * meas_rep) + (y_rep - samples_z) ** 2 / meas_rep)
-                log_gauss = log_gauss.squeeze(-1)
-
-                # log p(y) ≈ logsumexp(log_gauss, dim=0) - log K
-                logp_est = torch.logsumexp(log_gauss, dim=0) - math.log(float(K))
-                logp = logp_est.view(B, L)
-
-                loss = -logp.mean()
-                masked_nll = (-logp)[mask].mean() if mask.any() else torch.tensor(0.0, device=device)
-                unmasked_nll = (-logp)[~mask].mean() if (~mask).any() else torch.tensor(0.0, device=device)
-            else:
-                # Fast path: MLE on a single noisy target (data augmentation)
-                eps = torch.randn_like(x_target)
-                y_noisy = x_target + x_flux_err * eps
-                y_flat = y_noisy.view(B * L, 1)
-
-                dist = model.flow_posterior(ctx_flat)
-                logp = dist.log_prob(y_flat).view(B, L)
-
-                loss = -logp.mean()
-                masked_nll = (-logp)[mask].mean() if mask.any() else torch.tensor(0.0, device=device)
-                unmasked_nll = (-logp)[~mask].mean() if (~mask).any() else torch.tensor(0.0, device=device)
-
-        else:
-            # output['reconstructed']: (batch, seq_len, 2) -> mean, log_sigma
-            recon = output['reconstructed']
-            pred_mean = recon[..., 0]
-            pred_logsigma = recon[..., 1]
-            # To ensure positive scale, convert log-sigma to sigma via softplus or exp
-            pred_sigma = torch.nn.functional.softplus(pred_logsigma)
-
-            # Negative log-likelihood per element for Gaussian: 0.5*log(2*pi*sigma^2) + 0.5*((y - mu)^2 / sigma^2)
-            # Compute full NLL over all timesteps
-            var_scatter = pred_sigma ** 2 + 1e-8
-            var_measure = x_flux_err ** 2 + 1e-8
-            nll = 0.5 * (torch.log(2 * math.pi * (var_measure + var_scatter)) + (pred_mean - x_target) ** 2 / (var_measure + var_scatter))
-            loss = nll.mean()
-            masked_nll = nll[mask].mean() if mask.any() else torch.tensor(0.0, device=device)
-            unmasked_nll = nll[~mask].mean() if (~mask).any() else torch.tensor(0.0, device=device)
+        # For logging split masked/unmasked negative-log-likelihoods
+        masked_nll = (-logp)[mask].mean() if mask.any() else torch.tensor(0.0, device=device)
+        unmasked_nll = (-logp)[~mask].mean() if (~mask).any() else torch.tensor(0.0, device=device)
 
     # (masked_nll and unmasked_nll already computed per-branch above)
 
@@ -297,50 +263,26 @@ def validate_epoch(model, dataloader, criterion, device, mc_samples=32):
             output = model(x_input, timestamps, target=x_target, mask=mask)
 
             if isinstance(output, dict) and 'flow_context' in output and output['flow_context'] is not None:
+                # Flow context available: evaluate flow log-prob at observed targets.
+                # The flow is expected to be conditioned on measurement error
+                # through the model's context, so we use the flow density directly
+                # (no convolution with measurement error).
                 flow_ctx = output['flow_context']  # (B, L, C)
                 B, L = x_target.shape
                 ctx_flat = flow_ctx.view(B * L, -1)
                 y_flat = x_target.view(B * L, 1)
-                meas_err = x_input[..., 1].view(B * L, 1)
                 if getattr(model, 'flow_posterior', None) is None:
                     raise RuntimeError('Model provided flow_context but no flow_posterior module found')
 
                 dist = model.flow_posterior(ctx_flat)
-                # Compute flow log_prob at the observed target (useful when meas_err~0)
-                logp_flow = dist.log_prob(y_flat).view(B, L)
+                logp = dist.log_prob(y_flat)
+                if logp.dim() > 1:
+                    logp = logp.view(-1)
+                logp = logp.view(B, L)
 
-                # Prepare measurement error thresholding to avoid division-by-zero explosions
-                meas_err_flat = meas_err.view(B * L, 1)
-                thresh = 1e-6
-                small_mask = (meas_err_flat.squeeze(-1) <= thresh)  # (B*L,)
-
-                # For small measurement error, use flow density directly; otherwise use MC convolution
-                logp_obs = torch.empty(B * L, device=device)
-
-                if (~small_mask).any():
-                    idx = (~small_mask).nonzero(as_tuple=False).squeeze(-1)
-                    # sample shape: (S, N_small, 1)
-                    ctx_small = ctx_flat[idx]
-                    y_small = y_flat[idx]
-                    meas_small = meas_err_flat[idx]
-                    dist_small = model.flow_posterior(ctx_small)
-                    samples_z = dist_small.sample((mc_samples,))  # (S, N_small, 1)
-                    y_rep = y_small.unsqueeze(0).expand(samples_z.shape[0], -1, -1)
-                    meas_rep = meas_small.unsqueeze(0).expand(samples_z.shape[0], -1, -1)
-                    var = meas_rep ** 2 + 1e-8
-                    log_gauss = -0.5 * (torch.log(2 * math.pi * var) + (y_rep - samples_z) ** 2 / var)
-                    logp_obs_small = torch.logsumexp(log_gauss.squeeze(-1), dim=0) - math.log(float(samples_z.shape[0]))
-                    logp_obs[idx] = logp_obs_small
-
-                # Fill small-meas entries with direct flow log-prob
-                small_idx = small_mask.nonzero(as_tuple=False).squeeze(-1)
-                if small_idx.numel() > 0:
-                    logp_obs[small_idx] = logp_flow.view(-1)[small_idx]
-
-                logp_obs = logp_obs.view(B, L)
-                loss = -logp_obs.mean()
-                masked_loss = (-logp_obs)[mask].mean() if mask.any() else torch.tensor(0.0, device=device)
-                unmasked_loss = (-logp_obs)[~mask].mean() if (~mask).any() else torch.tensor(0.0, device=device)
+                loss = -logp.mean()
+                masked_loss = (-logp)[mask].mean() if mask.any() else torch.tensor(0.0, device=device)
+                unmasked_loss = (-logp)[~mask].mean() if (~mask).any() else torch.tensor(0.0, device=device)
             else:
                 recon = output['reconstructed']
                 pred_mean = recon[..., 0]
@@ -369,7 +311,7 @@ def validate_epoch(model, dataloader, criterion, device, mc_samples=32):
     }
 
 
-def plot_reconstruction_examples(model, dataloader, device, save_path, n_examples=4, sample_eval=False, num_samples=3, base_seed=0, eval_teacher_forcing=False, save_examples_data: bool = False):
+def plot_reconstruction_examples(model, dataloader, device, save_path, n_examples=4, sample_eval=True, num_samples=3, base_seed=0, eval_teacher_forcing=False, save_examples_data: bool = False):
     """Plot reconstruction examples. If sample_eval is True, generate multiple sampled
     reconstructions per example (saved as separate files)."""
     model.eval()
@@ -438,20 +380,41 @@ def plot_reconstruction_examples(model, dataloader, device, save_path, n_example
 
         sampled_list = []
         if sample_eval:
-            for s in range(num_samples):
-                seed = int(base_seed + s + 1)
-                # When sampling, we do not pass target/mask to ensure the model
-                # runs autoregressively and samples its own previous predictions.
-                # If the user requested teacher forcing during evaluation, pass
-                # target/mask to get deterministic mean traces instead.
-                # For sampled reconstructions, always pass target+mask so observed
-                # (unmasked) points are conditioned on the true values. The
-                # seeding ensures each sample is different.
-                out_s = model(x_input, timestamps, target=x_target, mask=mask, seed=seed)
-                if isinstance(out_s, dict):
-                    sampled_list.append(out_s.get('sampled', None))
-                else:
-                    sampled_list.append(None)
+            # Prefer drawing samples directly from the decoder-level flow context
+            # when available. This produces S samples from p_flow(·|flow_ctx)
+            # and is consistent with the conditional flow used during training.
+            if isinstance(base_out, dict) and base_out.get('flow_context', None) is not None and getattr(model, 'flow_posterior', None) is not None:
+                flow_ctx = base_out['flow_context']  # (B, L, C)
+                B, L, C = flow_ctx.shape
+                ctx_flat = flow_ctx.view(B * L, -1)
+                dist = model.flow_posterior(ctx_flat)
+                # Try to sample the whole flattened context at once
+                try:
+                    s_all = dist.sample((num_samples,))  # (S, B*L, 1) or (S, B*L)
+                    s_all = s_all.view(num_samples, B, L)
+                except TypeError:
+                    # Some flow implementations are not indexable for batched sampling
+                    # or may not accept a generator; sample per-context (slower)
+                    flat_list = []
+                    for idx in range(B * L):
+                        ctx_i = ctx_flat[idx:idx+1]
+                        dist_i = model.flow_posterior(ctx_i)
+                        si = dist_i.sample((num_samples,)).view(num_samples)
+                        flat_list.append(si)
+                    s_all = torch.stack(flat_list, dim=1).view(num_samples, B, L)
+
+                # store per-sample tensors in sampled_list (on CPU for plotting)
+                for s in range(num_samples):
+                    sampled_list.append(s_all[s].cpu())
+            else:
+                # Fallback: call model per-seed (previous behavior)
+                for s in range(num_samples):
+                    seed = int(base_seed + s + 1)
+                    out_s = model(x_input, timestamps, target=x_target, mask=mask, seed=seed)
+                    if isinstance(out_s, dict):
+                        sampled_list.append(out_s.get('sampled', None))
+                    else:
+                        sampled_list.append(None)
 
         # (example data saving moved to after conversion to numpy below)
 
@@ -883,9 +846,10 @@ def main():
 
     # Create dataset
     dataset = LightCurveDataset(flux, timestamps)
-    if flux_err is not None:
-        # Attach flux_err to dataset (as torch tensor)
-        dataset.flux_err = torch.from_numpy(flux_err).float()
+    # Attach flux_err to dataset (as torch tensor). load_lightcurve_data now
+    # enforces presence of 'flux_err' and will raise if missing, so here we
+    # simply convert to torch tensor.
+    dataset.flux_err = torch.from_numpy(flux_err).float()
 
     # Split into train/val
     val_size = int(len(dataset) * args.val_split)

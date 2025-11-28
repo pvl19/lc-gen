@@ -824,6 +824,7 @@ class HierarchicalRNN(BaseAutoencoder):
             means = []
             sigmas = []
             samples = []  # store sampled values when sampling is active
+            flow_ctx_list = []  # collect per-timestep flow context conditioned on prev state
 
             for ti in indices:
                 # Use decoder features as the per-step static context
@@ -848,8 +849,10 @@ class HierarchicalRNN(BaseAutoencoder):
                 mean_t = out2[:, 0]
                 logsigma_raw = out2[:, 1]
 
-                # Flow context for this timestep
+                # Flow context for this timestep (already conditions on prev_mean via step_out)
                 flow_ctx_t = self.flow_context_proj(step_out)  # (B, C)
+                # collect per-timestep context so callers get autoregressively-conditioned contexts
+                flow_ctx_list.append(flow_ctx_t.unsqueeze(1))
 
                 # keep scalar measurement error available for diagnostics / downstream use
                 # (meas_err_scalar set earlier)
@@ -922,18 +925,21 @@ class HierarchicalRNN(BaseAutoencoder):
             means = torch.cat(means, dim=1)
             sigmas = torch.cat(sigmas, dim=1)
             samples = torch.cat(samples, dim=1) if len(samples) > 0 else None
-            return means, sigmas, samples
+            # stack collected per-timestep flow contexts -> (B, L, C)
+            flow_ctx_dir = torch.cat(flow_ctx_list, dim=1) if len(flow_ctx_list) > 0 else None
+            return means, sigmas, samples, flow_ctx_dir
 
         # Run according to direction: 'forward', 'backward', or 'both'
         dir_mode = getattr(self.config, 'direction', 'forward')
         if dir_mode == 'forward':
-            means_f, sig_raw_f, samples_f = run_direction(forward=True)
+            means_f, sig_raw_f, samples_f, flow_ctx_f = run_direction(forward=True)
             recon = torch.stack([means_f, sig_raw_f], dim=-1)
-            return {'reconstructed': recon, 'sampled': samples_f}
+            # expose autoregressively-conditioned per-timestep flow context
+            return {'reconstructed': recon, 'sampled': samples_f, 'flow_context': flow_ctx_f}
         elif dir_mode == 'backward':
-            means_b, sig_raw_b, samples_b = run_direction(forward=False)
+            means_b, sig_raw_b, samples_b, flow_ctx_b = run_direction(forward=False)
             recon = torch.stack([means_b, sig_raw_b], dim=-1)
-            return {'reconstructed': recon, 'sampled': samples_b}
+            return {'reconstructed': recon, 'sampled': samples_b, 'flow_context': flow_ctx_b}
         else:
             # both: run forward and backward and fuse by precision weighting
             means_f, sig_raw_f, samples_f = run_direction(forward=True)
@@ -1009,7 +1015,7 @@ class HierarchicalRNN(BaseAutoencoder):
 
             samples_combined = sampled_vals
 
-            return {'reconstructed': recon, 'sampled': samples_combined}
+            return {'reconstructed': recon, 'sampled': samples_combined, 'flow_context': flow_ctx_dec}
 
 
 # Alias for consistency
