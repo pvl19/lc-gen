@@ -1,3 +1,8 @@
+torch>=2.0.0
+numpy>=1.24.0
+h5py>=3.8.0
+matplotlib>=3.7.0
+zuko>=1.5.0
 # Core dependencies
 torch>=2.0.0
 numpy>=1.24.0
@@ -27,3 +32,4 @@ tqdm>=4.66.0
 
 # Normalizing flows
 zuko>=1.5.0
+h5py>=3.8.0
