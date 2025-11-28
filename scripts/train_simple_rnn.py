@@ -16,14 +16,26 @@ import math
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
-from src.lcgen.models.simple_min_gru import SimpleMinGRU
+import sys
+from pathlib import Path as _P
+# Ensure local 'src' is on sys.path so we can import lcgen
+sys.path.insert(0, str(_P(__file__).resolve().parents[1] / 'src'))
+from lcgen.models.simple_min_gru import SimpleMinGRU
 
 
 class TimeSeriesDataset(Dataset):
     def __init__(self, h5path):
-        with h5py.File(h5path, 'r') as f:
-            self.flux = f['flux'][:]
-        self.flux = np.asarray(self.flux, dtype=np.float32)
+        p = Path(h5path)
+        if p.exists():
+            with h5py.File(h5path, 'r') as f:
+                self.flux = f['flux'][:]
+            self.flux = np.asarray(self.flux, dtype=np.float32)
+        else:
+            # Fall back to a synthetic dataset if file is missing (small and fast).
+            print(f'Warning: {h5path} not found. Using synthetic data for smoke test.')
+            N = 128
+            L = 256
+            self.flux = np.random.randn(N, L).astype(np.float32)
 
     def __len__(self):
         return len(self.flux)
@@ -38,7 +50,10 @@ def collate_fn(batch):
 
 
 def train(args):
-    device = torch.device('cuda' if torch.cuda.is_available() and args.device == 'auto' else args.device)
+    if args.device == 'auto':
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        device = torch.device(args.device)
 
     ds = TimeSeriesDataset(args.input)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
