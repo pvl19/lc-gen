@@ -42,19 +42,19 @@ class minGRUCell(nn.Module):
 
 class SimpleMinGRU(nn.Module):
     """Single-cell RNN model with Gaussian and optional Flow heads."""
-    def __init__(self, hidden_size: int = 64, use_flow: bool = True):
+    def __init__(self, hidden_size: int = 64, use_flow: bool = False):
         super().__init__()
         self.hidden_size = hidden_size
 
-        # We'll accept scalar flux inputs per timestep (1D)
-        self.input_proj = nn.Linear(1, hidden_size)
+        # We'll accept scalar flux + flux_err inputs per timestep (2D)
+        self.input_proj = nn.Linear(2, hidden_size)
 
         # single minGRU cell
         self.cell = minGRUCell(hidden_size, hidden_size)
 
         # Output projections
-        # Gaussian head: outputs [mean, raw_logsigma]
-        self.gauss_head = nn.Linear(hidden_size, 2)
+        # Gaussian head: outputs [mean]
+        self.gauss_head = nn.Linear(hidden_size, 1)
 
         # Flow context projection
         self.flow_ctx_proj = nn.Linear(hidden_size, hidden_size)
@@ -73,15 +73,18 @@ class SimpleMinGRU(nn.Module):
         """Forward pass.
 
         Args:
-            x: (B, L) or (B, L, 1)
+            x: (B, L) or (B, L, 2)
         Returns:
             dict with 'reconstructed' (B, L, 2) and 'flow_context' (B, L, C) or None
         """
-        if x.dim() == 2:
-            x_in = x.unsqueeze(-1)
-        else:
-            x_in = x
+        # Expect a 3D tensor with 2 features per timestep: (B, L, 2).
+        # This makes the model's `input_proj` (nn.Linear(2, hidden_size)) consistent
+        # with the provided inputs. If callers pass a different shape, raise a
+        # clear error rather than silently mis-shaping the data.
+        if x.dim() != 3 or x.size(-1) != 2:
+            raise ValueError(f"Expected input x with shape (B, L, 2), got {tuple(x.shape)}")
 
+        x_in = x
         B, L, _ = x_in.shape
         h = x_in.new_zeros(B, self.hidden_size)
 
@@ -90,29 +93,27 @@ class SimpleMinGRU(nn.Module):
         flow_ctxs = []
 
         for t in range(L):
-            xi = x_in[:, t:t+1, :].squeeze(1)  # (B, 1)
+            xi = x_in[:, t:t+1, :].squeeze(1)  # (B, C)
             inp = self.input_proj(xi)  # (B, H)
             h = self.cell.step(inp, h)
 
             out = self.gauss_head(h)
-            mean_t = out[:, 0]
-            logsig_raw_t = out[:, 1]
+            mean_t = out.squeeze(-1)
             means.append(mean_t.unsqueeze(1))
-            logs.append(logsig_raw_t.unsqueeze(1))
 
-            ctx = self.flow_ctx_proj(h)
-            flow_ctxs.append(ctx.unsqueeze(1))
+            # ctx = self.flow_ctx_proj(h)
+            # flow_ctxs.append(ctx.unsqueeze(1))
 
-        means = torch.cat(means, dim=1)
-        logs = torch.cat(logs, dim=1)
-        recon = torch.stack([means, logs], dim=-1)
+        means = torch.cat(means, dim=1)  # (B, L)
+        recon = means.unsqueeze(-1)
 
-        flow_ctx = torch.cat(flow_ctxs, dim=1)
+        # flow_ctx = torch.cat(flow_ctxs, dim=1)
 
-        return {'reconstructed': recon, 'flow_context': flow_ctx}
+        return {'reconstructed': recon} #, 'flow_context': flow_ctx}
 
 
 def example_usage():
+    print("Example usage of SimpleMinGRU model.")
     m = SimpleMinGRU(hidden_size=32, use_flow=(zuko is not None))
     x = torch.randn(2, 128)
     out = m(x)
