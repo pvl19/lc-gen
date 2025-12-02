@@ -47,7 +47,7 @@ class SimpleMinGRU(nn.Module):
         self.hidden_size = hidden_size
 
         # We'll accept scalar flux + flux_err inputs per timestep (2D)
-        self.input_proj = nn.Linear(2, hidden_size)
+        self.input_proj = nn.Linear(3, hidden_size)
 
         # single minGRU cell
         self.cell = minGRUCell(hidden_size, hidden_size)
@@ -69,48 +69,31 @@ class SimpleMinGRU(nn.Module):
                 # small NSF for 1D outputs conditioned on context
                 self.flow = zuko.flows.NSF(1, hidden_size, transforms=2, hidden_features=[64, 64])
 
-    def forward(self, x: torch.Tensor):
-        """Forward pass.
+    def forward(self, x):
+        if x.dim() != 3 or x.size(-1) != 3:
+            raise ValueError(f"Expected (B, L, 3), got {tuple(x.shape)}")
 
-        Args:
-            x: (B, L) or (B, L, 2)
-        Returns:
-            dict with 'reconstructed' (B, L, 2) and 'flow_context' (B, L, C) or None
-        """
-        # Expect a 3D tensor with 2 features per timestep: (B, L, 2).
-        # This makes the model's `input_proj` (nn.Linear(2, hidden_size)) consistent
-        # with the provided inputs. If callers pass a different shape, raise a
-        # clear error rather than silently mis-shaping the data.
-        if x.dim() != 3 or x.size(-1) != 2:
-            raise ValueError(f"Expected input x with shape (B, L, 2), got {tuple(x.shape)}")
+        B, L, _ = x.shape
+        h = x.new_zeros(B, self.hidden_size)
 
-        x_in = x
-        B, L, _ = x_in.shape
-        h = x_in.new_zeros(B, self.hidden_size)
+        preds = []
 
-        means = []
-        logs = []
-        flow_ctxs = []
-
+        # We always use x[:, t] as input to update the state
+        # and then predict x[t+1] based on the updated state.
         for t in range(L):
-            xi = x_in[:, t:t+1, :].squeeze(1)  # (B, C)
-            inp = self.input_proj(xi)  # (B, H)
-            h = self.cell.step(inp, h)
+            # Predict next value using current state
+            pred = self.gauss_head(h)    # (B,1)
+            preds.append(pred)
+            
+            # Feed current true timestep into RNN
+            xi = x[:, t, :]                  # (B,3)
+            inp = self.input_proj(xi)         # (B,H)
+            h = self.cell.step(inp, h)        # update state
 
-            out = self.gauss_head(h)
-            mean_t = out.squeeze(-1)
-            means.append(mean_t.unsqueeze(1))
+        # preds = list of L items [(B,1), (B,1), ...]
+        preds = torch.stack(preds, dim=1)     # (B, L, 1)
 
-            # ctx = self.flow_ctx_proj(h)
-            # flow_ctxs.append(ctx.unsqueeze(1))
-
-        means = torch.cat(means, dim=1)  # (B, L)
-        recon = means.unsqueeze(-1)
-
-        # flow_ctx = torch.cat(flow_ctxs, dim=1)
-
-        return {'reconstructed': recon} #, 'flow_context': flow_ctx}
-
+        return {'reconstructed': preds}
 
 def example_usage():
     print("Example usage of SimpleMinGRU model.")

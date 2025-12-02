@@ -44,13 +44,14 @@ def plot_recon(model_path, num_examples, seq_length, hidden_size, use_flow, rand
     ds = TimeSeriesDataset(raw_data_path, random_seed=random_seed, max_length=seq_length, num_samples=num_examples)
     loader = DataLoader(ds, batch_size=num_examples, shuffle=False, collate_fn=collate_fn)
     batch_X = next(iter(loader)) 
-    flux, flux_err, times = batch_X
-    flux = flux.to(device)
+    flux, flux_err, times, mask, masked_flux = batch_X
+    masked_flux = masked_flux.to(device)
     flux_err = flux_err.to(device)
     times = times.to(device)
+    mask = mask.to(device)
 
     # Build input channels [flux, flux_err] -> (B, L, 2)
-    x_in = torch.stack([flux, flux_err], dim=-1)
+    x_in = torch.stack([masked_flux, flux_err, mask], dim=-1)
 
     out = model(x_in)
     recon = out['reconstructed']  # (B, L, 1) -> [mean, raw_logsigma]
@@ -87,14 +88,14 @@ def plot_recon(model_path, num_examples, seq_length, hidden_size, use_flow, rand
         plt.ylabel('Loss')
         plt.legend()
 
-    
-    fig.savefig(outp / 'reconstructions.png')
-    print(f'Saved reconstruction plots to {outp / "reconstructions.png"}')
+    fig.savefig(outp / args.output_name)
+    print(f'Saved reconstruction plots to {outp / args.output_name}')
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--model_path', type=str, default='output/simple_rnn/simple_min_gru_final.pt')
+    p.add_argument('--model_path', type=str, default='output/simple_rnn/simple_min_gru_final_dummymask.pt')
     p.add_argument('--seq_length', type=int, default=1024)
+    p.add_argument('--output_name', type=str, default='reconstructions_rolling.png')
     p.add_argument('--num_examples', type=int, default=3)
     p.add_argument('--hidden_size', type=int, default=64)
     p.add_argument('--use_flow', action='store_true')   
