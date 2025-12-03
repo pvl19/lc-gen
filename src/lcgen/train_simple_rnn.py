@@ -20,7 +20,7 @@ import sys
 from pathlib import Path as _P
 # Ensure local 'src' is on sys.path so we can import lcgen
 sys.path.insert(0, str(_P(__file__).resolve().parents[1]))
-from lcgen.models.simple_min_gru import SimpleMinGRU
+from lcgen.models.simple_min_gru import SimpleMinGRU, BiDirectionalMinGRU
 from lcgen.utils.trunc_data import extract_data
 from lcgen.utils.loss import recon_loss
 from lcgen.models.TimeSeriesDataset import TimeSeriesDataset, collate_fn
@@ -31,11 +31,14 @@ def train(args):
     else:
         device = torch.device(args.device)
 
-    ds = TimeSeriesDataset(args.input, args.random_seed, args.max_length, args.num_samples)
+    ds = TimeSeriesDataset(args.input, args.random_seed, args.max_length, args.num_samples, args.min_size, args.max_size, args.mask_portion)
     print('Shape of TimeSeriesDataset:', ds.flux.shape)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
 
-    model = SimpleMinGRU(hidden_size=args.hidden_size, use_flow=args.use_flow).to(device)
+    if args.direction == 'bi':
+        model = BiDirectionalMinGRU(hidden_size=args.hidden_size, use_flow=args.use_flow).to(device)
+    else:
+        model = SimpleMinGRU(hidden_size=args.hidden_size, direction=args.direction, use_flow=args.use_flow).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     if args.epochs <= 0:
@@ -48,15 +51,15 @@ def train(args):
         n = 0
         for batch in loader:
             # batch is a tuple: (flux, flux_err, time) each shaped (B, L)
-            flux, flux_err, times, mask, masked_flux = batch
+            flux, flux_err, times, mask, masked_flux, masked_flux_err = batch
             # print('mean flux:', flux.mean().item(), 'std flux:', flux.std().item())
             # print('max flux_err:', flux_err.max().item(), 'min flux_err:', flux_err.min().item())
             masked_flux = masked_flux.to(device)
-            flux_err = flux_err.to(device)
+            masked_flux_err = masked_flux_err.to(device)
             mask = mask.to(device)
 
             # Build input channels [flux, flux_err] -> (B, L, 2)
-            x_in = torch.stack([masked_flux, flux_err, mask], dim=-1)
+            x_in = torch.stack([masked_flux, masked_flux_err, mask], dim=-1)
             out = model(x_in)
             recon = out['reconstructed']  # (B, L, 1) -> [mean, raw_logsigma]
             mean = recon[..., 0]
@@ -86,6 +89,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--input', type=str, default='data/timeseries.h5')
     p.add_argument('--max_length', type=int, default=16384)
+    p.add_argument('--direction', type=str, default='forward', choices=['forward', 'backward', 'bi'])
     p.add_argument('--random_seed', type=int, default=19)
     p.add_argument('--num_samples', type=int, default=None)
     p.add_argument('--epochs', type=int, default=3)
@@ -93,9 +97,12 @@ def parse_args():
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--hidden_size', type=int, default=64)
     p.add_argument('--output_dir', type=str, default='output/simple_rnn')
-    p.add_argument('--output_name', type=str, default='simple_min_gru_rolling.pt')
+    p.add_argument('--output_name', type=str, default='simple_min_gru_default_output.pt')
     p.add_argument('--device', type=str, default='auto')
     p.add_argument('--use_flow', action='store_true')
+    p.add_argument('--min_size', type=int, default=2)
+    p.add_argument('--max_size', type=int, default=100)
+    p.add_argument('--mask_portion', type=float, default=0.2)
     return p.parse_args()
 
 

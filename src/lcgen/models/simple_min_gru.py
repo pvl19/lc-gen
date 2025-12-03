@@ -39,12 +39,72 @@ class minGRUCell(nn.Module):
         h = (1.0 - z) * h_prev + z * h_tilde
         return h
 
-
-class SimpleMinGRU(nn.Module):
-    """Single-cell RNN model with Gaussian and optional Flow heads."""
+class BiDirectionalMinGRU(nn.Module):
+    """Bidirectional minGRU model."""
     def __init__(self, hidden_size: int = 64, use_flow: bool = False):
         super().__init__()
         self.hidden_size = hidden_size
+
+        # We'll accept scalar flux + flux_err inputs per timestep (2D)
+        self.forward_input_proj = nn.Linear(3, hidden_size)
+        self.backward_input_proj = nn.Linear(3, hidden_size)
+
+        # forward and backward minGRU cells
+        self.forward_cell = minGRUCell(hidden_size, hidden_size)
+        self.backward_cell = minGRUCell(hidden_size, hidden_size)
+
+        self.output_size = hidden_size * 2
+        self.gauss_head = nn.Linear(self.output_size, 1)
+
+    def forward(self, x):
+        if x.dim() != 3 or x.size(-1) != 3:
+            raise ValueError(f"Expected (B, L, 3), got {tuple(x.shape)}")
+        
+        B, L, _ = x.shape
+
+        # Preallocate hidden states
+        h_fwd_tensor = x.new_zeros(B, L, self.hidden_size)
+        h_bwd_tensor = x.new_zeros(B, L, self.hidden_size)
+
+        # Initial hidden states
+        h_fwd = x.new_zeros(B, self.hidden_size)
+        h_bwd = x.new_zeros(B, self.hidden_size)
+
+        preds_bi = []
+
+        # ---- Store backward hidden states ----
+        for t in reversed(range(L)):
+            # Store hidden state
+            h_bwd_tensor[:, t, :] = h_bwd           # store aligned with original sequence
+
+            # Backward RNN
+            xi_bwd = x[:, t, :]
+            inp_bwd = self.backward_input_proj(xi_bwd)
+            h_bwd = self.backward_cell.step(inp_bwd, h_bwd)
+
+        # User forward pass and predict
+        for t in range(L):
+
+            #Concatenate hidden states and predict
+            h_bwd = h_bwd_tensor[:, t, :]
+            h_bi = torch.cat([h_fwd, h_bwd], dim=1)  # (B, 2H)
+            pred_bi = self.gauss_head(h_bi)  # (B,1)
+            preds_bi.append(pred_bi)
+
+            # Forward RNN
+            xi_fwd = x[:, t, :]                     # (B, input_dim)
+            inp_fwd = self.forward_input_proj(xi_fwd)  # (B, H)
+            h_fwd = self.forward_cell.step(inp_fwd, h_fwd)            
+
+        preds_bi = torch.stack(preds_bi, dim=1)     # (B, L, 1)
+        return {'reconstructed': preds_bi}
+
+class SimpleMinGRU(nn.Module):
+    """Single-cell RNN model with Gaussian and optional Flow heads."""
+    def __init__(self, hidden_size: int = 64, direction: str = 'forward', use_flow: bool = False):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.direction = direction
 
         # We'll accept scalar flux + flux_err inputs per timestep (2D)
         self.input_proj = nn.Linear(3, hidden_size)
@@ -76,11 +136,13 @@ class SimpleMinGRU(nn.Module):
         B, L, _ = x.shape
         h = x.new_zeros(B, self.hidden_size)
 
+        if self.direction == 'backward':
+            x = torch.flip(x, dims=[1])  # reverse sequence for backward pass
+
         preds = []
 
-        # We always use x[:, t] as input to update the state
-        # and then predict x[t+1] based on the updated state.
         for t in range(L):
+            
             # Predict next value using current state
             pred = self.gauss_head(h)    # (B,1)
             preds.append(pred)
@@ -92,6 +154,9 @@ class SimpleMinGRU(nn.Module):
 
         # preds = list of L items [(B,1), (B,1), ...]
         preds = torch.stack(preds, dim=1)     # (B, L, 1)
+
+        if self.direction == 'backward':
+            preds = torch.flip(preds, dims=[1])  # reverse predictions back
 
         return {'reconstructed': preds}
 

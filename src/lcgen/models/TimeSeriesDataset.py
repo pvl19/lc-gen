@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 import h5py
+from lcgen.utils.mask import apply_block_mask
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,7 +19,7 @@ from lcgen.utils.trunc_data import extract_data
 from lcgen.utils.loss import recon_loss
 
 class TimeSeriesDataset(Dataset):
-    def __init__(self, h5path, random_seed,max_length=16384, num_samples=None):
+    def __init__(self, h5path, random_seed,max_length=16384, num_samples=None, min_size=2, max_size=100, mask_portion=0.2):
         p = Path(h5path)
         if p.exists():
             if max_length < 16384:
@@ -31,7 +32,6 @@ class TimeSeriesDataset(Dataset):
                     self.flux = f['flux'][:]
                     self.time = f['time'][:]
                     self.flux_err = f['flux_err'][:]
-            self.masked_flux = self.flux.copy()
             self.flux = np.asarray(self.flux, dtype=np.float32)
             self.time = np.asarray(self.time, dtype=np.float32)
             self.flux_err = np.asarray(self.flux_err, dtype=np.float32)
@@ -43,19 +43,69 @@ class TimeSeriesDataset(Dataset):
             self.flux = np.random.randn(N, L).astype(np.float32)
             self.flux_err = np.random.randn(N, L).astype(np.float32)
             self.time = np.random.randn(N, L).astype(np.float32)
-        self.apply_mask()
+        self.apply_block_mask(min_size, max_size, mask_portion)
 
     def __len__(self):
         return len(self.flux)
 
     def __getitem__(self, idx):
         return [self.flux[idx], self.flux_err[idx], self.time[idx],
-                self.mask[idx], self.masked_flux[idx]]
+                self.mask[idx], self.masked_flux[idx], self.masked_flux_err[idx]]
     
-    def apply_mask(self):
-        self.mask = np.full(self.flux.shape, 1.0, dtype=np.float32)
-        self.masked_flux = self.flux * self.mask
+    def apply_block_mask(self, min_size, max_size, mask_portion):
+        """
+        Apply random block masks to 2D or 3D time series data (B, L) or (B, L, C).
+        Each sample has its own random masked blocks; all channels in a sample share the same mask.
 
+        Args:
+            data: np.ndarray, shape (B, L) or (B, L, C)
+            min_size: minimum block size
+            max_size: maximum block size
+            mask_portion: fraction of time steps to mask (0-1)
+
+        Returns:
+            masked_flux: same shape as flux
+            masked_flux_err: same shape as flux_err
+            mask: same shape as flux (1=unmasked, 0=masked)
+        """
+        masked_flux = self.flux.copy()
+        masked_flux_err = self.flux_err.copy()
+        mask = np.ones_like(self.flux, dtype=np.float32)
+        
+        B, L = self.flux.shape[:2]
+        C = self.flux.shape[2] if self.flux.ndim == 3 else 1
+        total_mask_size = int(L * mask_portion)
+
+        # For each sample, generate a mask
+        for i in range(B):
+            # Create a boolean array of length L: 1 = masked, 0 = unmasked
+            sample_mask = np.zeros(L, dtype=np.bool_)
+
+            # Precompute blocks that fit into total_mask_size
+            masked_so_far = 0
+            while masked_so_far < total_mask_size:
+                block_size = np.random.randint(min_size, max_size + 1)
+                if masked_so_far + block_size > total_mask_size:
+                    block_size = total_mask_size - masked_so_far
+                start_idx = np.random.randint(0, L - block_size + 1)
+                sample_mask[start_idx:start_idx + block_size] = True
+                masked_so_far += block_size
+
+            # Apply mask to data
+            if self.flux.ndim == 2:
+                masked_flux[i, sample_mask] = 0.0
+                masked_flux_err[i, sample_mask] = 0.0
+                mask[i, sample_mask] = 0.0
+            else:  # (B, L, C)
+                masked_flux[i, sample_mask, :] = 0.0
+                masked_flux_err[i, sample_mask, :] = 0.0
+                mask[i, sample_mask, :] = 0.0
+        
+        print(f'Applied block mask: min_size={min_size}, max_size={max_size}, mask_portion={mask_portion}')
+
+        self.masked_flux = masked_flux
+        self.masked_flux_err = masked_flux_err
+        self.mask = mask
 
 def collate_fn(batch):
     """Collate list of samples into batched tensors.
@@ -69,4 +119,6 @@ def collate_fn(batch):
     times = np.stack([b[2] for b in batch], axis=0).astype(np.float32)
     masks = np.stack([b[3] for b in batch], axis=0).astype(np.float32)
     masked_fluxes = np.stack([b[4] for b in batch], axis=0).astype(np.float32)
-    return (torch.from_numpy(masked_fluxes), torch.from_numpy(flux_errs), torch.from_numpy(times), torch.from_numpy(masks), torch.from_numpy(masked_fluxes))
+    masked_flux_errs = np.stack([b[5] for b in batch], axis=0).astype(np.float32)
+
+    return (torch.from_numpy(fluxes), torch.from_numpy(flux_errs), torch.from_numpy(times), torch.from_numpy(masks), torch.from_numpy(masked_fluxes), torch.from_numpy(masked_flux_errs))
