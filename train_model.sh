@@ -2,11 +2,12 @@ python src/lcgen/train_simple_rnn.py \
   --input data/timeseries.h5 \
   --random_seed 19 \
   --direction bi \
-  --max_length 1048 \
-  --num_samples 100 \
-  --output_name simple_min_gru_bi.pt \
-  --epochs 40 \
+  --max_length 1024 \
+  --num_samples 1024 \
+  --output_name simple_min_gru_bi_tenc_mock.pt \
+  --epochs 3 \
   --lr 1e-3 \
   --min_size 2 \
-  --max_size 100 \
-  --mask_portion 0.2
+  --max_size 40 \
+  --mask_portion 0.05 \
+  --mock_sinusoid

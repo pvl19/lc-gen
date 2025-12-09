@@ -39,7 +39,7 @@ def mask_intervals(mask_1d):
         intervals.append((start, L))
     return intervals
 
-def plot_recon(model_path, num_examples, seq_length, hidden_size, direction, use_flow, random_seed=19):
+def plot_recon(model_path, num_examples, seq_length, hidden_size, direction, use_flow, random_seed, mock_sinusoid):
     """Plot reconstructions from a trained SimpleMinGRU model.
 
     Args:
@@ -67,19 +67,22 @@ def plot_recon(model_path, num_examples, seq_length, hidden_size, direction, use
     # Load data and generate reconstructions
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     raw_data_path = Path('data/timeseries.h5')
-    ds = TimeSeriesDataset(raw_data_path, random_seed=random_seed, max_length=seq_length, num_samples=num_examples)
+    ds = TimeSeriesDataset(raw_data_path, random_seed=random_seed, min_size=args.min_size, max_size=args.max_size, mask_portion=args.mask_portion, max_length=seq_length, num_samples=num_examples, mock_sinusoid=mock_sinusoid)
     loader = DataLoader(ds, batch_size=num_examples, shuffle=False, collate_fn=collate_fn)
     batch_X = next(iter(loader)) 
-    flux, flux_err, times, mask, masked_flux, masked_flux_err = batch_X
-    masked_flux = masked_flux.to(device)
-    masked_flux_err = masked_flux_err.to(device)
+    flux, flux_err, times, mask = batch_X
+    flux = flux.to(device)
+    flux_err = flux_err.to(device)
+    # masked_flux = masked_flux.to(device)
+    # masked_flux_err = masked_flux_err.to(device)
     times = times.to(device)
     mask = mask.to(device)
 
     # Build input channels [flux, flux_err] -> (B, L, 2)
-    x_in = torch.stack([masked_flux, masked_flux_err, mask], dim=-1)
+    x_in = torch.stack([flux, flux_err, mask], dim=-1)
+    t_in = torch.stack([times], dim=-1)
 
-    out = model(x_in)
+    out = model(x_in, t_in)
     recon = out['reconstructed']  # (B, L, 1) -> [mean, raw_logsigma]
     mean = recon[..., 0]
     loss = recon_loss(flux, flux_err, mean)
@@ -140,9 +143,14 @@ def parse_args():
     p.add_argument('--num_examples', type=int, default=3)
     p.add_argument('--hidden_size', type=int, default=64)
     p.add_argument('--use_flow', action='store_true')   
+    p.add_argument('--min_size', type=int, default=2)
+    p.add_argument('--max_size', type=int, default=40)
+    p.add_argument('--mask_portion', type=float, default=0.6)
+    p.add_argument('--random_seed', type=int, default=19)
+    p.add_argument('--mock_sinusoid', action='store_true')
     return p.parse_args()
 
 
 if __name__ == '__main__':
     args = parse_args()
-    plot_recon(args.model_path, args.num_examples, args.seq_length, args.hidden_size, args.direction, args.use_flow)
+    plot_recon(args.model_path, args.num_examples, args.seq_length, args.hidden_size, args.direction, args.use_flow, args.random_seed, args.mock_sinusoid)

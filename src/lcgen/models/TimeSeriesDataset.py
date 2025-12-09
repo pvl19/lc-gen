@@ -19,7 +19,7 @@ from lcgen.utils.trunc_data import extract_data
 from lcgen.utils.loss import recon_loss
 
 class TimeSeriesDataset(Dataset):
-    def __init__(self, h5path, random_seed,max_length=16384, num_samples=None, min_size=2, max_size=100, mask_portion=0.2):
+    def __init__(self, h5path, random_seed, min_size, max_size, mask_portion, max_length=16384, num_samples=None, mock_sinusoid=False):
         p = Path(h5path)
         if p.exists():
             if max_length < 16384:
@@ -43,6 +43,19 @@ class TimeSeriesDataset(Dataset):
             self.flux = np.random.randn(N, L).astype(np.float32)
             self.flux_err = np.random.randn(N, L).astype(np.float32)
             self.time = np.random.randn(N, L).astype(np.float32)
+        if mock_sinusoid:
+            # Generate a mock sinusoidal dataset
+            for i in range(len(self.flux)):
+                t_range_i = np.max(self.time[i]) - np.min(self.time[i])
+                phase = np.random.uniform(0, 2 * np.pi)
+                amp = np.random.normal(1, 0.5)  # Random amplitude
+                num_cycles = np.abs(np.random.normal(3, 2))  # Random number of cycles
+                period = t_range_i / num_cycles
+                t_reg_space = np.linspace(np.min(self.time[i]), np.max(self.time[i]), self.flux.shape[1])
+                flux_reg_space = amp * np.sin(t_reg_space * (2 * np.pi / period) + phase)
+                flux_at_t = np.interp(self.time[i], t_reg_space, flux_reg_space)
+                self.flux[i] = flux_at_t
+                self.flux_err[i] = np.full_like(flux_at_t, 0.1)  # Minimal flux error
         self.apply_block_mask(min_size, max_size, mask_portion)
 
     def __len__(self):
@@ -50,7 +63,7 @@ class TimeSeriesDataset(Dataset):
 
     def __getitem__(self, idx):
         return [self.flux[idx], self.flux_err[idx], self.time[idx],
-                self.mask[idx], self.masked_flux[idx], self.masked_flux_err[idx]]
+                self.mask[idx]]
     
     def apply_block_mask(self, min_size, max_size, mask_portion):
         """
@@ -118,7 +131,7 @@ def collate_fn(batch):
     flux_errs = np.stack([b[1] for b in batch], axis=0).astype(np.float32)
     times = np.stack([b[2] for b in batch], axis=0).astype(np.float32)
     masks = np.stack([b[3] for b in batch], axis=0).astype(np.float32)
-    masked_fluxes = np.stack([b[4] for b in batch], axis=0).astype(np.float32)
-    masked_flux_errs = np.stack([b[5] for b in batch], axis=0).astype(np.float32)
+    # masked_fluxes = np.stack([b[4] for b in batch], axis=0).astype(np.float32)
+    # masked_flux_errs = np.stack([b[5] for b in batch], axis=0).astype(np.float32)
 
-    return (torch.from_numpy(fluxes), torch.from_numpy(flux_errs), torch.from_numpy(times), torch.from_numpy(masks), torch.from_numpy(masked_fluxes), torch.from_numpy(masked_flux_errs))
+    return (torch.from_numpy(fluxes), torch.from_numpy(flux_errs), torch.from_numpy(times), torch.from_numpy(masks))

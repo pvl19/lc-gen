@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import torch.optim as optim
+from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import Dataset, DataLoader
 
 import sys
@@ -31,7 +32,7 @@ def train(args):
     else:
         device = torch.device(args.device)
 
-    ds = TimeSeriesDataset(args.input, args.random_seed, args.max_length, args.num_samples, args.min_size, args.max_size, args.mask_portion)
+    ds = TimeSeriesDataset(args.input, args.random_seed,  args.min_size, args.max_size, args.mask_portion, args.max_length, args.num_samples, args.mock_sinusoid)
     print('Shape of TimeSeriesDataset:', ds.flux.shape)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
 
@@ -39,7 +40,8 @@ def train(args):
         model = BiDirectionalMinGRU(hidden_size=args.hidden_size, use_flow=args.use_flow).to(device)
     else:
         model = SimpleMinGRU(hidden_size=args.hidden_size, direction=args.direction, use_flow=args.use_flow).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0)
+    # scheduler = OneCycleLR(optimizer, max_lr=args.lr, steps_per_epoch=len(loader), epochs=args.epochs, pct_start=0.3, div_factor=10.0, final_div_factor=1000.0)
 
     if args.epochs <= 0:
         print('No epochs requested, exiting.')
@@ -50,27 +52,39 @@ def train(args):
         total_loss = 0.0
         n = 0
         for batch in loader:
+            optimizer.zero_grad()
             # batch is a tuple: (flux, flux_err, time) each shaped (B, L)
-            flux, flux_err, times, mask, masked_flux, masked_flux_err = batch
+            flux, flux_err, times, mask = batch
             # print('mean flux:', flux.mean().item(), 'std flux:', flux.std().item())
             # print('max flux_err:', flux_err.max().item(), 'min flux_err:', flux_err.min().item())
-            masked_flux = masked_flux.to(device)
-            masked_flux_err = masked_flux_err.to(device)
+            flux = flux.to(device)
+            flux_err = flux_err.to(device)
+            times = times.to(device)
+            # masked_flux = masked_flux.to(device)
+            # masked_flux_err = masked_flux_err.to(device)
             mask = mask.to(device)
 
             # Build input channels [flux, flux_err] -> (B, L, 2)
-            x_in = torch.stack([masked_flux, masked_flux_err, mask], dim=-1)
-            out = model(x_in)
+            x_in = torch.stack([flux, flux_err, mask], dim=-1)
+            t_in = torch.stack([times], dim=-1)
+            out = model(x_in, t_in)
             recon = out['reconstructed']  # (B, L, 1) -> [mean, raw_logsigma]
             mean = recon[..., 0]
 
-            nll = recon_loss(flux, flux_err, mean)
-            loss = nll.mean()
 
-            optimizer.zero_grad()
+            nll = recon_loss(flux, flux_err, mean)  # elementwise (B,L)
+            observed_mask = mask.bool()  # 1 means observed; adapt if reversed
+            loss = (nll * observed_mask).sum() / (observed_mask.sum().clamp_min(1.0))
+            # nll = recon_loss(flux, flux_err, mean)
+            # loss = nll.mean()
+            loss = (((mean - flux) ** 2).sum())**0.5
+
             loss.backward()
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            # scheduler.step()
+            optimizer.zero_grad()
 
             total_loss += loss.item()
             n += 1
@@ -103,6 +117,7 @@ def parse_args():
     p.add_argument('--min_size', type=int, default=2)
     p.add_argument('--max_size', type=int, default=100)
     p.add_argument('--mask_portion', type=float, default=0.2)
+    p.add_argument('--mock_sinusoid', action='store_true')
     return p.parse_args()
 
 
