@@ -41,7 +41,7 @@ class minGRUCell(nn.Module):
 
 class BiDirectionalMinGRU(nn.Module):
     """Bidirectional minGRU model."""
-    def __init__(self, hidden_size: int = 64, use_flow: bool = False):
+    def __init__(self, hidden_size: int = 64, direction: str = "bi", use_flow: bool = False):
         super().__init__()
         self.hidden_size = hidden_size
 
@@ -86,6 +86,13 @@ class BiDirectionalMinGRU(nn.Module):
 
         B, L, _ = x.shape
 
+        # Defensive normalization: expect t to be (B, L) or (B, L, 1)
+        t_seq = t
+        if t_seq.dim() == 3 and t_seq.size(-1) == 1:
+            t_seq = t_seq.squeeze(-1)
+        if t_seq.dim() != 2:
+            raise ValueError("t must be shape (B, L) or (B, L, 1)")
+
         # Replace masked timesteps' (flux, flux_err) with a learned mask token.
         # Dataset convention: mask == 1 -> unmasked, mask == 0 -> masked.
         mask_chan = x[..., 2:3]                    # (B, L, 1)
@@ -100,7 +107,7 @@ class BiDirectionalMinGRU(nn.Module):
         t_enc = self.time_enc(t)  # (B, L, 16)
         x = torch.cat([x, t_enc], dim=-1)  # (B, L, 3 + 16)
 
-        # Preallocate backward hidden states
+    # Preallocate backward hidden states
         h_bwd_tensor = x.new_zeros(B, L, self.hidden_size)
         h_fwd_tensor = x.new_zeros(B, L, self.hidden_size)
 
@@ -110,45 +117,49 @@ class BiDirectionalMinGRU(nn.Module):
 
         preds_bi = []
 
-        # ---- Store backward hidden states ----
-        for t in reversed(range(L)):
-            # Store hidden state
-            h_bwd_tensor[:, t, :] = h_bwd           # store aligned with original sequence
+        # ---- Store backward hidden states (mask-gated updates) ----
+        for ti in reversed(range(L)):
+            # Store hidden state (before processing this timestep)
+            h_bwd_tensor[:, ti, :] = h_bwd
 
-            # Backward RNN
-            xi_bwd = x[:, t, :]
+            # Backward RNN step for this timestep
+            xi_bwd = x[:, ti, :]
             inp_bwd = self.backward_input_proj(xi_bwd)
-            h_bwd = self.backward_cell.step(inp_bwd, h_bwd)
+            h_bwd_candidate = self.backward_cell.step(inp_bwd, h_bwd)
 
-        # User forward pass and predict
-        for t in range(L):
-            # Store forward hidden state
-            h_fwd_tensor[:, t, :] = h_fwd           # store aligned with original sequence
+            # Only update hidden state where the data is observed (mask==1)
+            # mask_t = x[:, ti, 2].unsqueeze(-1)               # (B,1)
+            # mask_bool = (mask_t > 0.5)
+            # mask_expand = mask_bool.expand(-1, self.hidden_size)
+            # h_bwd = torch.where(mask_expand, h_bwd_candidate, h_bwd)
+            h_bwd = h_bwd_candidate
 
-            # Forward RNN
-            xi_fwd = x[:, t, :]                     # (B, input_dim)
-            inp_fwd = self.forward_input_proj(xi_fwd)  # (B, H)
-            h_fwd = self.forward_cell.step(inp_fwd, h_fwd)            
+        # Forward pass (mask-gated updates)
+        for ti in range(L):
+            # Store forward hidden state (before processing this timestep)
+            h_fwd_tensor[:, ti, :] = h_fwd
+
+            # Forward RNN step
+            xi_fwd = x[:, ti, :]
+            inp_fwd = self.forward_input_proj(xi_fwd)
+            h_fwd_candidate = self.forward_cell.step(inp_fwd, h_fwd)
+
+            # Only update hidden state where the data is observed (mask==1)
+            # mask_t = x[:, ti, 2].unsqueeze(-1)
+            # mask_bool = (mask_t > 0.5)
+            # mask_expand = mask_bool.expand(-1, self.hidden_size)
+            # h_fwd = torch.where(mask_expand, h_fwd_candidate, h_fwd)
+            h_fwd = h_fwd_candidate
 
         h_bwd_final = h_bwd_tensor[:, 0, :]
         h_fwd_final = h_fwd_tensor[:, -1, :]
 
-        for t in range(L):
+        for ti in range(L):
+            # Use closest hidden states available from unmasked data at this index
+            h_fwd_apply = h_fwd_tensor[:, ti, :]
+            h_bwd_apply = h_bwd_tensor[:, ti, :]
 
-            # Get the mask for this timestep: (B,)
-            mask_t = x[:, t, 2].unsqueeze(-1)     # → (B, 1)
-
-            # Compute candidate hidden states
-            h_fwd_unmasked = h_fwd_tensor[:, t, :]   # (B, H)
-            h_fwd_masked = h_fwd_final               # (B, H)
-            h_bwd_unmasked = h_bwd_tensor[:, t, :]   # (B, H)
-            h_bwd_masked = h_bwd_final               # (B, H)
-
-            # Per-sample selection (vectorized)
-            h_fwd_apply = torch.where(mask_t > 0, h_fwd_unmasked, h_fwd_masked)
-            h_bwd_apply = torch.where(mask_t > 0, h_bwd_unmasked, h_bwd_masked)
-
-            time_enc_t = t_enc[:, t, :]
+            time_enc_t = t_enc[:, ti, :]
 
             # Concatenate and predict
             h_bi = torch.cat([h_fwd_apply, h_bwd_apply, time_enc_t], dim=1)
@@ -176,23 +187,43 @@ class BiDirectionalMinGRU(nn.Module):
         t_enc = self.time_enc(t)  # (B, L, 16)
         x = torch.cat([x, t_enc], dim=-1)  # (B, L, 3 + 16)
 
+        # Defensive normalization for t sequence (B, L) or (B, L, 1)
+        t_seq = t
+        if t_seq.dim() == 3 and t_seq.size(-1) == 1:
+            t_seq = t_seq.squeeze(-1)
+        if t_seq.dim() != 2:
+            raise ValueError("t must be shape (B, L) or (B, L, 1)")
+
         # Initial hidden states
         h_fwd = x.new_zeros(B, self.hidden_size)
         h_bwd = x.new_zeros(B, self.hidden_size)
-
-        # ---- Store backward hidden state ----
+        # ---- Store backward hidden state (mask-gated updates) ----
+        h_bwd_tensor = x.new_zeros(B, L, self.hidden_size)
         for ti in reversed(range(L)):
-            # Backward RNN
+            # store current hidden (before processing this timestep)
+            h_bwd_tensor[:, ti, :] = h_bwd
             xi_bwd = x[:, ti, :]
             inp_bwd = self.backward_input_proj(xi_bwd)
-            h_bwd = self.backward_cell.step(inp_bwd, h_bwd)
+            h_bwd_candidate = self.backward_cell.step(inp_bwd, h_bwd)
 
-        # User forward pass and predict
+            mask_t = x[:, ti, 2].unsqueeze(-1)
+            mask_bool = (mask_t > 0.5)
+            mask_expand = mask_bool.expand(-1, self.hidden_size)
+            h_bwd = torch.where(mask_expand, h_bwd_candidate, h_bwd)
+
+        # User forward pass and predict (mask-gated updates)
+        h_fwd_tensor = x.new_zeros(B, L, self.hidden_size)
         for ti in range(L):
-            # Forward RNN
-            xi_fwd = x[:, ti, :]                     # (B, input_dim)
-            inp_fwd = self.forward_input_proj(xi_fwd)  # (B, H)
-            h_fwd = self.forward_cell.step(inp_fwd, h_fwd)            
+            # store current hidden (before processing this timestep)
+            h_fwd_tensor[:, ti, :] = h_fwd
+            xi_fwd = x[:, ti, :]
+            inp_fwd = self.forward_input_proj(xi_fwd)
+            h_fwd_candidate = self.forward_cell.step(inp_fwd, h_fwd)
+
+            mask_t = x[:, ti, 2].unsqueeze(-1)
+            mask_bool = (mask_t > 0.5)
+            mask_expand = mask_bool.expand(-1, self.hidden_size)
+            h_fwd = torch.where(mask_expand, h_fwd_candidate, h_fwd)
 
         preds_bi = []
 
@@ -211,11 +242,43 @@ class BiDirectionalMinGRU(nn.Module):
         t_pred_enc = self.time_enc(t_pred.unsqueeze(-1))                   # (B,T_pred,16)
 
         
-        #Concatenate hidden states and predict
-        for t in range(t_pred_enc.size(1)):
-            h_bi = torch.cat([h_fwd, h_bwd, t_pred_enc[:, t, :]], dim=1)  # (B, 2H + time_enc_dims)
-            pred_bi = self.gauss_head(h_bi)  # (B,1)
-            preds_bi.append(pred_bi)
+        # For each predicted timestamp, select the last forward hidden state preceding
+        # the timestamp and the first backward hidden state following the timestamp.
+        # If timestamp is before the sequence, use h_bwd_final as the fallback.
+        # If timestamp is after the sequence, use h_fwd_final as the fallback.
+        # We'll do this per-batch sample since time arrays may differ per sample.
+
+        # Compute final hidden fallbacks
+        h_bwd_final = h_bwd_tensor[:, 0, :]
+        h_fwd_final = h_fwd_tensor[:, -1, :]
+
+        # t_seq already normalized above
+
+        Tpred = t_pred_enc.size(1)
+        for b in range(B):
+            t_seq_b = t_seq[b]
+            # searchsorted for this batch: returns indices in [0, L]
+            indices = torch.searchsorted(t_seq_b, t_pred[b])
+            for p in range(Tpred):
+                idx_next = int(indices[p].item())
+                idx_prev = idx_next - 1
+
+                if idx_prev >= 0:
+                    h_fwd_sel = h_fwd_tensor[b, idx_prev, :]
+                else:
+                    # timestamp before sequence -> use final backward hidden
+                    h_fwd_sel = h_bwd_final[b]
+
+                if idx_next < L:
+                    h_bwd_sel = h_bwd_tensor[b, idx_next, :]
+                else:
+                    # timestamp after sequence -> use final forward hidden
+                    h_bwd_sel = h_fwd_final[b]
+
+                time_enc_p = t_pred_enc[b, p, :]
+                h_bi = torch.cat([h_fwd_sel, h_bwd_sel, time_enc_p], dim=0).unsqueeze(0)
+                pred_bi = self.gauss_head(h_bi)
+                preds_bi.append(pred_bi)
 
         preds_bi = torch.stack(preds_bi, dim=1)     # (B, T_pred, 1)
         return {'predicted': preds_bi}

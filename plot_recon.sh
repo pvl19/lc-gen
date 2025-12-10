@@ -1,12 +1,12 @@
 python scripts/plot_recon.py \
-  --model_path output/simple_rnn/simple_min_gru_bi_tenc_mock.pt \
-  --output_name reconstructions_bi_tenc_mock.png \
+  --model_path output/simple_rnn/simple_min_gru_bi_tenc_mock_relu.pt \
+  --output_name reconstructions_bi_tenc_mock_relu.png \
   --direction bi \
   --num_examples 3 \
   --seq_length 1048 \
   --hidden_size 64 \
   --min_size 2 \
   --max_size 40 \
-  --mask_portion 0.05 \
-  --random_seed 87 \
+  --mask_portion 0.4 \
+  --random_seed 19 \
   --mock_sinusoid

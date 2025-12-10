@@ -75,9 +75,9 @@ def train(args):
             nll = recon_loss(flux, flux_err, mean)  # elementwise (B,L)
             observed_mask = mask.bool()  # 1 means observed; adapt if reversed
             loss = (nll * observed_mask).sum() / (observed_mask.sum().clamp_min(1.0))
-            # nll = recon_loss(flux, flux_err, mean)
-            # loss = nll.mean()
-            loss = (((mean - flux) ** 2).sum())**0.5
+            nll = recon_loss(flux, flux_err, mean)
+            loss = nll.mean()
+            # loss = (((mean - flux) ** 2).sum())**0.5
 
             loss.backward()
 
