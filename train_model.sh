@@ -1,10 +1,10 @@
 python src/lcgen/train_simple_rnn.py \
   --input data/timeseries.h5 \
   --random_seed 19 \
-  --direction bi \
+  --direction forward \
   --max_length 1024 \
   --num_samples 256 \
-  --output_name simple_min_gru_bi_tenc_mock_relu.pt \
+  --output_name simple_min_gru_v8_tenc_reset_fwd.pt \
   --epochs 3 \
   --lr 1e-3 \
   --min_size 2 \

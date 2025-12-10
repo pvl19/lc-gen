@@ -36,10 +36,8 @@ def train(args):
     print('Shape of TimeSeriesDataset:', ds.flux.shape)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
 
-    if args.direction == 'bi':
-        model = BiDirectionalMinGRU(hidden_size=args.hidden_size, use_flow=args.use_flow).to(device)
-    else:
-        model = SimpleMinGRU(hidden_size=args.hidden_size, direction=args.direction, use_flow=args.use_flow).to(device)
+    model = BiDirectionalMinGRU(hidden_size=args.hidden_size, direction=args.direction, use_flow=args.use_flow).to(device)
+    
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0)
     # scheduler = OneCycleLR(optimizer, max_lr=args.lr, steps_per_epoch=len(loader), epochs=args.epochs, pct_start=0.3, div_factor=10.0, final_div_factor=1000.0)
 
@@ -65,16 +63,12 @@ def train(args):
             mask = mask.to(device)
 
             # Build input channels [flux, flux_err] -> (B, L, 2)
-            x_in = torch.stack([flux, flux_err, mask], dim=-1)
+            x_in = torch.stack([flux, flux_err], dim=-1)
             t_in = torch.stack([times], dim=-1)
             out = model(x_in, t_in)
             recon = out['reconstructed']  # (B, L, 1) -> [mean, raw_logsigma]
             mean = recon[..., 0]
 
-
-            nll = recon_loss(flux, flux_err, mean)  # elementwise (B,L)
-            observed_mask = mask.bool()  # 1 means observed; adapt if reversed
-            loss = (nll * observed_mask).sum() / (observed_mask.sum().clamp_min(1.0))
             nll = recon_loss(flux, flux_err, mean)
             loss = nll.mean()
             # loss = (((mean - flux) ** 2).sum())**0.5

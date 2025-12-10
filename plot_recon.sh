@@ -1,7 +1,7 @@
 python scripts/plot_recon.py \
-  --model_path output/simple_rnn/simple_min_gru_bi_tenc_mock_relu.pt \
-  --output_name reconstructions_bi_tenc_mock_relu.png \
-  --direction bi \
+  --model_path output/simple_rnn/simple_min_gru_v8_tenc_reset_fwd.pt \
+  --output_name reconstructions_v8_tenc_reset_fwd.png \
+  --direction forward \
   --num_examples 3 \
   --seq_length 1048 \
   --hidden_size 64 \

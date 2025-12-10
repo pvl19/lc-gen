@@ -56,10 +56,8 @@ def plot_recon(model_path, num_examples, seq_length, hidden_size, direction, use
     outp.mkdir(parents=True, exist_ok=True)
 
     # Load model
-    if direction == 'bi':
-        model = BiDirectionalMinGRU(hidden_size=hidden_size, use_flow=use_flow)
-    else:
-        model = SimpleMinGRU(hidden_size=hidden_size, direction=direction, use_flow=use_flow)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = BiDirectionalMinGRU(hidden_size=args.hidden_size, direction=args.direction, use_flow=args.use_flow).to(device)
     model.load_state_dict(torch.load(model_path)['model_state_dict'])
     model.eval()
     print('Loaded model from ', model_path)
@@ -79,7 +77,7 @@ def plot_recon(model_path, num_examples, seq_length, hidden_size, direction, use
     mask = mask.to(device)
 
     # Build input channels [flux, flux_err] -> (B, L, 2)
-    x_in = torch.stack([flux, flux_err, mask], dim=-1)
+    x_in = torch.stack([flux, flux_err], dim=-1)
     t_in = torch.stack([times], dim=-1)
 
     out = model(x_in, t_in)
