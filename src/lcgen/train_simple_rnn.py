@@ -23,7 +23,7 @@ from pathlib import Path as _P
 sys.path.insert(0, str(_P(__file__).resolve().parents[1]))
 from lcgen.models.simple_min_gru import SimpleMinGRU, BiDirectionalMinGRU
 from lcgen.utils.trunc_data import extract_data
-from lcgen.utils.loss import recon_loss
+from lcgen.utils.loss import recon_loss, bounded_horizon_future_nll
 from lcgen.models.TimeSeriesDataset import TimeSeriesDataset, collate_fn
 
 def train(args):
@@ -37,7 +37,12 @@ def train(args):
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
 
     model = BiDirectionalMinGRU(hidden_size=args.hidden_size, direction=args.direction, use_flow=args.use_flow).to(device)
-    
+    # Ensure the post-LN time scaling parameter is trainable (unfrozen) so it
+    # can be fine-tuned during training. This prints its requires_grad status
+    # for transparency when the user launches training.
+    if hasattr(model, 'time_scale'):
+        print('time_scale present; requires_grad =', model.time_scale.requires_grad)
+
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0)
     # scheduler = OneCycleLR(optimizer, max_lr=args.lr, steps_per_epoch=len(loader), epochs=args.epochs, pct_start=0.3, div_factor=10.0, final_div_factor=1000.0)
 
@@ -52,7 +57,7 @@ def train(args):
         for batch in loader:
             optimizer.zero_grad()
             # batch is a tuple: (flux, flux_err, time) each shaped (B, L)
-            flux, flux_err, times, mask = batch
+            flux, flux_err, times = batch
             # print('mean flux:', flux.mean().item(), 'std flux:', flux.std().item())
             # print('max flux_err:', flux_err.max().item(), 'min flux_err:', flux_err.min().item())
             flux = flux.to(device)
@@ -60,17 +65,23 @@ def train(args):
             times = times.to(device)
             # masked_flux = masked_flux.to(device)
             # masked_flux_err = masked_flux_err.to(device)
-            mask = mask.to(device)
+            # mask = mask.to(device)
 
             # Build input channels [flux, flux_err] -> (B, L, 2)
             x_in = torch.stack([flux, flux_err], dim=-1)
             t_in = torch.stack([times], dim=-1)
-            out = model(x_in, t_in)
-            recon = out['reconstructed']  # (B, L, 1) -> [mean, raw_logsigma]
-            mean = recon[..., 0]
 
-            nll = recon_loss(flux, flux_err, mean)
-            loss = nll.mean()
+            # Request hidden states for multi-step supervision
+            out = model(x_in, t_in, return_states=True)
+            recon = out['reconstructed']  # (B, L, 1)
+
+            # Extract forward hidden states and time encodings
+            h_fwd = out.get('h_fwd_tensor')
+            t_enc = out.get('t_enc')
+
+            # Compute bounded-horizon averaged NLL over future predictions
+            # K chosen as 32 by default (can tune)
+            loss, stats = bounded_horizon_future_nll(h_fwd, t_enc, model.gauss_head, flux, flux_err, K=args.K)
             # loss = (((mean - flux) ** 2).sum())**0.5
 
             loss.backward()
@@ -112,6 +123,7 @@ def parse_args():
     p.add_argument('--max_size', type=int, default=100)
     p.add_argument('--mask_portion', type=float, default=0.2)
     p.add_argument('--mock_sinusoid', action='store_true')
+    p.add_argument('--K', type=int, default=128)
     return p.parse_args()
 
 

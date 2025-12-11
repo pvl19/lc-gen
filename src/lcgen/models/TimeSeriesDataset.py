@@ -56,14 +56,13 @@ class TimeSeriesDataset(Dataset):
                 flux_at_t = np.interp(self.time[i], t_reg_space, flux_reg_space)
                 self.flux[i] = flux_at_t
                 self.flux_err[i] = np.full_like(flux_at_t, 0.1)  # Minimal flux error
-        self.apply_block_mask(min_size, max_size, mask_portion)
+        # self.apply_block_mask(min_size, max_size, mask_portion)
 
     def __len__(self):
         return len(self.flux)
 
     def __getitem__(self, idx):
-        return [self.flux[idx], self.flux_err[idx], self.time[idx],
-                self.mask[idx]]
+        return [self.flux[idx], self.flux_err[idx], self.time[idx]]
     
     def apply_block_mask(self, min_size, max_size, mask_portion):
         """
@@ -130,8 +129,8 @@ def collate_fn(batch):
     fluxes = np.stack([b[0] for b in batch], axis=0).astype(np.float32)
     flux_errs = np.stack([b[1] for b in batch], axis=0).astype(np.float32)
     times = np.stack([b[2] for b in batch], axis=0).astype(np.float32)
-    masks = np.stack([b[3] for b in batch], axis=0).astype(np.float32)
+    # masks = np.stack([b[3] for b in batch], axis=0).astype(np.float32)
     # masked_fluxes = np.stack([b[4] for b in batch], axis=0).astype(np.float32)
     # masked_flux_errs = np.stack([b[5] for b in batch], axis=0).astype(np.float32)
 
-    return (torch.from_numpy(fluxes), torch.from_numpy(flux_errs), torch.from_numpy(times), torch.from_numpy(masks))
+    return (torch.from_numpy(fluxes), torch.from_numpy(flux_errs), torch.from_numpy(times))

@@ -1,12 +1,13 @@
 python scripts/plot_recon.py \
-  --model_path output/simple_rnn/simple_min_gru_v8_tenc_reset_fwd.pt \
-  --output_name reconstructions_v8_tenc_reset_fwd.png \
+  --model_path output/simple_rnn/simple_min_gru_v11_multipred.pt \
+  --output_name reconstructions_v11_multipred_fwd.png \
   --direction forward \
   --num_examples 3 \
-  --seq_length 1048 \
+  --seq_length 256 \
   --hidden_size 64 \
   --min_size 2 \
   --max_size 40 \
-  --mask_portion 0.4 \
+  --mask_portion 0.0 \
   --random_seed 19 \
-  --mock_sinusoid
+  --mock_sinusoid \
+  --lags 1 8 32 128

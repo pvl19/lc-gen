@@ -46,7 +46,8 @@ class BiDirectionalMinGRU(nn.Module):
         self.hidden_size = hidden_size
         self.direction = direction
 
-        num_time_enc_dims = 64
+        num_time_enc_dims = 8
+        self.num_time_enc_dims = num_time_enc_dims
         # Non-linear time encoder: scalar time -> richer time features.
         # Small MLP lets the head exploit time information more flexibly.
         self.time_enc = nn.Sequential(
@@ -67,17 +68,24 @@ class BiDirectionalMinGRU(nn.Module):
             self.output_size = hidden_size * 2 + num_time_enc_dims
         else:
             self.output_size = hidden_size + num_time_enc_dims
+        # single LayerNorm for head inputs (defined after output_size)
+        self.head_norm = nn.LayerNorm(self.output_size)
+        # initialize time_scale to 2.0 to give the time-encoding a larger initial
+        # contribution and make it easier for the head to rely on absolute time.
+        self.time_scale = nn.Parameter(torch.tensor(5.0))
         # Small MLP head so the model can nonlinearly combine global summary
         # and per-step time encoding before predicting the scalar.
         head_hidden = max(32, hidden_size // 2)
 
         self.gauss_head = nn.Sequential(
             nn.Linear(self.output_size, head_hidden),
-            nn.ReLU(),
+            # use LeakyReLU so the head can produce negative activations easily
+            # (prevents the final linear from only seeing non-negative inputs)
+            nn.GELU(),
             nn.Linear(head_hidden, 1),
         )
 
-    def forward(self, x, t):
+    def forward(self, x, t, return_states: bool = False):
         if x.dim() != 3 or x.size(-1) != 2:
             raise ValueError(f"Expected (B, L, 2), got {tuple(x.shape)}")
 
@@ -137,125 +145,30 @@ class BiDirectionalMinGRU(nn.Module):
                 h_fwd_apply = h_fwd_tensor[:, ti, :]
                 h_bwd_apply = h_bwd_tensor[:, ti, :]
                 h_bi = torch.cat([h_fwd_apply, h_bwd_apply, time_enc_t], dim=1)
+            # normalize fused vector so time and hidden parts have comparable scale
+            h_bi = self.head_norm(h_bi)
+            # Apply a learnable scalar to the time-encoding portion AFTER LayerNorm
+            # so the scalar is not normalized away by head_norm.
+            nt = self.num_time_enc_dims
+            if nt > 0:
+                # multiply only the final nt dimensions (the time encoding slice)
+                h_hidden = h_bi[:, :-nt]
+                h_time = h_bi[:, -nt:] * self.time_scale
+                h_bi = torch.cat([h_hidden, h_time], dim=1)
             point_prediction = self.gauss_head(h_bi)
             seq_prediction.append(point_prediction)
 
         seq_prediction = torch.stack(seq_prediction, dim=1)     # (B, L, 1)
-        return {'reconstructed': seq_prediction}
-    
-    def predict(self, x, t, t_pred):
-        if x.dim() != 3 or x.size(-1) != 3:
-            raise ValueError(f"Expected (B, L, 3), got {tuple(x.shape)}")
-        
-        B, L, _ = x.shape
-        # Replace masked timesteps' (flux, flux_err) with the learned mask token
-        # (keep mask channel unchanged). Dataset convention: mask == 1 -> unmasked
-        mask_chan = x[..., 2:3]
-        masked_pos = (mask_chan == 0)
-        if masked_pos.any():
-            token = self.mask_token.view(1, 1, 2).to(x.device)
-            x_first2 = x[..., :2]
-            x_first2 = torch.where(masked_pos.expand_as(x_first2), token, x_first2)
-            x = torch.cat([x_first2, mask_chan], dim=-1)
-
-        t_enc = self.time_enc(t)  # (B, L, 16)
-        x = torch.cat([x, t_enc], dim=-1)  # (B, L, 3 + 16)
-
-        # Defensive normalization for t sequence (B, L) or (B, L, 1)
-        t_seq = t
-        if t_seq.dim() == 3 and t_seq.size(-1) == 1:
-            t_seq = t_seq.squeeze(-1)
-        if t_seq.dim() != 2:
-            raise ValueError("t must be shape (B, L) or (B, L, 1)")
-
-        # Initial hidden states
-        h_fwd = x.new_zeros(B, self.hidden_size)
-        h_bwd = x.new_zeros(B, self.hidden_size)
-        # ---- Store backward hidden state (mask-gated updates) ----
-        h_bwd_tensor = x.new_zeros(B, L, self.hidden_size)
-        for ti in reversed(range(L)):
-            # store current hidden (before processing this timestep)
-            h_bwd_tensor[:, ti, :] = h_bwd
-            xi_bwd = x[:, ti, :]
-            inp_bwd = self.backward_input_proj(xi_bwd)
-            h_bwd_candidate = self.backward_cell.step(inp_bwd, h_bwd)
-
-            mask_t = x[:, ti, 2].unsqueeze(-1)
-            mask_bool = (mask_t > 0.5)
-            mask_expand = mask_bool.expand(-1, self.hidden_size)
-            h_bwd = torch.where(mask_expand, h_bwd_candidate, h_bwd)
-
-        # User forward pass and predict (mask-gated updates)
-        h_fwd_tensor = x.new_zeros(B, L, self.hidden_size)
-        for ti in range(L):
-            # store current hidden (before processing this timestep)
-            h_fwd_tensor[:, ti, :] = h_fwd
-            xi_fwd = x[:, ti, :]
-            inp_fwd = self.forward_input_proj(xi_fwd)
-            h_fwd_candidate = self.forward_cell.step(inp_fwd, h_fwd)
-
-            mask_t = x[:, ti, 2].unsqueeze(-1)
-            mask_bool = (mask_t > 0.5)
-            mask_expand = mask_bool.expand(-1, self.hidden_size)
-            h_fwd = torch.where(mask_expand, h_fwd_candidate, h_fwd)
-
-        preds_bi = []
-
-        # ---- Encode predicted timestamps ----
-        # t_pred may be (T_pred,) or (B, T_pred)
-        t_pred = torch.tensor(t_pred, device=x.device, dtype=x.dtype)
-
-        if t_pred.dim() == 1:
-            # User gave a single timeline → broadcast
-            t_pred = t_pred.unsqueeze(0).expand(B, -1)
-        elif t_pred.dim() == 2:
-            # Already (B, T_pred) → do nothing
-            pass
-        else:
-            raise ValueError("t_pred must be 1D or 2D (B, T_pred)")
-        t_pred_enc = self.time_enc(t_pred.unsqueeze(-1))                   # (B,T_pred,16)
-
-        
-        # For each predicted timestamp, select the last forward hidden state preceding
-        # the timestamp and the first backward hidden state following the timestamp.
-        # If timestamp is before the sequence, use h_bwd_final as the fallback.
-        # If timestamp is after the sequence, use h_fwd_final as the fallback.
-        # We'll do this per-batch sample since time arrays may differ per sample.
-
-        # Compute final hidden fallbacks
-        h_bwd_final = h_bwd_tensor[:, 0, :]
-        h_fwd_final = h_fwd_tensor[:, -1, :]
-
-        # t_seq already normalized above
-
-        Tpred = t_pred_enc.size(1)
-        for b in range(B):
-            t_seq_b = t_seq[b]
-            # searchsorted for this batch: returns indices in [0, L]
-            indices = torch.searchsorted(t_seq_b, t_pred[b])
-            for p in range(Tpred):
-                idx_next = int(indices[p].item())
-                idx_prev = idx_next - 1
-
-                if idx_prev >= 0:
-                    h_fwd_sel = h_fwd_tensor[b, idx_prev, :]
-                else:
-                    # timestamp before sequence -> use final backward hidden
-                    h_fwd_sel = h_bwd_final[b]
-
-                if idx_next < L:
-                    h_bwd_sel = h_bwd_tensor[b, idx_next, :]
-                else:
-                    # timestamp after sequence -> use final forward hidden
-                    h_bwd_sel = h_fwd_final[b]
-
-                time_enc_p = t_pred_enc[b, p, :]
-                h_bi = torch.cat([h_fwd_sel, h_bwd_sel, time_enc_p], dim=0).unsqueeze(0)
-                pred_bi = self.gauss_head(h_bi)
-                preds_bi.append(pred_bi)
-
-        preds_bi = torch.stack(preds_bi, dim=1)     # (B, T_pred, 1)
-        return {'predicted': preds_bi}
+        out = {'reconstructed': seq_prediction}
+        if return_states:
+            # Provide forward hidden states and time encodings so training code can
+            # compute multi-step losses based on the hidden states BEFORE each timestep.
+            if self.direction in ['bi', 'forward']:
+                out['h_fwd_tensor'] = h_fwd_tensor
+            if self.direction in ['bi', 'backward']:
+                out['h_bwd_tensor'] = h_bwd_tensor
+            out['t_enc'] = t_enc
+        return out
 
 class SimpleMinGRU(nn.Module):
     """Single-cell RNN model with Gaussian and optional Flow heads."""

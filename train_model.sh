@@ -2,12 +2,13 @@ python src/lcgen/train_simple_rnn.py \
   --input data/timeseries.h5 \
   --random_seed 19 \
   --direction forward \
-  --max_length 1024 \
-  --num_samples 256 \
-  --output_name simple_min_gru_v8_tenc_reset_fwd.pt \
-  --epochs 3 \
+  --max_length 256 \
+  --num_samples 1024 \
+  --output_name simple_min_gru_v11_multipred.pt \
+  --epochs 5 \
   --lr 1e-3 \
   --min_size 2 \
   --max_size 40 \
-  --mask_portion 0.4 \
-  --mock_sinusoid
+  --mask_portion 0.0 \
+  --mock_sinusoid \
+  --K 128

@@ -11,7 +11,7 @@ def recon_loss(flux, flux_err, recon_flux):
     return nll
 
 
-def bounded_horizon_future_nll(h_fwd, t_enc, head, flux, flux_err, K: int = 32):
+def bounded_horizon_future_nll(h_fwd, t_enc, head, flux, flux_err, K: int = 128):
     """
     Compute the average NLL loss where each source hidden h_fwd[:, i] predicts up to K
     future targets j = i+1 .. i+K (bounded horizon). For each target j we average the
@@ -39,12 +39,11 @@ def bounded_horizon_future_nll(h_fwd, t_enc, head, flux, flux_err, K: int = 32):
     flux = flux.to(device)
     flux_err = flux_err.to(device)
 
-    # accumulators per-target
-    sum_nll_per_target = torch.zeros(B, L, device=device)
-    count_per_target = torch.zeros(B, L, device=device)
-
+    # We'll compute a global average over ALL valid predictions.
+    # Accumulate total NLL and total prediction count.
     max_k = min(K, L - 1)
     total_preds = 0
+    total_sum_nll = torch.tensor(0.0, device=device)
 
     for k in range(1, max_k + 1):
         src_slice = slice(0, L - k)
@@ -57,42 +56,25 @@ def bounded_horizon_future_nll(h_fwd, t_enc, head, flux, flux_err, K: int = 32):
         inputs_k = torch.cat([h_src, t_tgt], dim=-1)   # (B, L-k, H+Te)
         flat_in = inputs_k.view(-1, H + Te)           # (B*(L-k), H+Te)
 
-        # predict means
-        with torch.no_grad():
-            # head may contain parameters; however predictions are used to compute loss
-            # we call head without torch.no_grad so grads propagate. Remove no_grad.
-            pass
+        # predict means (allow gradients to flow)
         preds_k = head(flat_in).view(B, L - k)        # (B, L-k)
 
         # target ground truth and errors
         flux_tgt = flux[:, tgt_slice]                 # (B, L-k)
         ferr_tgt = flux_err[:, tgt_slice]             # (B, L-k)
 
-        # When no masking is used, every source/target pair in this diagonal is valid
+        # All pairs are valid when no masking is used
         valid = torch.ones_like(flux_tgt, device=device)
 
         # compute NLL per prediction using existing recon_loss
         nll_k = recon_loss(flux_tgt, ferr_tgt, preds_k)   # (B, L-k)
 
-        # accumulate (include all pairs)
-        sum_nll_per_target[:, tgt_slice] += nll_k * valid
-        count_per_target[:, tgt_slice] += valid
+        # accumulate global sums
+        total_sum_nll = total_sum_nll + (nll_k * valid).sum()
         total_preds += int(valid.sum().item())
 
-    # Only include targets with at least one prediction
-    targets_with_preds = (count_per_target > 0)
-    num_targets_with_preds = int(targets_with_preds.sum().item())
+    if total_preds == 0:
+        return torch.tensor(0.0, device=device), {'total_preds': 0}
 
-    if num_targets_with_preds == 0:
-        # no supervision available
-        return torch.tensor(0.0, device=device), {'total_preds': total_preds, 'targets_with_preds': 0}
-
-    avg_nll_per_target = torch.zeros_like(sum_nll_per_target)
-    avg_nll_per_target[targets_with_preds] = (
-        sum_nll_per_target[targets_with_preds] / count_per_target[targets_with_preds]
-    )
-
-    # final loss: mean across all (b, t) that have >=1 prediction
-    loss = avg_nll_per_target[targets_with_preds].mean()
-
-    return loss, {'total_preds': total_preds, 'targets_with_preds': num_targets_with_preds}
+    loss = total_sum_nll / float(total_preds)
+    return loss, {'total_preds': total_preds}
