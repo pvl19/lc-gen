@@ -3,11 +3,11 @@ python scripts/plot_recon.py \
   --output_name reconstructions_v11_multipred_fwd.png \
   --direction forward \
   --num_examples 3 \
-  --seq_length 256 \
+  --seq_length 512 \
   --hidden_size 64 \
   --min_size 2 \
   --max_size 40 \
   --mask_portion 0.0 \
   --random_seed 19 \
   --mock_sinusoid \
-  --lags 1 8 32 128
+  --lags 1 8 32 64

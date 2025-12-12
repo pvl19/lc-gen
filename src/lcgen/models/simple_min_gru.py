@@ -94,11 +94,18 @@ class BiDirectionalMinGRU(nn.Module):
         # Defensive normalization: expect t to be (B, L) or (B, L, 1)
         t_seq = t
         if t_seq.dim() == 3 and t_seq.size(-1) == 1:
+            # make (B, L)
             t_seq = t_seq.squeeze(-1)
         if t_seq.dim() != 2:
             raise ValueError("t must be shape (B, L) or (B, L, 1)")
 
-        t_enc = self.time_enc(t)  # (B, L, 16)
+        # Shift each sequence so times start at zero: t <- t - t0 where t0 = t[:,0]
+        # Keep units unchanged; this ensures the time-encoder sees time relative to
+        # the start of the sequence.
+        t0 = t_seq[:, 0].unsqueeze(1)  # (B, 1)
+        t_shifted = t_seq - t0         # (B, L)
+        # time_enc expects a last-dim scalar, so restore (...,1)
+        t_enc = self.time_enc(t_shifted.unsqueeze(-1))  # (B, L, Te)
         x = torch.cat([x, t_enc], dim=-1)  # (B, L, 2 + 16)
 
         seq_prediction = []

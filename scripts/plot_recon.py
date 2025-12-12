@@ -50,7 +50,9 @@ def plot_recon(args):
 
     # Create folder for plots
     outp = Path(args.model_path).parent / 'recon_plots'
+    outp_data = Path(args.model_path).parent / 'recon_data'
     outp.mkdir(parents=True, exist_ok=True)
+    outp_data.mkdir(parents=True, exist_ok=True)
 
     # Load model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -99,13 +101,16 @@ def plot_recon(args):
     # get forward/backward hidden states from the model output
     h_fwd = out.get('h_fwd_tensor')
     h_bwd_out = out.get('h_bwd_tensor')
-    # Compute time-encodings directly from the input times (t_in) so that
-    # reconstructions for t+k are formed by concatenating hidden(t) with
-    # time_enc(t+k) computed from the original input times. Do NOT rely on
-    # t_enc returned by the forward pass (it may reflect internal normalization
-    # or checkpoint mismatches); compute from `t_in` explicitly.
+    # Compute time-encodings from the provided raw times but first shift each
+    # sequence so it starts at zero: t_shifted = t_in - t0 (t0 = first time per seq).
+    # This uses the user's provided time base while matching the model's forward
+    # convention of computing time encodings on a per-sequence zero-origin.
     with torch.no_grad():
-        t_enc_in = model.time_enc(t_in)
+        # t_in shape: (B, L, 1) -> squeeze to (B, L)
+        t_seq = t_in.squeeze(-1)
+        t0 = t_seq[:, 0].unsqueeze(1)  # (B, 1)
+        t_shifted = (t_seq - t0).unsqueeze(-1)  # (B, L, 1)
+        t_enc_in = model.time_enc(t_shifted)
     loss = recon_loss(flux, flux_err, mean)
     flux_np = flux.cpu().numpy()
     flux_err_np = flux_err.cpu().numpy()
@@ -121,6 +126,9 @@ def plot_recon(args):
         ks = list(args.lags)
     preds_ks = {}
     if h_fwd is not None and t_enc_in is not None:
+        # We'll also compute predictions using relative time encodings (t_target - t_source)
+        preds_ks_rel = {}
+
         # h_fwd: (B, L, H), t_enc_in: (B, L, Te)
         B, L, H = h_fwd.shape
         Te = t_enc_in.size(-1)
@@ -155,11 +163,41 @@ def plot_recon(args):
                     flat_preds = head(normed).view(B, L - k)
                     preds_k[:, k:] = flat_preds
                 preds_ks[k] = preds_k.cpu().numpy()
+                # ---- relative time predictions for this k ----
+                preds_k_rel = torch.full((B, L), float('nan'), device=device)
+                if k < L:
+                    # build relative time differences: shape (B, L-k, 1)
+                    # t_src: times[:, :L-k], t_tgt: times[:, k:]
+                    t_src = times[:, :L-k]
+                    t_tgt = times[:, k:]
+                    t_rel = (t_tgt - t_src).unsqueeze(-1)  # (B, L-k, 1)
+                    # compute time-encodings from relative times
+                    t_rel_enc = model.time_enc(t_rel)
+                    if args.direction == 'bi' and h_bwd is not None:
+                        src_f = h_fwd[:, :L-k, :]
+                        src_b = h_bwd[:, k:, :]
+                        tgt_rel = t_rel_enc
+                        inputs_k_rel = torch.cat([src_f, src_b, tgt_rel], dim=-1)
+                    else:
+                        src = h_fwd[:, :L-k, :]
+                        tgt_rel = t_rel_enc
+                        inputs_k_rel = torch.cat([src, tgt_rel], dim=-1)
+
+                    flat_in_rel = inputs_k_rel.contiguous().view(-1, inputs_k_rel.size(-1))
+                    normed_rel = model.head_norm(flat_in_rel)
+                    if nt > 0:
+                        h_hidden = normed_rel[:, :-nt]
+                        h_time = normed_rel[:, -nt:] * model.time_scale
+                        normed_rel = torch.cat([h_hidden, h_time], dim=1)
+                    flat_preds_rel = head(normed_rel).view(B, L - k)
+                    preds_k_rel[:, k:] = flat_preds_rel
+                preds_ks_rel[k] = preds_k_rel.cpu().numpy()
     else:
         # fallback: repeat the single-step mean for all ks
         print('Warning: no hidden states or time encodings available; using single-step mean for all ks.')
         for k in ks:
             preds_ks[k] = mean_np
+            preds_ks_rel[k] = mean_np
 
     print(f'Using {args.num_examples} examples of length {args.seq_length} for plotting.')
 
@@ -210,8 +248,44 @@ def plot_recon(args):
         plt.legend()
 
     fig.savefig(outp / args.output_name)
-    print(f'Saved reconstruction plots to {outp / args.output_name}')
+    # Save plotting data (numpy) for later analysis / comparisons
+    data_fname = args.output_name.replace('.png', '') + '_data.npz'
+    save_path = outp_data / data_fname
+    # Build a dict of arrays to save
+    save_dict = {
+        'flux': flux_np,
+        'flux_err': flux_err_np,
+        'times': times_np,
+        'mean': mean_np,
+        'loss': loss_np,
+        # include the time-encodings computed from the input times so we can
+        # inspect how time features vary and contribute to per-k differences
+        't_enc_in': t_enc_in.detach().cpu().numpy(),
+        'ks': np.array(ks, dtype=np.int32)
+    }
+    for k, arr in preds_ks.items():
+        # store each preds_k under a key like pred_k_1
+        save_dict[f'pred_k_{k}'] = arr
+    for k, arr in preds_ks_rel.items():
+        save_dict[f'pred_k_rel_{k}'] = arr
 
+    try:
+        np.savez_compressed(save_path, **save_dict)
+        print(f'Saved reconstruction plot to {outp / args.output_name} and data to {save_path}')
+    except Exception as e:
+        print(f'Warning: failed to save data npz to {save_path}: {e}')
+
+    # Also save relative-time predictions to a separate NPZ for direct comparison
+    data_fname_rel = args.output_name.replace('.png', '') + '_rel_data.npz'
+    save_path_rel = outp_data / data_fname_rel
+    save_dict_rel = save_dict.copy()
+    for k, arr in preds_ks_rel.items():
+        save_dict_rel[f'pred_k_rel_{k}'] = arr
+    try:
+        np.savez_compressed(save_path_rel, **save_dict_rel)
+        print(f'Saved relative-time reconstruction data to {save_path_rel}')
+    except Exception as e:
+        print(f'Warning: failed to save relative data npz to {save_path_rel}: {e}')
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--model_path', type=str, default='output/simple_rnn/simple_min_gru_final_dummymask.pt')

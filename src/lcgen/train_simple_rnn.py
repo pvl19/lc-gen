@@ -75,13 +75,17 @@ def train(args):
             out = model(x_in, t_in, return_states=True)
             recon = out['reconstructed']  # (B, L, 1)
 
-            # Extract forward hidden states and time encodings
+            # Extract forward/backward hidden states and time encodings
             h_fwd = out.get('h_fwd_tensor')
+            h_bwd = out.get('h_bwd_tensor')
             t_enc = out.get('t_enc')
 
             # Compute bounded-horizon averaged NLL over future predictions
             # K chosen as 32 by default (can tune)
-            loss, stats = bounded_horizon_future_nll(h_fwd, t_enc, model.gauss_head, flux, flux_err, K=args.K)
+            # Pass the model so the loss uses the same head_norm / time-conditioning
+            # that `model.forward` applies during inference. Also pass h_bwd so
+            # bidirectional models can form the same fused head input.
+            loss, stats = bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, K=args.K)
             # loss = (((mean - flux) ** 2).sum())**0.5
 
             loss.backward()
