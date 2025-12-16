@@ -37,7 +37,8 @@ def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, K: in
 
     Returns:
         loss: scalar tensor (average NLL across targets that have >=1 valid prediction)
-        stats: dict with keys 'total_preds' and 'targets_with_preds' for diagnostics
+        stats: dict with keys 'total_preds' for diagnostics
+        per_k_mean: dict mapping k -> mean NLL (float) for predictions at horizon k
     """
     device = h_fwd.device
     B, L, H = h_fwd.shape
@@ -59,6 +60,7 @@ def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, K: in
     # we simply won't scale the time slice.
     time_scale = getattr(model, 'time_scale', None)
 
+    per_k_mean = {}
     for k in range(1, max_k + 1):
         src_slice = slice(0, L - k)
         tgt_slice = slice(k, L)
@@ -104,12 +106,20 @@ def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, K: in
         # compute NLL per prediction using existing recon_loss
         nll_k = recon_loss(flux_tgt, ferr_tgt, preds_k)   # (B, L-k)
 
+        # compute mean NLL for this k across valid predictions
+        valid_count = int(valid.sum().item())
+        if valid_count > 0:
+            mean_nll_k = float((nll_k * valid).sum().item() / valid_count)
+        else:
+            mean_nll_k = float('nan')
+        per_k_mean[k] = mean_nll_k
+
         # accumulate global sums
         total_sum_nll = total_sum_nll + (nll_k * valid).sum()
-        total_preds += int(valid.sum().item())
+        total_preds += valid_count
 
     if total_preds == 0:
         return torch.tensor(0.0, device=device), {'total_preds': 0}
 
     loss = total_sum_nll / float(total_preds)
-    return loss, {'total_preds': total_preds}
+    return loss, {'total_preds': total_preds}, per_k_mean

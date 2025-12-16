@@ -3,8 +3,8 @@ python src/lcgen/train_simple_rnn.py \
   --random_seed 19 \
   --direction forward \
   --max_length 512 \
-  --num_samples 1024 \
-  --output_name simple_min_gru_v11_multipred.pt \
+  --num_samples 2048 \
+  --output_name baseline_v1.pt \
   --epochs 10 \
   --lr 1e-3 \
   --min_size 2 \

@@ -24,6 +24,8 @@ sys.path.insert(0, str(_P(__file__).resolve().parents[1]))
 from lcgen.models.simple_min_gru import SimpleMinGRU, BiDirectionalMinGRU
 from lcgen.utils.trunc_data import extract_data
 from lcgen.utils.loss import recon_loss, bounded_horizon_future_nll
+from collections import defaultdict
+import matplotlib.pyplot as plt
 from lcgen.models.TimeSeriesDataset import TimeSeriesDataset, collate_fn
 
 def train(args):
@@ -49,6 +51,10 @@ def train(args):
     if args.epochs <= 0:
         print('No epochs requested, exiting.')
         return
+
+    # trackers for per-step logging
+    step_losses = []            # overall loss per optimizer.step
+    per_k_losses = defaultdict(list)  # maps k -> list of mean NLL for that k per step
 
     for epoch in range(args.epochs):
         model.train()
@@ -85,7 +91,7 @@ def train(args):
             # Pass the model so the loss uses the same head_norm / time-conditioning
             # that `model.forward` applies during inference. Also pass h_bwd so
             # bidirectional models can form the same fused head input.
-            loss, stats = bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, K=args.K)
+            loss, stats, per_k_mean = bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, K=args.K)
             # loss = (((mean - flux) ** 2).sum())**0.5
 
             loss.backward()
@@ -94,18 +100,49 @@ def train(args):
             optimizer.step()
             # scheduler.step()
             optimizer.zero_grad()
-
             total_loss += loss.item()
             n += 1
+
+            # record per-step losses
+            step_losses.append(loss.item())
+            for k, v in per_k_mean.items():
+                per_k_losses[int(k)].append(v)
 
         avg = total_loss / max(1, n)
         print(f'Epoch {epoch+1}/{args.epochs} - Loss: {avg:.6f}')
 
     # Save final model
-    outp = Path(args.output_dir)
-    outp.mkdir(parents=True, exist_ok=True)
-    torch.save({'model_state_dict': model.state_dict()}, outp / args.output_name)
-    print('Saved final model to', outp / args.output_name)
+    outp_model = Path(args.output_dir + '/models/')
+    outp_model.mkdir(parents=True, exist_ok=True)
+    outp_loss = Path(args.output_dir + '/training_loss/')
+    outp_loss.mkdir(parents=True, exist_ok=True)
+    torch.save({'model_state_dict': model.state_dict()}, outp_model / args.output_name)
+    print('Saved final model to', outp_model / args.output_name)
+    # Save training loss traces
+    try:
+        npz_path = outp_loss / 'training_loss_steps.npz'
+        save_dict = {'step_loss': np.array(step_losses, dtype=np.float32)}
+        for k, vals in per_k_losses.items():
+            save_dict[f'loss_k_{k}'] = np.array(vals, dtype=np.float32)
+        np.savez_compressed(npz_path, **save_dict)
+        print('Saved training loss traces to', npz_path)
+    except Exception as e:
+        print('Warning: failed to save training loss traces:', e)
+
+    # Save a simple plot of overall training loss per step
+    try:
+        plt.figure(figsize=(6, 3))
+        plt.plot(np.arange(len(step_losses)), step_losses, '-k')
+        plt.xlabel('Training step')
+        plt.ylabel('Average NLL')
+        plt.title('Training loss per step')
+        png_path = outp_loss / 'training_loss_steps.png'
+        plt.tight_layout()
+        plt.savefig(png_path)
+        plt.close()
+        print('Saved training loss plot to', png_path)
+    except Exception as e:
+        print('Warning: failed to save training loss plot:', e)
 
 
 def parse_args():

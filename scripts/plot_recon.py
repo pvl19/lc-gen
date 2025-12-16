@@ -128,6 +128,7 @@ def plot_recon(args):
     if h_fwd is not None and t_enc_in is not None:
         # We'll also compute predictions using relative time encodings (t_target - t_source)
         preds_ks_rel = {}
+        preds_ks_loss = {}
 
         # h_fwd: (B, L, H), t_enc_in: (B, L, Te)
         B, L, H = h_fwd.shape
@@ -162,6 +163,15 @@ def plot_recon(args):
                         normed = torch.cat([h_hidden, h_time], dim=1)
                     flat_preds = head(normed).view(B, L - k)
                     preds_k[:, k:] = flat_preds
+                    # compute per-prediction NLL aligned with target indices
+                    with torch.no_grad():
+                        preds_k_t = preds_k[:, k:]
+                        flux_tgt = flux[:, k:]
+                        ferr_tgt = flux_err[:, k:]
+                        nll_k = recon_loss(flux_tgt, ferr_tgt, preds_k_t)  # (B, L-k)
+                        loss_k = torch.full((B, L), float('nan'), device=device)
+                        loss_k[:, k:] = nll_k
+                        preds_ks_loss[k] = loss_k.cpu().numpy()
                 preds_ks[k] = preds_k.cpu().numpy()
                 # ---- relative time predictions for this k ----
                 preds_k_rel = torch.full((B, L), float('nan'), device=device)
@@ -198,6 +208,7 @@ def plot_recon(args):
         for k in ks:
             preds_ks[k] = mean_np
             preds_ks_rel[k] = mean_np
+            preds_ks_loss[k] = np.zeros_like(mean_np)
 
     print(f'Using {args.num_examples} examples of length {args.seq_length} for plotting.')
 
@@ -235,9 +246,16 @@ def plot_recon(args):
         plt.ylabel('Flux')
         plt.legend()
 
-        # Loss
+        # Loss: plot per-k NLL lines (use same colors as predictions)
         plt.subplot(args.num_examples*2, 1, (i*2) + 2)
-        plt.plot(times_np[i], loss_np[i], label='Reconstruction Loss', color='green')
+        cmap = plt.get_cmap('tab10')
+        for idx, k in enumerate(ks):
+            loss_arr = preds_ks_loss.get(k)
+            if loss_arr is None:
+                continue
+            loss_i = loss_arr[i]
+            color = cmap(idx % 10)
+            plt.plot(times_np[i], loss_i, label=f'Loss from pred t-{k}', color=color)
         # for start, end in intervals:
         #     x0 = times_np[i, start]
         #     x1 = times_np[i, end-1]
@@ -266,6 +284,8 @@ def plot_recon(args):
     for k, arr in preds_ks.items():
         # store each preds_k under a key like pred_k_1
         save_dict[f'pred_k_{k}'] = arr
+    for k, arr in preds_ks_loss.items():
+        save_dict[f'loss_k_{k}'] = arr
     for k, arr in preds_ks_rel.items():
         save_dict[f'pred_k_rel_{k}'] = arr
 

@@ -31,6 +31,20 @@ class minGRUCell(nn.Module):
         self.W_z = nn.Linear(input_size, hidden_size)
         self.W_h = nn.Linear(input_size, hidden_size)
 
+    def g(x):
+        return torch.where(x >= 0, x+0.5, torch.sigmoid(x))
+    
+    def log_g(x):
+        return torch.where(x >= 0, (F.relu(x)+0.5).log(), 5 -F.softplus(-x))
+
+    def parallel_scan_log(log_coeffs, log_values):
+        # log_coeffs: (batch_size, seq_len, input_size)
+        # log_values: (batch_size, seq_len + 1, input_size)
+        a_star = F.pad(torch.cumsum(log_coeffs, dim=1), (0, 0, 1, 0))
+        log_h0_plus_b_star = torch.logcumsumexp(log_values - a_star, dim=1)
+        log_h = a_star + log_h0_plus_b_star
+        return torch.exp(log_h)[:, 1:]
+
     def step(self, x_t, h_prev=None):
         if h_prev is None:
             h_prev = x_t.new_zeros(x_t.shape[0], self.W_h.out_features)
@@ -38,6 +52,19 @@ class minGRUCell(nn.Module):
         h_tilde = torch.tanh(self.W_h(x_t))
         h = (1.0 - z) * h_prev + z * h_tilde
         return h
+    
+    def step_parallel_log(self, x, h_0):
+        """Parallelized step for batch processing."""
+        # x: (batch_size, seq_len, input_size)
+        # h_0: (batch_size, 1, hidden_size)
+        k = self.linear_z(x)
+        log_z = -F.softplus(-k)
+        log_coeffs = -F.softplus(k)
+        log_h_0 = self.log_g(h_0)
+        log_tilde_h = self.log_g(self.linear_h(x))
+        h = self.parallel_scan_log(log_coeffs,torch.cat([log_h_0, log_z + log_tilde_h], dim=1))
+        return h
+        
 
 class BiDirectionalMinGRU(nn.Module):
     """Bidirectional minGRU model."""
