@@ -3,9 +3,10 @@ python src/lcgen/train_simple_rnn.py \
   --random_seed 19 \
   --direction forward \
   --max_length 512 \
-  --num_samples 2048 \
-  --output_name baseline_v4_parallel.pt \
-  --epochs 10 \
+  --num_samples 512 \
+  --output_name baseline_v5_test_refactor_seq.pt \
+  --epochs 3 \
+  --mode sequential \
   --lr 1e-3 \
   --min_size 2 \
   --max_size 40 \

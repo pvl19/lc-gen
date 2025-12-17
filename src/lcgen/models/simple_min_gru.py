@@ -176,63 +176,79 @@ class BiDirectionalMinGRU(nn.Module):
         if self.direction in ['bi', 'backward']:
             h_bwd = x.new_zeros(B, self.hidden_size)
             x_bwd = x.flip(dims=[1])  # reverse sequence for backward pass
-            # Project raw inputs (flux, flux_err, time_enc) into the cell's
-            # input dimension before running the parallel scan.
             x_bwd_proj = self.backward_input_proj(x_bwd)
-
+            
             if self.mode == 'parallel':
                 h_bwd_all = self.backward_cell.step_parallel(x_bwd_proj, h_bwd.unsqueeze(1))
                 h_bwd_tensor = h_bwd_all.flip(dims=[1])
+                h0_b = h_bwd_tensor.new_zeros(B, 1, self.hidden_size)
+                h_bwd_tensor = torch.cat([h_bwd_tensor[:, 1:, :], h0_b], dim=1)
 
             elif self.mode == 'sequential':
-                h_bwd_list = []
-                h_bwd_t = h_bwd
+                h_bwd_tensor = x.new_zeros(B, L, self.hidden_size)
+                
                 for ti in range(L):
-                    x_bwd_t = x_bwd_proj[:, ti, :]
-                    h_bwd_t = self.backward_cell.step(x_bwd_t, h_bwd_t)
-                    h_bwd_list.append(h_bwd_t)
-                h_bwd_tensor = torch.stack(h_bwd_list, dim=1).flip(dims=[1])
+                    # Store hidden state (before processing this timestep)
+                    
+                    h_bwd_tensor[:, ti, :] = h_bwd
+
+                    # Backward RNN step for this timestep
+                    xi_bwd = x_bwd_proj[:, ti, :]
+                    h_bwd = self.backward_cell.step(xi_bwd, h_bwd)
+                    h_bwd_tensor = h_bwd_tensor.flip(dims=[1])
 
 
         if self.direction in ['bi', 'forward']:
             h_fwd = x.new_zeros(B, self.hidden_size)
             x_fwd = x
-            # Project raw inputs (flux, flux_err, time_enc) into the cell's
-            # input dimension before running the parallel scan.
             x_fwd_proj = self.forward_input_proj(x_fwd)
-            h_fwd_all = self.forward_cell.step_parallel(x_fwd_proj, h_fwd.unsqueeze(1))
-            h_fwd_tensor = h_fwd_all
 
-        for ti in range(L):
-            # Use closest hidden states available from unmasked data at this index
-            time_enc_t = t_enc[:, ti, :]
+            if self.mode == 'parallel':
+                h_fwd_all = self.forward_cell.step_parallel(x_fwd_proj, h_fwd.unsqueeze(1))
+                h_fwd_tensor = h_fwd_all
+                h0_f = h_fwd_tensor.new_zeros(B, 1, self.hidden_size)
+                h_fwd_tensor = torch.cat([h0_f, h_fwd_tensor[:, :-1, :]], dim=1)
 
-            # Concatenate and predict
-            if self.direction == 'forward':
-                h_fwd_apply = h_fwd_tensor[:, ti, :]
-                h_bi = torch.cat([h_fwd_apply, time_enc_t], dim=1)
-            elif self.direction == 'backward':
-                h_bwd_apply = h_bwd_tensor[:, ti, :]
-                h_bi = torch.cat([h_bwd_apply, time_enc_t], dim=1)
-            else:
-                h_fwd_apply = h_fwd_tensor[:, ti, :]
-                h_bwd_apply = h_bwd_tensor[:, ti, :]
-                h_bi = torch.cat([h_fwd_apply, h_bwd_apply, time_enc_t], dim=1)
-            # normalize fused vector so time and hidden parts have comparable scale
-            h_bi = self.head_norm(h_bi)
-            # Apply a learnable scalar to the time-encoding portion AFTER LayerNorm
-            # so the scalar is not normalized away by head_norm.
-            nt = self.num_time_enc_dims
-            if nt > 0:
-                # multiply only the final nt dimensions (the time encoding slice)
-                h_hidden = h_bi[:, :-nt]
-                h_time = h_bi[:, -nt:] * self.time_scale
-                h_bi = torch.cat([h_hidden, h_time], dim=1)
-            point_prediction = self.gauss_head(h_bi)
-            seq_prediction.append(point_prediction)
+            elif self.mode == 'sequential':
+                h_fwd_tensor = x.new_zeros(B, L, self.hidden_size)
+                for ti in range(L):
+                    # Store hidden state (before processing this timestep)
+                    h_fwd_tensor[:, ti, :] = h_fwd
 
-        seq_prediction = torch.stack(seq_prediction, dim=1)     # (B, L, 1)
-        out = {'reconstructed': seq_prediction}
+                    # Forward RNN step for this timestep
+                    xi_fwd = x_fwd_proj[:, ti, :]
+                    h_fwd = self.forward_cell.step(xi_fwd, h_fwd)
+
+        # for ti in range(L):
+        #     # Use closest hidden states available from unmasked data at this index
+        #     time_enc_t = t_enc[:, ti, :]
+
+        #     # Concatenate and predict
+        #     if self.direction == 'forward':
+        #         h_fwd_apply = h_fwd_tensor[:, ti, :]
+        #         h_bi = torch.cat([h_fwd_apply, time_enc_t], dim=1)
+        #     elif self.direction == 'backward':
+        #         h_bwd_apply = h_bwd_tensor[:, ti, :]
+        #         h_bi = torch.cat([h_bwd_apply, time_enc_t], dim=1)
+        #     else:
+        #         h_fwd_apply = h_fwd_tensor[:, ti, :]
+        #         h_bwd_apply = h_bwd_tensor[:, ti, :]
+        #         h_bi = torch.cat([h_fwd_apply, h_bwd_apply, time_enc_t], dim=1)
+        #     # normalize fused vector so time and hidden parts have comparable scale
+        #     h_bi = self.head_norm(h_bi)
+        #     # Apply a learnable scalar to the time-encoding portion AFTER LayerNorm
+        #     # so the scalar is not normalized away by head_norm.
+        #     nt = self.num_time_enc_dims
+        #     if nt > 0:
+        #         # multiply only the final nt dimensions (the time encoding slice)
+        #         h_hidden = h_bi[:, :-nt]
+        #         h_time = h_bi[:, -nt:] * self.time_scale
+        #         h_bi = torch.cat([h_hidden, h_time], dim=1)
+        #     point_prediction = self.gauss_head(h_bi)
+        #     seq_prediction.append(point_prediction)
+
+        # seq_prediction = torch.stack(seq_prediction, dim=1)     # (B, L, 1)
+        out = {'time_encoding': t_enc}
         if return_states:
             # Provide forward/backward hidden states and time encodings.
             # Note: `h_*_tensor` are the hidden states *after* processing the
@@ -243,21 +259,8 @@ class BiDirectionalMinGRU(nn.Module):
             # initial zero-state prepended.
             if self.direction in ['bi', 'forward']:
                 out['h_fwd_tensor'] = h_fwd_tensor
-                # h_fwd_before[ :, t, :] = hidden state available before x_t
-                h0_f = h_fwd_tensor.new_zeros(B, 1, self.hidden_size)
-                h_fwd_before = torch.cat([h0_f, h_fwd_tensor[:, :-1, :]], dim=1)
-                out['h_fwd_before'] = h_fwd_before
             if self.direction in ['bi', 'backward']:
                 out['h_bwd_tensor'] = h_bwd_tensor
-                # For the backward direction the "before" state should reflect
-                # the hidden state available prior to processing x_t in the
-                # backward pass — i.e. after seeing timesteps t+1..L. Thus
-                # h_bwd_before[:, t, :] = h_bwd_tensor[:, t+1, :], and the
-                # final timestep (no future) has the zero initial state.
-                h0_b = h_bwd_tensor.new_zeros(B, 1, self.hidden_size)
-                h_bwd_before = torch.cat([h_bwd_tensor[:, 1:, :], h0_b], dim=1)
-                out['h_bwd_before'] = h_bwd_before
-            out['t_enc'] = t_enc
         return out
 
 if __name__ == '__main__':

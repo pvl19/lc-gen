@@ -1,6 +1,6 @@
 python scripts/plot_recon.py \
-  --model_path output/simple_rnn/models/baseline_v4_parallel.pt \
-  --output_name reconstructions_v4_parallel.png \
+  --model_path output/simple_rnn/models/baseline_v5_test_refactor_seq.pt \
+  --output_name reconstructions_v5_test_refactor_seq.png \
   --direction forward \
   --num_examples 3 \
   --seq_length 512 \
