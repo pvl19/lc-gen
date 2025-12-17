@@ -55,7 +55,7 @@ class TimeSeriesDataset(Dataset):
                 flux_reg_space = amp * np.sin(t_reg_space * (2 * np.pi / period) + phase)
                 flux_at_t = np.interp(self.time[i], t_reg_space, flux_reg_space)
                 self.flux[i] = flux_at_t
-                self.flux_err[i] = np.random.normal(1, 0.1, size=flux_at_t.shape)  # Minimal flux error
+                self.flux_err[i] = np.full_like(flux_at_t, 0.1)  # Minimal flux error
         # self.apply_block_mask(min_size, max_size, mask_portion)
 
     def __len__(self):
