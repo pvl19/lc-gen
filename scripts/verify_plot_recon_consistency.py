@@ -11,7 +11,8 @@ from torch.utils.data import DataLoader
 
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model_path = 'output/simple_rnn/simple_min_gru_v11_multipred.pt'
+    # Use an available checkpoint from output/simple_rnn/models
+    model_path = 'output/simple_rnn/models/baseline_v5_test_refactor_seq.pt'
     model = BiDirectionalMinGRU(hidden_size=64, direction='bi').to(device)
     ckpt = torch.load(model_path)
     sd = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt

@@ -118,7 +118,7 @@ def plot_recon(args):
         t_seq = t_in.squeeze(-1)
         t0 = t_seq[:, 0].unsqueeze(1)  # (B, 1)
         t_shifted = (t_seq - t0).unsqueeze(-1)  # (B, L, 1)
-        t_enc_in = model.time_enc(t_shifted)
+    t_enc_in = model.time_enc(t_shifted)
     # loss = recon_loss(flux, flux_err, mean)
     flux_np = flux.cpu().numpy()
     flux_err_np = flux_err.cpu().numpy()
@@ -143,6 +143,7 @@ def plot_recon(args):
         Te = t_enc_in.size(-1)
         head = model.gauss_head
         h_bwd = h_bwd_out
+
         with torch.no_grad():
             for k in ks:
                 preds_k = torch.full((B, L), float('nan'), device=device)
@@ -210,6 +211,7 @@ def plot_recon(args):
                     flat_preds_rel = head(normed_rel).view(B, L - k)
                     preds_k_rel[:, k:] = flat_preds_rel
                 preds_ks_rel[k] = preds_k_rel.cpu().numpy()
+                
     else:
         # fallback: repeat the single-step mean for all ks
         print('Warning: no hidden states or time encodings available; using single-step mean for all ks.')
@@ -308,6 +310,8 @@ def plot_recon(args):
         save_dict[f'loss_k_{k}'] = arr
     for k, arr in preds_ks_rel.items():
         save_dict[f'pred_k_rel_{k}'] = arr
+    # (No model-returned time encodings are saved or used. Reconstructions
+    # must be computed only from the real input times t_enc_in.)
 
     try:
         np.savez_compressed(save_path, **save_dict)

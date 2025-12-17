@@ -171,53 +171,78 @@ class BiDirectionalMinGRU(nn.Module):
 
         seq_prediction = []
 
+
         # ---- Store backward hidden states (mask-gated updates) ----
 
         if self.direction in ['bi', 'backward']:
+            h_bwd_tensor = x.new_zeros(B, L, self.hidden_size)
             h_bwd = x.new_zeros(B, self.hidden_size)
-            x_bwd = x.flip(dims=[1])  # reverse sequence for backward pass
-            x_bwd_proj = self.backward_input_proj(x_bwd)
-            
+            for ti in reversed(range(L)):
+                # Store hidden state (before processing this timestep)
+                h_bwd_tensor[:, ti, :] = h_bwd
+
+                # Backward RNN step for this timestep
+                xi_bwd = x[:, ti, :]
+                inp_bwd = self.backward_input_proj(xi_bwd)
+                h_bwd = self.backward_cell.step(inp_bwd, h_bwd)
+
+        if self.direction in ['bi', 'forward']:
+            h_fwd_tensor = x.new_zeros(B, L, self.hidden_size)
+            h_fwd = x.new_zeros(B, self.hidden_size)
+
+            for ti in range(L):
+                h_fwd_tensor[:, ti, :] = h_fwd
+
+                # Forward RNN step
+                xi_fwd = x[:, ti, :]
+                inp_fwd = self.forward_input_proj(xi_fwd)
+                h_fwd = self.forward_cell.step(inp_fwd, h_fwd)
+
+        # ---- Store backward hidden states (mask-gated updates) ----
+
+        if self.direction in ['bi', 'backward']:
+            h_bwd_tensor = x.new_zeros(B, L, self.hidden_size)
+            h_bwd = x.new_zeros(B, self.hidden_size)
+
             if self.mode == 'parallel':
+                inp_bwd = x.flip(dims=[1])  # reverse sequence for backward pass
+                x_bwd_proj = self.backward_input_proj(inp_bwd)
                 h_bwd_all = self.backward_cell.step_parallel(x_bwd_proj, h_bwd.unsqueeze(1))
                 h_bwd_tensor = h_bwd_all.flip(dims=[1])
                 h0_b = h_bwd_tensor.new_zeros(B, 1, self.hidden_size)
                 h_bwd_tensor = torch.cat([h_bwd_tensor[:, 1:, :], h0_b], dim=1)
 
             elif self.mode == 'sequential':
-                h_bwd_tensor = x.new_zeros(B, L, self.hidden_size)
-                
-                for ti in range(L):
+                for ti in reversed(range(L)):
                     # Store hidden state (before processing this timestep)
-                    
                     h_bwd_tensor[:, ti, :] = h_bwd
 
                     # Backward RNN step for this timestep
-                    xi_bwd = x_bwd_proj[:, ti, :]
-                    h_bwd = self.backward_cell.step(xi_bwd, h_bwd)
-                    h_bwd_tensor = h_bwd_tensor.flip(dims=[1])
-
+                    xi_bwd = x[:, ti, :]
+                    inp_bwd = self.backward_input_proj(xi_bwd)
+                    h_bwd = self.backward_cell.step(inp_bwd, h_bwd)
 
         if self.direction in ['bi', 'forward']:
+            h_fwd_tensor = x.new_zeros(B, L, self.hidden_size)
             h_fwd = x.new_zeros(B, self.hidden_size)
-            x_fwd = x
-            x_fwd_proj = self.forward_input_proj(x_fwd)
 
             if self.mode == 'parallel':
+                inp_fwd = x
+                x_fwd_proj = self.forward_input_proj(inp_fwd)
                 h_fwd_all = self.forward_cell.step_parallel(x_fwd_proj, h_fwd.unsqueeze(1))
                 h_fwd_tensor = h_fwd_all
                 h0_f = h_fwd_tensor.new_zeros(B, 1, self.hidden_size)
                 h_fwd_tensor = torch.cat([h0_f, h_fwd_tensor[:, :-1, :]], dim=1)
 
             elif self.mode == 'sequential':
-                h_fwd_tensor = x.new_zeros(B, L, self.hidden_size)
                 for ti in range(L):
                     # Store hidden state (before processing this timestep)
                     h_fwd_tensor[:, ti, :] = h_fwd
 
                     # Forward RNN step for this timestep
-                    xi_fwd = x_fwd_proj[:, ti, :]
-                    h_fwd = self.forward_cell.step(xi_fwd, h_fwd)
+                    xi_fwd = x[:, ti, :]
+                    input_fwd = self.forward_input_proj(xi_fwd)
+                    h_fwd = self.forward_cell.step(input_fwd, h_fwd)
 
         # for ti in range(L):
         #     # Use closest hidden states available from unmasked data at this index
