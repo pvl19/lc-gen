@@ -4,8 +4,9 @@ python src/lcgen/train_simple_rnn.py \
   --direction forward \
   --max_length 512 \
   --num_samples 2048 \
-  --output_name baseline_v3.pt \
+  --output_name baseline_v4_merged.pt \
   --epochs 10 \
+  --mode sequential \
   --lr 1e-3 \
   --min_size 2 \
   --max_size 40 \

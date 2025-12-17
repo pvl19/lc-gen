@@ -8,12 +8,11 @@ import sys
 from pathlib import Path as _P
 # Ensure local 'src' is on sys.path so we can import lcgen
 sys.path.insert(0, str(_P(__file__).resolve().parents[1] / 'src'))
-from lcgen.models.simple_min_gru import SimpleMinGRU
 from pathlib import Path
 from lcgen.utils.trunc_data import extract_data
 from lcgen.utils.loss import recon_loss
 from torch.utils.data import DataLoader
-from lcgen.models.simple_min_gru import SimpleMinGRU, BiDirectionalMinGRU
+from lcgen.models.simple_min_gru import BiDirectionalMinGRU
 from lcgen.train_simple_rnn import TimeSeriesDataset, collate_fn
 
 def mask_intervals(mask_1d):
@@ -96,8 +95,8 @@ def plot_recon(args):
     t_in = torch.stack([times], dim=-1)
 
     out = model(x_in, t_in, return_states=True)
-    recon = out['reconstructed']  # (B, L, 1) -> [mean]
-    mean = recon[..., 0]
+    # recon = out['reconstructed']  # (B, L, 1) -> [mean]
+    # mean = recon[..., 0]
     # get forward/backward hidden states from the model output
     h_fwd = out.get('h_fwd_tensor')
     h_bwd_out = out.get('h_bwd_tensor')
@@ -111,12 +110,12 @@ def plot_recon(args):
         t0 = t_seq[:, 0].unsqueeze(1)  # (B, 1)
         t_shifted = (t_seq - t0).unsqueeze(-1)  # (B, L, 1)
         t_enc_in = model.time_enc(t_shifted)
-    loss = recon_loss(flux, flux_err, mean)
+    # loss = recon_loss(flux, flux_err, mean)
     flux_np = flux.cpu().numpy()
     flux_err_np = flux_err.cpu().numpy()
     times_np = times.cpu().numpy()
-    mean_np = mean.detach().cpu().numpy()
-    loss_np = loss.detach().cpu().numpy()
+    # mean_np = mean.detach().cpu().numpy()
+    # loss_np = loss.detach().cpu().numpy()
     # mask_np = mask.cpu().numpy()
 
     # Prepare multi-horizon reconstructions using hidden states at t-k
@@ -206,9 +205,10 @@ def plot_recon(args):
         # fallback: repeat the single-step mean for all ks
         print('Warning: no hidden states or time encodings available; using single-step mean for all ks.')
         for k in ks:
-            preds_ks[k] = mean_np
-            preds_ks_rel[k] = mean_np
-            preds_ks_loss[k] = np.zeros_like(mean_np)
+            print('plceholder')
+            # preds_ks[k] = mean_np
+            # preds_ks_rel[k] = mean_np
+            # preds_ks_loss[k] = np.zeros_like(mean_np)
 
     print(f'Using {args.num_examples} examples of length {args.seq_length} for plotting.')
 
@@ -274,8 +274,8 @@ def plot_recon(args):
         'flux': flux_np,
         'flux_err': flux_err_np,
         'times': times_np,
-        'mean': mean_np,
-        'loss': loss_np,
+        # 'mean': mean_np,
+        # 'loss': loss_np,
         # include the time-encodings computed from the input times so we can
         # inspect how time features vary and contribute to per-k differences
         't_enc_in': t_enc_in.detach().cpu().numpy(),

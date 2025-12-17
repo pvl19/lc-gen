@@ -21,7 +21,7 @@ import sys
 from pathlib import Path as _P
 # Ensure local 'src' is on sys.path so we can import lcgen
 sys.path.insert(0, str(_P(__file__).resolve().parents[1]))
-from lcgen.models.simple_min_gru import SimpleMinGRU, BiDirectionalMinGRU
+from lcgen.models.simple_min_gru import BiDirectionalMinGRU
 from lcgen.utils.trunc_data import extract_data
 from lcgen.utils.loss import recon_loss, bounded_horizon_future_nll
 from collections import defaultdict
@@ -38,7 +38,10 @@ def train(args):
     print('Shape of TimeSeriesDataset:', ds.flux.shape)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
 
-    model = BiDirectionalMinGRU(hidden_size=args.hidden_size, direction=args.direction, use_flow=args.use_flow).to(device)
+    model = BiDirectionalMinGRU(hidden_size=args.hidden_size,
+                                mode=args.mode,
+                                direction=args.direction,
+                                use_flow=args.use_flow).to(device)
     # Ensure the post-LN time scaling parameter is trainable (unfrozen) so it
     # can be fine-tuned during training. This prints its requires_grad status
     # for transparency when the user launches training.
@@ -79,12 +82,20 @@ def train(args):
 
             # Request hidden states for multi-step supervision
             out = model(x_in, t_in, return_states=True)
-            recon = out['reconstructed']  # (B, L, 1)
+            # recon = out['reconstructed']  # (B, L, 1)
 
-            # Extract forward/backward hidden states and time encodings
-            h_fwd = out.get('h_fwd_tensor')
-            h_bwd = out.get('h_bwd_tensor')
-            t_enc = out.get('t_enc')
+            # Extract forward/backward hidden states and time encodings.
+            # Require the "before" hidden states (no backward compatibility).
+            if args.direction in ['forward', 'bi']:
+                h_fwd = out['h_fwd_tensor']
+            else:
+                h_fwd = None
+            # For bi-directional models we also require h_bwd_before.
+            if args.direction in ['backward', 'bi']:
+                h_bwd = out['h_bwd_tensor']
+            else:
+                h_bwd = None
+            t_enc = out.get('time_encoding')
 
             # Compute bounded-horizon averaged NLL over future predictions
             # K chosen as 32 by default (can tune)
@@ -152,6 +163,7 @@ def parse_args():
     p.add_argument('--direction', type=str, default='forward', choices=['forward', 'backward', 'bi'])
     p.add_argument('--random_seed', type=int, default=19)
     p.add_argument('--num_samples', type=int, default=None)
+    p.add_argument('--mode', type=str, default='parallel', choices=['parallel', 'sequential'])
     p.add_argument('--epochs', type=int, default=3)
     p.add_argument('--batch_size', type=int, default=16)
     p.add_argument('--lr', type=float, default=1e-3)

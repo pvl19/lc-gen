@@ -14,7 +14,6 @@ import sys
 from pathlib import Path as _P
 # Ensure local 'src' is on sys.path so we can import lcgen
 sys.path.insert(0, str(_P(__file__).resolve().parents[1] / 'src'))
-from lcgen.models.simple_min_gru import SimpleMinGRU
 from lcgen.utils.trunc_data import extract_data
 from lcgen.utils.loss import recon_loss
 
