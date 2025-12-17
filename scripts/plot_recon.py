@@ -48,8 +48,8 @@ def plot_recon(args):
     np.random.seed(args.random_seed)
 
     # Create folder for plots
-    outp = Path(args.model_path).parent.parent / 'recon_plots'
-    outp_data = Path(args.model_path).parent.parent / 'recon_data'
+    outp = Path(args.model_path).parent / 'recon_plots'
+    outp_data = Path(args.model_path).parent / 'recon_data'
     outp.mkdir(parents=True, exist_ok=True)
     outp_data.mkdir(parents=True, exist_ok=True)
 
@@ -98,17 +98,8 @@ def plot_recon(args):
     # recon = out['reconstructed']  # (B, L, 1) -> [mean]
     # mean = recon[..., 0]
     # get forward/backward hidden states from the model output
-    # Require the "before" states (pre-step hidden) and raise a clear
-    # error if they are not present to avoid ambiguous alignment.
-    if 'h_fwd_tensor' not in out:
-        raise RuntimeError("Model.forward must return 'h_fwd_tensor' when called with return_states=True")
-    h_fwd = out['h_fwd_tensor']
-    if model.direction == 'bi':
-        if 'h_bwd_tensor' not in out:
-            raise RuntimeError("Model.forward must return 'h_bwd_tensor' when model.direction=='bi' and return_states=True")
-        h_bwd_out = out['h_bwd_tensor']
-    else:
-        h_bwd_out = out.get('h_bwd_tensor', None)
+    h_fwd = out.get('h_fwd_tensor')
+    h_bwd_out = out.get('h_bwd_tensor')
     # Compute time-encodings from the provided raw times but first shift each
     # sequence so it starts at zero: t_shifted = t_in - t0 (t0 = first time per seq).
     # This uses the user's provided time base while matching the model's forward
@@ -118,7 +109,7 @@ def plot_recon(args):
         t_seq = t_in.squeeze(-1)
         t0 = t_seq[:, 0].unsqueeze(1)  # (B, 1)
         t_shifted = (t_seq - t0).unsqueeze(-1)  # (B, L, 1)
-    t_enc_in = model.time_enc(t_shifted)
+        t_enc_in = model.time_enc(t_shifted)
     # loss = recon_loss(flux, flux_err, mean)
     flux_np = flux.cpu().numpy()
     flux_err_np = flux_err.cpu().numpy()
@@ -143,7 +134,6 @@ def plot_recon(args):
         Te = t_enc_in.size(-1)
         head = model.gauss_head
         h_bwd = h_bwd_out
-
         with torch.no_grad():
             for k in ks:
                 preds_k = torch.full((B, L), float('nan'), device=device)
@@ -211,12 +201,11 @@ def plot_recon(args):
                     flat_preds_rel = head(normed_rel).view(B, L - k)
                     preds_k_rel[:, k:] = flat_preds_rel
                 preds_ks_rel[k] = preds_k_rel.cpu().numpy()
-                
     else:
         # fallback: repeat the single-step mean for all ks
         print('Warning: no hidden states or time encodings available; using single-step mean for all ks.')
         for k in ks:
-            print(f'Preparing fallback predictions for k={k}')
+            print('plceholder')
             # preds_ks[k] = mean_np
             # preds_ks_rel[k] = mean_np
             # preds_ks_loss[k] = np.zeros_like(mean_np)
@@ -276,18 +265,7 @@ def plot_recon(args):
         plt.ylabel('Loss')
         plt.legend()
 
-    # Save figure (wrapped in try/except so failures are visible)
-    png_path = outp / args.output_name
-    try:
-        fig.savefig(png_path, bbox_inches='tight', dpi=150)
-        # verify file exists and print absolute path for user convenience
-        if png_path.exists():
-            print(f'Saved reconstruction plot to {png_path.resolve()}')
-        else:
-            print(f'Warning: fig.savefig did not raise an error but {png_path} was not found after save')
-    except Exception as e:
-        print(f'Error: failed to save reconstruction plot to {png_path}: {e}')
-
+    fig.savefig(outp / args.output_name)
     # Save plotting data (numpy) for later analysis / comparisons
     data_fname = args.output_name.replace('.png', '') + '_data.npz'
     save_path = outp_data / data_fname
@@ -310,8 +288,6 @@ def plot_recon(args):
         save_dict[f'loss_k_{k}'] = arr
     for k, arr in preds_ks_rel.items():
         save_dict[f'pred_k_rel_{k}'] = arr
-    # (No model-returned time encodings are saved or used. Reconstructions
-    # must be computed only from the real input times t_enc_in.)
 
     try:
         np.savez_compressed(save_path, **save_dict)
