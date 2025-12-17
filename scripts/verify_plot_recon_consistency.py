@@ -41,8 +41,16 @@ def main():
         out = model(x_in, t_in, return_states=True)
 
     recon_model = out['reconstructed'].squeeze(-1).cpu().numpy()
-    h_fwd = out.get('h_fwd_tensor')
-    h_bwd = out.get('h_bwd_tensor')
+    # prefer before-step hidden states (available prior to x_t)
+    if 'h_fwd_before' not in out:
+        raise RuntimeError("Model.forward must return 'h_fwd_before' when called with return_states=True")
+    h_fwd = out['h_fwd_before']
+    if model.direction == 'bi':
+        if 'h_bwd_before' not in out:
+            raise RuntimeError("Model.forward must return 'h_bwd_before' when model.direction=='bi' and return_states=True")
+        h_bwd = out['h_bwd_before']
+    else:
+        h_bwd = out.get('h_bwd_before', None)
     t_enc_forward = out.get('t_enc')  # this was computed inside model.forward (shifted)
 
     # Manual reconstruction using forward's t_enc and hidden states

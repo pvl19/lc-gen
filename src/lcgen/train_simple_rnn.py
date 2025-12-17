@@ -81,9 +81,18 @@ def train(args):
             out = model(x_in, t_in, return_states=True)
             recon = out['reconstructed']  # (B, L, 1)
 
-            # Extract forward/backward hidden states and time encodings
-            h_fwd = out.get('h_fwd_tensor')
-            h_bwd = out.get('h_bwd_tensor')
+            # Extract forward/backward hidden states and time encodings.
+            # Require the "before" hidden states (no backward compatibility).
+            if 'h_fwd_before' not in out:
+                raise RuntimeError("Model.forward must return 'h_fwd_before' when called with return_states=True")
+            h_fwd = out['h_fwd_before']
+            # For bi-directional models we also require h_bwd_before.
+            if getattr(model, 'direction', None) == 'bi':
+                if 'h_bwd_before' not in out:
+                    raise RuntimeError("Model.forward must return 'h_bwd_before' when model.direction=='bi' and return_states=True")
+                h_bwd = out['h_bwd_before']
+            else:
+                h_bwd = out.get('h_bwd_before', None)
             t_enc = out.get('t_enc')
 
             # Compute bounded-horizon averaged NLL over future predictions

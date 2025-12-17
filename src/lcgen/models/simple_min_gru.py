@@ -30,20 +30,31 @@ class minGRUCell(nn.Module):
         super().__init__()
         self.W_z = nn.Linear(input_size, hidden_size)
         self.W_h = nn.Linear(input_size, hidden_size)
+        self.linear_f = nn.Linear(input_size, hidden_size)
+        self.linear_i = nn.Linear(input_size, hidden_size)
+        self.linear_h = nn.Linear(input_size, hidden_size)
 
-    def g(x):
+    def g(self, x):
         return torch.where(x >= 0, x+0.5, torch.sigmoid(x))
     
-    def log_g(x):
+    def log_g(self, x):
         return torch.where(x >= 0, (F.relu(x)+0.5).log(), 5 -F.softplus(-x))
 
-    def parallel_scan_log(log_coeffs, log_values):
+    def parallel_scan_log(self, log_coeffs, log_values):
         # log_coeffs: (batch_size, seq_len, input_size)
         # log_values: (batch_size, seq_len + 1, input_size)
         a_star = F.pad(torch.cumsum(log_coeffs, dim=1), (0, 0, 1, 0))
         log_h0_plus_b_star = torch.logcumsumexp(log_values - a_star, dim=1)
         log_h = a_star + log_h0_plus_b_star
         return torch.exp(log_h)[:, 1:]
+    
+    def parallel_scan(self, coeffs, values):
+        # log_coeffs: (batch_size, seq_len, input_size)
+        # log_values: (batch_size, seq_len + 1, input_size)
+        a_star = F.pad(torch.cumsum(coeffs, dim=1), (0, 0, 1, 0))
+        h0_plus_b_star = torch.logcumsumexp(values - a_star, dim=1)
+        h = a_star + h0_plus_b_star
+        return h[:, 1:]
 
     def step(self, x_t, h_prev=None):
         if h_prev is None:
@@ -53,15 +64,27 @@ class minGRUCell(nn.Module):
         h = (1.0 - z) * h_prev + z * h_tilde
         return h
     
+    def step_parallel(self, x, h_0):
+        # x: (batch_size, seq_len, input_size)
+        # h_0: (batch_size, 1, hidden_size)
+        f = torch.sigmoid(self.linear_f(x))
+        i = torch.sigmoid(self.linear_i(x))
+        tilde_h = self.linear_h(x)
+        f_prime = f / (f + i)
+        i_prime = i / (f + i)
+        h = self.parallel_scan(f_prime, torch.cat([h_0, i_prime * tilde_h], dim=1))
+        return h
+    
+    
     def step_parallel_log(self, x, h_0):
         """Parallelized step for batch processing."""
         # x: (batch_size, seq_len, input_size)
         # h_0: (batch_size, 1, hidden_size)
-        k = self.linear_z(x)
+        k = self.W_z(x)
         log_z = -F.softplus(-k)
         log_coeffs = -F.softplus(k)
         log_h_0 = self.log_g(h_0)
-        log_tilde_h = self.log_g(self.linear_h(x))
+        log_tilde_h = self.log_g(self.W_h(x))
         h = self.parallel_scan_log(log_coeffs,torch.cat([log_h_0, log_z + log_tilde_h], dim=1))
         return h
         
@@ -141,28 +164,23 @@ class BiDirectionalMinGRU(nn.Module):
         # ---- Store backward hidden states (mask-gated updates) ----
 
         if self.direction in ['bi', 'backward']:
-            h_bwd_tensor = x.new_zeros(B, L, self.hidden_size)
             h_bwd = x.new_zeros(B, self.hidden_size)
-            for ti in reversed(range(L)):
-                # Store hidden state (before processing this timestep)
-                h_bwd_tensor[:, ti, :] = h_bwd
 
-                # Backward RNN step for this timestep
-                xi_bwd = x[:, ti, :]
-                inp_bwd = self.backward_input_proj(xi_bwd)
-                h_bwd = self.backward_cell.step(inp_bwd, h_bwd)
+            x_bwd = x.flip(dims=[1])  # reverse sequence for backward pass
+            # Project raw inputs (flux, flux_err, time_enc) into the cell's
+            # input dimension before running the parallel scan.
+            x_bwd_proj = self.backward_input_proj(x_bwd)
+            h_bwd_all = self.backward_cell.step_parallel(x_bwd_proj, h_bwd.unsqueeze(1))
+            h_bwd_tensor = h_bwd_all.flip(dims=[1])
 
         if self.direction in ['bi', 'forward']:
-            h_fwd_tensor = x.new_zeros(B, L, self.hidden_size)
             h_fwd = x.new_zeros(B, self.hidden_size)
-
-            for ti in range(L):
-                h_fwd_tensor[:, ti, :] = h_fwd
-
-                # Forward RNN step
-                xi_fwd = x[:, ti, :]
-                inp_fwd = self.forward_input_proj(xi_fwd)
-                h_fwd = self.forward_cell.step(inp_fwd, h_fwd)
+            x_fwd = x
+            # Project raw inputs (flux, flux_err, time_enc) into the cell's
+            # input dimension before running the parallel scan.
+            x_fwd_proj = self.forward_input_proj(x_fwd)
+            h_fwd_all = self.forward_cell.step_parallel(x_fwd_proj, h_fwd.unsqueeze(1))
+            h_fwd_tensor = h_fwd_all
 
         for ti in range(L):
             # Use closest hidden states available from unmasked data at this index
@@ -195,12 +213,29 @@ class BiDirectionalMinGRU(nn.Module):
         seq_prediction = torch.stack(seq_prediction, dim=1)     # (B, L, 1)
         out = {'reconstructed': seq_prediction}
         if return_states:
-            # Provide forward hidden states and time encodings so training code can
-            # compute multi-step losses based on the hidden states BEFORE each timestep.
+            # Provide forward/backward hidden states and time encodings.
+            # Note: `h_*_tensor` are the hidden states *after* processing the
+            # corresponding input at that timestep (i.e. h_t includes x_t).
+            # For code that needs the hidden state available *before* seeing x_t
+            # (i.e. depends only on observations up to t-1), we also return
+            # `h_*_before` which is simply a left-shifted version with an
+            # initial zero-state prepended.
             if self.direction in ['bi', 'forward']:
                 out['h_fwd_tensor'] = h_fwd_tensor
+                # h_fwd_before[ :, t, :] = hidden state available before x_t
+                h0_f = h_fwd_tensor.new_zeros(B, 1, self.hidden_size)
+                h_fwd_before = torch.cat([h0_f, h_fwd_tensor[:, :-1, :]], dim=1)
+                out['h_fwd_before'] = h_fwd_before
             if self.direction in ['bi', 'backward']:
                 out['h_bwd_tensor'] = h_bwd_tensor
+                # For the backward direction the "before" state should reflect
+                # the hidden state available prior to processing x_t in the
+                # backward pass — i.e. after seeing timesteps t+1..L. Thus
+                # h_bwd_before[:, t, :] = h_bwd_tensor[:, t+1, :], and the
+                # final timestep (no future) has the zero initial state.
+                h0_b = h_bwd_tensor.new_zeros(B, 1, self.hidden_size)
+                h_bwd_before = torch.cat([h_bwd_tensor[:, 1:, :], h0_b], dim=1)
+                out['h_bwd_before'] = h_bwd_before
             out['t_enc'] = t_enc
         return out
 

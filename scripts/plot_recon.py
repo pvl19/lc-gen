@@ -49,8 +49,8 @@ def plot_recon(args):
     np.random.seed(args.random_seed)
 
     # Create folder for plots
-    outp = Path(args.model_path).parent / 'recon_plots'
-    outp_data = Path(args.model_path).parent / 'recon_data'
+    outp = Path(args.model_path).parent.parent / 'recon_plots'
+    outp_data = Path(args.model_path).parent.parent / 'recon_data'
     outp.mkdir(parents=True, exist_ok=True)
     outp_data.mkdir(parents=True, exist_ok=True)
 
@@ -99,8 +99,17 @@ def plot_recon(args):
     recon = out['reconstructed']  # (B, L, 1) -> [mean]
     mean = recon[..., 0]
     # get forward/backward hidden states from the model output
-    h_fwd = out.get('h_fwd_tensor')
-    h_bwd_out = out.get('h_bwd_tensor')
+    # Require the "before" states (pre-step hidden) and raise a clear
+    # error if they are not present to avoid ambiguous alignment.
+    if 'h_fwd_before' not in out:
+        raise RuntimeError("Model.forward must return 'h_fwd_before' when called with return_states=True")
+    h_fwd = out['h_fwd_before']
+    if model.direction == 'bi':
+        if 'h_bwd_before' not in out:
+            raise RuntimeError("Model.forward must return 'h_bwd_before' when model.direction=='bi' and return_states=True")
+        h_bwd_out = out['h_bwd_before']
+    else:
+        h_bwd_out = out.get('h_bwd_before', None)
     # Compute time-encodings from the provided raw times but first shift each
     # sequence so it starts at zero: t_shifted = t_in - t0 (t0 = first time per seq).
     # This uses the user's provided time base while matching the model's forward
@@ -265,7 +274,18 @@ def plot_recon(args):
         plt.ylabel('Loss')
         plt.legend()
 
-    fig.savefig(outp / args.output_name)
+    # Save figure (wrapped in try/except so failures are visible)
+    png_path = outp / args.output_name
+    try:
+        fig.savefig(png_path, bbox_inches='tight', dpi=150)
+        # verify file exists and print absolute path for user convenience
+        if png_path.exists():
+            print(f'Saved reconstruction plot to {png_path.resolve()}')
+        else:
+            print(f'Warning: fig.savefig did not raise an error but {png_path} was not found after save')
+    except Exception as e:
+        print(f'Error: failed to save reconstruction plot to {png_path}: {e}')
+
     # Save plotting data (numpy) for later analysis / comparisons
     data_fname = args.output_name.replace('.png', '') + '_data.npz'
     save_path = outp_data / data_fname
