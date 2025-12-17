@@ -1,6 +1,6 @@
 python scripts/plot_recon.py \
-  --model_path output/simple_rnn/models/baseline_v2.pt \
-  --output_name reconstructions_v2_baseline.png \
+  --model_path output/simple_rnn/models/baseline_v3.pt \
+  --output_name reconstructions_v3_baseline.png \
   --direction forward \
   --num_examples 3 \
   --seq_length 512 \
@@ -10,4 +10,4 @@ python scripts/plot_recon.py \
   --mask_portion 0.0 \
   --random_seed 19 \
   --mock_sinusoid \
-  --lags 1 8 64 256
+  --lags 1 8 32 64

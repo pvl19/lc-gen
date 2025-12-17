@@ -4,11 +4,11 @@ python src/lcgen/train_simple_rnn.py \
   --direction forward \
   --max_length 512 \
   --num_samples 2048 \
-  --output_name baseline_v2.pt \
+  --output_name baseline_v3.pt \
   --epochs 10 \
   --lr 1e-3 \
   --min_size 2 \
   --max_size 40 \
   --mask_portion 0.0 \
   --mock_sinusoid \
-  --K 256
+  --K 64
