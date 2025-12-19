@@ -1,6 +1,6 @@
 python scripts/plot_recon.py \
-  --model_path output/simple_rnn/models/baseline_v3.pt \
-  --output_name reconstructions_v3_baseline.png \
+  --model_path output/simple_rnn/models/baseline_v7_100_epochs.pt \
+  --output_name reconstructions_v7_100_epochs.png \
   --direction forward \
   --num_examples 3 \
   --seq_length 512 \

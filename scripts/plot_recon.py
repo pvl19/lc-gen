@@ -49,8 +49,8 @@ def plot_recon(args):
     np.random.seed(args.random_seed)
 
     # Create folder for plots
-    outp = Path(args.model_path).parent / 'recon_plots'
-    outp_data = Path(args.model_path).parent / 'recon_data'
+    outp = Path(args.model_path).parent.parent / 'recon_plots'
+    outp_data = Path(args.model_path).parent.parent / 'recon_data'
     outp.mkdir(parents=True, exist_ok=True)
     outp_data.mkdir(parents=True, exist_ok=True)
 
@@ -225,7 +225,8 @@ def plot_recon(args):
 
         # Reconstruction: plot true flux and multiple reconstructions from different lagged states
         plt.subplot(args.num_examples*2, 1, (i*2) + 1)
-        plt.errorbar(times_np[i], flux_np[i], yerr=flux_err_np[i], fmt='.', label='Original', alpha=0.5, color='black')
+        plt.errorbar(times_np[i], flux_np[i], yerr=flux_err_np[i], fmt='.', label='Original', alpha=0.5, color='black',
+                     ecolor='lightgray')
         # plt.plot(times_np[i], mean_np[i], label='Reconstruction (t-1 default)', color='black', linewidth=1.5)
         # plot each k prediction if available; pick colors from a colormap
         cmap = plt.get_cmap('tab10')
@@ -236,7 +237,7 @@ def plot_recon(args):
             pred_k_i = pred_k[i]
             color = cmap(idx % 10)
             # pred_k may contain NaNs for early timesteps; matplotlib will skip them
-            plt.plot(times_np[i], pred_k_i, label=f'Pred from t-{k}', color=color, linestyle='--')
+            plt.plot(times_np[i], pred_k_i, label=f'Pred from t-{k}', color=color, linestyle='--',linewidth=2)
             # for start, end in intervals:
             #     x0 = times_np[i, start]
             #     x1 = times_np[i, end-1]

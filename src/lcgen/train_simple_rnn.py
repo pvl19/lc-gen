@@ -46,7 +46,7 @@ def train(args):
         print('time_scale present; requires_grad =', model.time_scale.requires_grad)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0)
-    # scheduler = OneCycleLR(optimizer, max_lr=args.lr, steps_per_epoch=len(loader), epochs=args.epochs, pct_start=0.3, div_factor=10.0, final_div_factor=1000.0)
+    scheduler = OneCycleLR(optimizer, max_lr=args.lr, steps_per_epoch=len(loader), epochs=args.epochs, pct_start=0.3, div_factor=10.0, final_div_factor=1000.0)
 
     if args.epochs <= 0:
         print('No epochs requested, exiting.')
@@ -98,7 +98,7 @@ def train(args):
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            # scheduler.step()
+            scheduler.step()
             optimizer.zero_grad()
             total_loss += loss.item()
             n += 1

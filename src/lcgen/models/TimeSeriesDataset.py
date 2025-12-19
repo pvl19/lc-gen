@@ -49,13 +49,13 @@ class TimeSeriesDataset(Dataset):
                 t_range_i = np.max(self.time[i]) - np.min(self.time[i])
                 phase = np.random.uniform(0, 2 * np.pi)
                 amp = np.random.normal(1, 0.5)  # Random amplitude
-                num_cycles = np.abs(np.random.normal(3, 2))  # Random number of cycles
+                num_cycles = np.abs(np.random.normal(5, 5))  # Random number of cycles
                 period = t_range_i / num_cycles
                 t_reg_space = np.linspace(np.min(self.time[i]), np.max(self.time[i]), self.flux.shape[1])
                 flux_reg_space = amp * np.sin(t_reg_space * (2 * np.pi / period) + phase)
                 flux_at_t = np.interp(self.time[i], t_reg_space, flux_reg_space)
                 self.flux[i] = flux_at_t
-                self.flux_err[i] = np.full_like(flux_at_t, 0.1)  # Minimal flux error
+                self.flux_err[i] = np.abs(np.random.normal(1,0.5, size=self.flux.shape[1]))+0.05
         # self.apply_block_mask(min_size, max_size, mask_portion)
 
     def __len__(self):

@@ -4,8 +4,8 @@ python src/lcgen/train_simple_rnn.py \
   --direction forward \
   --max_length 512 \
   --num_samples 2048 \
-  --output_name baseline_v3.pt \
-  --epochs 10 \
+  --output_name baseline_v7_100_epochs.pt \
+  --epochs 100 \
   --lr 1e-3 \
   --min_size 2 \
   --max_size 40 \
