@@ -3,6 +3,7 @@ import h5py
 import numpy as np
 import matplotlib.pyplot as plt
 import argparse
+import datetime
 
 import sys
 from pathlib import Path as _P
@@ -56,7 +57,7 @@ def plot_recon(args):
 
     # Load model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = BiDirectionalMinGRU(hidden_size=args.hidden_size, direction=args.direction, use_flow=args.use_flow).to(device)
+    model = BiDirectionalMinGRU(hidden_size=args.hidden_size, direction=args.direction, mode=args.mode, use_flow=args.use_flow).to(device)
     ckpt = torch.load(args.model_path)
     # ckpt may store a dict under 'model_state_dict'
     if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
@@ -321,10 +322,12 @@ def parse_args():
     p.add_argument('--mask_portion', type=float, default=0.6)
     p.add_argument('--random_seed', type=int, default=19)
     p.add_argument('--mock_sinusoid', action='store_true')
+    p.add_argument('--mode', type=str, default='sequential', choices=['sequential', 'parallel'])
     p.add_argument('--lags', type=int, nargs='*', default=None, help='List of lag values (t-k) for multi-horizon reconstructions')
     return p.parse_args()
 
 
 if __name__ == '__main__':
     args = parse_args()
+    print('Starting at time', datetime.datetime.now())
     plot_recon(args)

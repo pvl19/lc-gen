@@ -53,6 +53,53 @@ class minGRUCell(nn.Module):
         h = (1.0 - z) * h_prev + z * h_tilde
         return h
     
+    def parallel_scan(self,a, b):
+        """
+        a: (B, T, H)        multiplicative terms
+        b: (B, T+1, H)      additive terms, with b[:, 0] = h0
+        returns:
+        h: (B, T, H)
+        """
+        # Solve linear recurrence h_t = a_t * h_{t-1} + b_t for t=1..T in
+        # parallel. Let A_t = prod_{i=1}^t a_i. Then the closed-form solution
+        # is:
+        #   h_t = A_t * h0 + A_t * sum_{k=1}^t (b_k / A_k)
+        # where A_k = prod_{i=1}^k a_i. We compute this stably below.
+
+        # cumulative product A_t = prod_{i=1}^t a_i  (shape: B, T, H)
+        A = torch.cumprod(a, dim=1)
+
+        # b has shape (B, T+1, H) with b[:,0,:] == h0 and b[:,1:,:] == b_1..b_T
+        h0 = b[:, 0, :].unsqueeze(1)       # (B, 1, H)
+        b_k = b[:, 1:, :]                  # (B, T, H)
+
+        # Avoid division by zero by clamping A to a tiny positive value for the
+        # division (this is a numeric safeguard; a should be in (0,1] for GRU)
+        A_safe = A.clamp(min=1e-12)
+
+        # Compute B_k = b_k / A_k
+        B_div = b_k / A_safe
+
+        # cumulative sum S_t = sum_{k=1}^t B_k
+        S = torch.cumsum(B_div, dim=1)     # (B, T, H)
+
+        # h_t = A_t * (h0 + S_t)
+        H = A * (h0 + S)
+        return H
+    
+    def step_parallel(self, x, h_0):
+        # x: (batch_size, seq_len, input_size)
+        # h_0: (batch_size, 1, hidden_size)
+
+        z = torch.sigmoid(self.W_z(x))           # (B, T, H)
+        h_tilde = self.W_h(x)                    # (B, T, H)
+
+        a = 1.0 - z
+        b = torch.cat([h_0, z * h_tilde], dim=1)
+
+        h = self.parallel_scan(a, b)
+        return h
+    
     def step_parallel_log(self, x, h_0):
         """Parallelized step for batch processing."""
         # x: (batch_size, seq_len, input_size)
@@ -68,10 +115,11 @@ class minGRUCell(nn.Module):
 
 class BiDirectionalMinGRU(nn.Module):
     """Bidirectional minGRU model."""
-    def __init__(self, hidden_size: int = 64, direction: str = "bi", use_flow: bool = False):
+    def __init__(self, hidden_size: int = 64, direction: str = "bi", mode: str = "sequential", use_flow: bool = False):
         super().__init__()
         self.hidden_size = hidden_size
         self.direction = direction
+        self.mode = mode
 
         num_time_enc_dims = 8
         self.num_time_enc_dims = num_time_enc_dims
@@ -143,26 +191,45 @@ class BiDirectionalMinGRU(nn.Module):
         if self.direction in ['bi', 'backward']:
             h_bwd_tensor = x.new_zeros(B, L, self.hidden_size)
             h_bwd = x.new_zeros(B, self.hidden_size)
-            for ti in reversed(range(L)):
-                # Store hidden state (before processing this timestep)
-                h_bwd_tensor[:, ti, :] = h_bwd
 
-                # Backward RNN step for this timestep
-                xi_bwd = x[:, ti, :]
-                inp_bwd = self.backward_input_proj(xi_bwd)
-                h_bwd = self.backward_cell.step(inp_bwd, h_bwd)
+            if self.mode == 'parallel':
+                inp_bwd = x.flip(dims=[1])  # reverse sequence for backward pass
+                x_bwd_proj = self.backward_input_proj(inp_bwd)
+                h_bwd_all = self.backward_cell.step_parallel(x_bwd_proj, h_bwd.unsqueeze(1))
+                h_bwd_tensor = h_bwd_all.flip(dims=[1])
+                h0_b = h_bwd_tensor.new_zeros(B, 1, self.hidden_size)
+                h_bwd_tensor = torch.cat([h_bwd_tensor[:, 1:, :], h0_b], dim=1)
+
+            elif self.mode == 'sequential':
+                for ti in reversed(range(L)):
+                    # Store hidden state (before processing this timestep)
+                    h_bwd_tensor[:, ti, :] = h_bwd
+
+                    # Backward RNN step for this timestep
+                    xi_bwd = x[:, ti, :]
+                    inp_bwd = self.backward_input_proj(xi_bwd)
+                    h_bwd = self.backward_cell.step(inp_bwd, h_bwd)
 
         if self.direction in ['bi', 'forward']:
             h_fwd_tensor = x.new_zeros(B, L, self.hidden_size)
             h_fwd = x.new_zeros(B, self.hidden_size)
 
-            for ti in range(L):
-                h_fwd_tensor[:, ti, :] = h_fwd
+            if self.mode == 'parallel':
+                inp_fwd = x
+                x_fwd_proj = self.forward_input_proj(inp_fwd)
+                h_fwd_all = self.forward_cell.step_parallel(x_fwd_proj, h_fwd.unsqueeze(1))
+                h_fwd_tensor = h_fwd_all
+                h0_f = h_fwd_tensor.new_zeros(B, 1, self.hidden_size)
+                h_fwd_tensor = torch.cat([h0_f, h_fwd_tensor[:, :-1, :]], dim=1)
 
-                # Forward RNN step
-                xi_fwd = x[:, ti, :]
-                inp_fwd = self.forward_input_proj(xi_fwd)
-                h_fwd = self.forward_cell.step(inp_fwd, h_fwd)
+            elif self.mode == 'sequential':
+                for ti in range(L):
+                    h_fwd_tensor[:, ti, :] = h_fwd
+
+                    # Forward RNN step
+                    xi_fwd = x[:, ti, :]
+                    inp_fwd = self.forward_input_proj(xi_fwd)
+                    h_fwd = self.forward_cell.step(inp_fwd, h_fwd)
 
         for ti in range(L):
             # Use closest hidden states available from unmasked data at this index

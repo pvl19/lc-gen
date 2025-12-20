@@ -4,11 +4,12 @@ python src/lcgen/train_simple_rnn.py \
   --direction forward \
   --max_length 512 \
   --num_samples 2048 \
-  --output_name baseline_v7_100_epochs.pt \
-  --epochs 100 \
+  --output_name baseline_v8_par_30e.pt \
+  --epochs 30 \
   --lr 1e-3 \
   --min_size 2 \
   --max_size 40 \
   --mask_portion 0.0 \
   --mock_sinusoid \
+  --mode parallel \
   --K 64

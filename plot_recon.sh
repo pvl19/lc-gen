@@ -1,6 +1,6 @@
 python scripts/plot_recon.py \
-  --model_path output/simple_rnn/models/baseline_v7_100_epochs.pt \
-  --output_name reconstructions_v7_100_epochs.png \
+  --model_path output/simple_rnn/models/baseline_v8_par_30e.pt \
+  --output_name reconstructions_v8_par_30e.png \
   --direction forward \
   --num_examples 3 \
   --seq_length 512 \
@@ -10,4 +10,5 @@ python scripts/plot_recon.py \
   --mask_portion 0.0 \
   --random_seed 19 \
   --mock_sinusoid \
+  --mode parallel \
   --lags 1 8 32 64

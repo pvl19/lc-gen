@@ -16,6 +16,7 @@ import math
 import torch.optim as optim
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import Dataset, DataLoader
+import datetime
 
 import sys
 from pathlib import Path as _P
@@ -38,7 +39,7 @@ def train(args):
     print('Shape of TimeSeriesDataset:', ds.flux.shape)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
 
-    model = BiDirectionalMinGRU(hidden_size=args.hidden_size, direction=args.direction, use_flow=args.use_flow).to(device)
+    model = BiDirectionalMinGRU(hidden_size=args.hidden_size, direction=args.direction, mode=args.mode, use_flow=args.use_flow).to(device)
     # Ensure the post-LN time scaling parameter is trainable (unfrozen) so it
     # can be fine-tuned during training. This prints its requires_grad status
     # for transparency when the user launches training.
@@ -164,10 +165,14 @@ def parse_args():
     p.add_argument('--max_size', type=int, default=100)
     p.add_argument('--mask_portion', type=float, default=0.2)
     p.add_argument('--mock_sinusoid', action='store_true')
+    p.add_argument('--mode', type=str, default='sequential', choices=['sequential', 'parallel'])
     p.add_argument('--K', type=int, default=128)
     return p.parse_args()
 
 
 if __name__ == '__main__':
     args = parse_args()
+    start = datetime.datetime.now()
     train(args)
+    end = datetime.datetime.now()
+    print('Total training time:', end - start)
