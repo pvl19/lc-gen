@@ -11,7 +11,7 @@ def recon_loss(flux, flux_err, recon_flux):
     return nll
 
 
-def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, K: int = 128):
+def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=None, K: int = 128):
     """
     Compute the average NLL loss where each source hidden h_fwd[:, i] predicts up to K
     future targets j = i+1 .. i+K (bounded horizon). For each target j we average the
@@ -32,7 +32,9 @@ def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, K: in
            training and inference match.
         flux: (B, L) ground-truth flux values
         flux_err: (B, L) measurement errors (used by recon_loss)
-        mask: (B, L) boolean or {0,1} mask where 1=observed (valid source/target)
+        mask: (B, L) optional mask where 1=observed, 0=masked. If provided,
+              predictions are only computed for unmasked targets, and source
+              hidden states must come from unmasked positions.
         K: maximum horizon (int)
 
     Returns:
@@ -93,18 +95,50 @@ def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, K: in
         else:
             normed = flat_in
 
-        # predict means (allow gradients to flow)
-        preds_k = head(normed).view(B, L - k)        # (B, L-k)
-
         # target ground truth and errors
         flux_tgt = flux[:, tgt_slice]                 # (B, L-k)
         ferr_tgt = flux_err[:, tgt_slice]             # (B, L-k)
 
-        # All pairs are valid when no masking is used
-        valid = torch.ones_like(flux_tgt, device=device)
+        # Compute validity mask for predictions
+        # A prediction is valid if:
+        # 1. The target position is unmasked (we have ground truth to compare against)
+        # 2. The source position is unmasked (the hidden state was computed from real data)
+        # For bidirectional models, we also need the backward source (at target position) to be valid,
+        # but h_bwd[j] only depends on positions > j, so we don't need to check the target itself.
+        if mask is not None:
+            mask_src = mask[:, src_slice]  # (B, L-k) - mask at source positions
+            mask_tgt = mask[:, tgt_slice]  # (B, L-k) - mask at target positions
+            # Valid if both source and target are unmasked
+            valid = (mask_src * mask_tgt)  # (B, L-k)
+        else:
+            valid = torch.ones_like(flux_tgt, device=device)
 
-        # compute NLL per prediction using existing recon_loss
-        nll_k = recon_loss(flux_tgt, ferr_tgt, preds_k)   # (B, L-k)
+        # If the model exposes a conditional flow (zuko) named `flow`, use it
+        # to compute per-prediction negative log-likelihoods. The flow will
+        # be conditioned on the same normalized head input used in forward
+        # plus the measurement error at the target timestep.
+        flow_module = getattr(model, 'flow', None)
+        if flow_module is not None:
+            # Prepare context: normed is (B*(L-k), C); append ferr_tgt flattened
+            ferr_flat = ferr_tgt.contiguous().view(-1)          # (B*(L-k),)
+            ctx = torch.cat([normed, ferr_flat.unsqueeze(1)], dim=1)  # (N, C+1)
+
+            # zuko flow call returns a Distribution-like object; compute log_prob
+            dist = flow_module(ctx)
+            # flux targets: shape (B, L-k) -> flatten to (N, 1) for event dim 1
+            flux_flat = flux_tgt.contiguous().view(-1, 1)
+            logp = dist.log_prob(flux_flat)   # expected shape (N, 1) or (N,)
+            # normalize shape to (N,)
+            if logp.dim() > 1:
+                logp = logp.view(-1)
+            nll_flat = -logp
+            nll_k = nll_flat.view(B, L - k)
+        else:
+            # predict means (allow gradients to flow)
+            preds_k = head(normed).view(B, L - k)        # (B, L-k)
+
+            # compute NLL per prediction using existing recon_loss
+            nll_k = recon_loss(flux_tgt, ferr_tgt, preds_k)   # (B, L-k)
 
         # compute mean NLL for this k across valid predictions
         valid_count = int(valid.sum().item())

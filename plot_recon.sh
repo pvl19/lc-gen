@@ -1,14 +1,15 @@
 python scripts/plot_recon.py \
-  --model_path output/simple_rnn/models/baseline_v8_par_30e.pt \
-  --output_name reconstructions_v8_par_30e.png \
-  --direction forward \
+  --model_path output/simple_rnn/models/baseline_v15_masking_real_60e.pt \
+  --output_name reconstructions_v15_masking_real_60e.png \
+  --direction bi \
   --num_examples 3 \
   --seq_length 512 \
   --hidden_size 64 \
-  --min_size 2 \
-  --max_size 40 \
-  --mask_portion 0.0 \
-  --random_seed 19 \
-  --mock_sinusoid \
+  --min_size 5 \
+  --max_size 100 \
+  --mask_portion 0.3 \
+  --random_seed 25 \
   --mode parallel \
-  --lags 1 8 32 64
+  --lags 1 8 32 64 \
+  --use_flow \
+  --flow_mode mean  # Options: mode, mean, sample

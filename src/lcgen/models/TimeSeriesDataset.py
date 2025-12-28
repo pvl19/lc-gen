@@ -19,7 +19,13 @@ from lcgen.utils.trunc_data import extract_data
 from lcgen.utils.loss import recon_loss
 
 class TimeSeriesDataset(Dataset):
-    def __init__(self, h5path, random_seed, min_size, max_size, mask_portion, max_length=16384, num_samples=None, mock_sinusoid=False):
+    def __init__(self, h5path, random_seed, min_size, max_size, mask_portion, max_length=16384, num_samples=None, mock_sinusoid=False, mock_noise=0.1):
+        self.min_size = min_size
+        self.max_size = max_size
+        self.mask_portion = mask_portion
+        self.rng = np.random.default_rng(random_seed)
+        self.mock_noise = mock_noise
+        
         p = Path(h5path)
         if p.exists():
             if max_length < 16384:
@@ -54,15 +60,57 @@ class TimeSeriesDataset(Dataset):
                 t_reg_space = np.linspace(np.min(self.time[i]), np.max(self.time[i]), self.flux.shape[1])
                 flux_reg_space = amp * np.sin(t_reg_space * (2 * np.pi / period) + phase)
                 flux_at_t = np.interp(self.time[i], t_reg_space, flux_reg_space)
-                self.flux[i] = flux_at_t
+                flux_at_t_noisy = flux_at_t + np.random.normal(0, self.mock_noise, size=flux_at_t.shape)  # Add noise
+                self.flux[i] = flux_at_t_noisy
                 self.flux_err[i] = np.abs(np.random.normal(1,0.5, size=self.flux.shape[1]))+0.05
-        # self.apply_block_mask(min_size, max_size, mask_portion)
 
     def __len__(self):
         return len(self.flux)
 
+    def _generate_block_mask(self, L):
+        """Generate a random block mask for a single sample.
+        
+        Args:
+            L: sequence length
+            
+        Returns:
+            mask: np.ndarray of shape (L,) with 1=observed, 0=masked
+        """
+        if self.mask_portion <= 0:
+            return np.ones(L, dtype=np.float32)
+        
+        mask = np.ones(L, dtype=np.float32)
+        total_mask_size = int(L * self.mask_portion)
+        
+        if total_mask_size == 0:
+            return mask
+            
+        masked_so_far = 0
+        while masked_so_far < total_mask_size:
+            block_size = self.rng.integers(self.min_size, self.max_size + 1)
+            if masked_so_far + block_size > total_mask_size:
+                block_size = total_mask_size - masked_so_far
+            if block_size <= 0:
+                break
+            max_start = L - block_size
+            if max_start < 0:
+                break
+            start_idx = self.rng.integers(0, max_start + 1)
+            mask[start_idx:start_idx + block_size] = 0.0
+            masked_so_far += block_size
+        
+        return mask
+
     def __getitem__(self, idx):
-        return [self.flux[idx], self.flux_err[idx], self.time[idx]]
+        flux = self.flux[idx]
+        flux_err = self.flux_err[idx]
+        time = self.time[idx]
+        L = len(flux)
+        
+        # Generate a fresh random mask for this sample
+        mask = self._generate_block_mask(L)
+        
+        return [flux, flux_err, time, mask]
     
     def apply_block_mask(self, min_size, max_size, mask_portion):
         """
@@ -122,15 +170,13 @@ class TimeSeriesDataset(Dataset):
 def collate_fn(batch):
     """Collate list of samples into batched tensors.
 
-    Each item in batch is [flux, flux_err, time] where each is a 1D numpy
-    array of length L. Return a tuple of torch.FloatTensors: (flux, flux_err, time)
+    Each item in batch is [flux, flux_err, time, mask] where each is a 1D numpy
+    array of length L. Return a tuple of torch.FloatTensors: (flux, flux_err, time, mask)
     with shapes (B, L).
     """
     fluxes = np.stack([b[0] for b in batch], axis=0).astype(np.float32)
     flux_errs = np.stack([b[1] for b in batch], axis=0).astype(np.float32)
     times = np.stack([b[2] for b in batch], axis=0).astype(np.float32)
-    # masks = np.stack([b[3] for b in batch], axis=0).astype(np.float32)
-    # masked_fluxes = np.stack([b[4] for b in batch], axis=0).astype(np.float32)
-    # masked_flux_errs = np.stack([b[5] for b in batch], axis=0).astype(np.float32)
+    masks = np.stack([b[3] for b in batch], axis=0).astype(np.float32)
 
-    return (torch.from_numpy(fluxes), torch.from_numpy(flux_errs), torch.from_numpy(times))
+    return (torch.from_numpy(fluxes), torch.from_numpy(flux_errs), torch.from_numpy(times), torch.from_numpy(masks))

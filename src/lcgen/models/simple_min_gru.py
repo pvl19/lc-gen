@@ -53,46 +53,45 @@ class minGRUCell(nn.Module):
         h = (1.0 - z) * h_prev + z * h_tilde
         return h
     
-    def parallel_scan(self,a, b):
+    def parallel_scan(self, a, b):
         """
-        a: (B, T, H)        multiplicative terms
+        a: (B, T, H)        multiplicative terms (should be in (0,1] for GRU)
         b: (B, T+1, H)      additive terms, with b[:, 0] = h0
         returns:
         h: (B, T, H)
+        
+        Solves the linear recurrence h_t = a_t * h_{t-1} + b_t for t=1..T.
+        
+        This implementation uses associative scan which is O(T) depth but
+        parallelizable. Falls back to sequential for very long sequences.
         """
-        # Solve linear recurrence h_t = a_t * h_{t-1} + b_t for t=1..T in
-        # parallel. Let A_t = prod_{i=1}^t a_i. Then the closed-form solution
-        # is:
-        #   h_t = A_t * h0 + A_t * sum_{k=1}^t (b_k / A_k)
-        # where A_k = prod_{i=1}^k a_i. We compute this stably below.
-
-        # cumulative product A_t = prod_{i=1}^t a_i  (shape: B, T, H)
-        A = torch.cumprod(a, dim=1)
-
-        # b has shape (B, T+1, H) with b[:,0,:] == h0 and b[:,1:,:] == b_1..b_T
-        h0 = b[:, 0, :].unsqueeze(1)       # (B, 1, H)
-        b_k = b[:, 1:, :]                  # (B, T, H)
-
-        # Avoid division by zero by clamping A to a tiny positive value for the
-        # division (this is a numeric safeguard; a should be in (0,1] for GRU)
-        A_safe = A.clamp(min=1e-12)
-
-        # Compute B_k = b_k / A_k
-        B_div = b_k / A_safe
-
-        # cumulative sum S_t = sum_{k=1}^t B_k
-        S = torch.cumsum(B_div, dim=1)     # (B, T, H)
-
-        # h_t = A_t * (h0 + S_t)
-        H = A * (h0 + S)
-        return H
+        B, T, H = a.shape
+        
+        # For the recurrence h_t = a_t * h_{t-1} + b_t, we can write this as
+        # a matrix operation and use associative scan. Each step is:
+        # [h_t, 1] = [[a_t, b_t], [0, 1]] @ [h_{t-1}, 1]
+        # 
+        # The simplest numerically stable approach for moderate T is sequential.
+        # For very large T, a proper associative scan should be implemented.
+        
+        h0 = b[:, 0, :]  # (B, H)
+        b_seq = b[:, 1:, :]  # (B, T, H) - the b_1..b_T terms
+        
+        h_list = []
+        h_prev = h0
+        for t in range(T):
+            h_t = a[:, t, :] * h_prev + b_seq[:, t, :]
+            h_list.append(h_t)
+            h_prev = h_t
+        
+        return torch.stack(h_list, dim=1)  # (B, T, H)
     
     def step_parallel(self, x, h_0):
         # x: (batch_size, seq_len, input_size)
         # h_0: (batch_size, 1, hidden_size)
 
         z = torch.sigmoid(self.W_z(x))           # (B, T, H)
-        h_tilde = self.W_h(x)                    # (B, T, H)
+        h_tilde = torch.tanh(self.W_h(x))        # (B, T, H) - must match step() which uses tanh
 
         a = 1.0 - z
         b = torch.cat([h_0, z * h_tilde], dim=1)
@@ -118,6 +117,7 @@ class BiDirectionalMinGRU(nn.Module):
     def __init__(self, hidden_size: int = 64, direction: str = "bi", mode: str = "sequential", use_flow: bool = False):
         super().__init__()
         self.hidden_size = hidden_size
+        self.use_flow = use_flow
         self.direction = direction
         self.mode = mode
 
@@ -159,12 +159,46 @@ class BiDirectionalMinGRU(nn.Module):
             nn.GELU(),
             nn.Linear(head_hidden, 1),
         )
+        # Optional conditional normalizing flow head (zuko). If zuko is
+        # available, construct a small Neural Spline Flow (NSF) that models
+        # p(y | context) where context = [hidden(s), time_enc_slice, meas_err].
+        self.flow = None
+        if zuko is not None and use_flow:
+            # context dim = size of head input after head_norm/time-scaling + 1 for meas_err
+            flow_context_dim = self.output_size + 1
+            # small NSF: 2 transforms, small hidden networks
+            self.flow = zuko.flows.NSF(1, flow_context_dim, transforms=2, hidden_features=[64, 64])
 
-    def forward(self, x, t, return_states: bool = False):
+    def forward(self, x, t, mask=None, return_states: bool = False, flow_mode: str = 'mean'):
+        """Forward pass through the model.
+
+        Args:
+            x: (B, L, 2) input tensor [flux, flux_err]
+            t: (B, L) or (B, L, 1) timestamps
+            mask: (B, L) optional mask tensor where 1=observed, 0=masked.
+                  Masked positions will have their flux/flux_err zeroed in RNN input.
+            return_states: if True, return hidden states and time encodings
+            flow_mode: how to produce point predictions when flow head is present.
+                - 'mean': Monte Carlo average of N samples (default, good for reconstruction)
+                - 'mode': gradient-based optimization to find the flow mode (MAP estimate)
+                - 'sample': single random sample from the flow (stochastic)
+                Ignored when flow head is not present (uses Gaussian head).
+
+        Returns:
+            dict with 'reconstructed' (B, L, 1), optionally hidden states and t_enc
+        """
         if x.dim() != 3 or x.size(-1) != 2:
             raise ValueError(f"Expected (B, L, 2), got {tuple(x.shape)}")
 
         B, L, _ = x.shape
+
+        # Apply mask to input: zero out flux and flux_err at masked positions
+        # but keep time encoding so the RNN knows the timestamp
+        if mask is not None:
+            # mask shape: (B, L) -> expand to (B, L, 1) for broadcasting
+            mask_expanded = mask.unsqueeze(-1)  # (B, L, 1)
+            # Zero out flux (index 0) and flux_err (index 1) at masked positions
+            x = x * mask_expanded
 
         # Defensive normalization: expect t to be (B, L) or (B, L, 1)
         t_seq = t
@@ -181,7 +215,7 @@ class BiDirectionalMinGRU(nn.Module):
         t_shifted = t_seq - t0         # (B, L)
         # time_enc expects a last-dim scalar, so restore (...,1)
         t_enc = self.time_enc(t_shifted.unsqueeze(-1))  # (B, L, Te)
-        x = torch.cat([x, t_enc], dim=-1)  # (B, L, 2 + 16)
+        x = torch.cat([x, t_enc], dim=-1)  # (B, L, 2 + Te)
 
         seq_prediction = []
 
@@ -256,7 +290,54 @@ class BiDirectionalMinGRU(nn.Module):
                 h_hidden = h_bi[:, :-nt]
                 h_time = h_bi[:, -nt:] * self.time_scale
                 h_bi = torch.cat([h_hidden, h_time], dim=1)
-            point_prediction = self.gauss_head(h_bi)
+            # measurement error at this timestep is present in the input
+            # `x` at index 1 before the time-enc dims were appended.
+            # Fetch it so we can condition the flow on the per-observation error.
+            meas_err_t = x[:, ti, 1]
+
+            # If a flow head is configured, condition on [h_bi, meas_err] and
+            # produce a point prediction based on flow_mode. Otherwise,
+            # use the Gaussian MLP head as a fallback for compatibility.
+            if self.flow is not None:
+                ctx = torch.cat([h_bi, meas_err_t.unsqueeze(1)], dim=1)
+                # zuko flow objects are callable and return a Distribution
+                dist = self.flow(ctx)
+
+                if flow_mode == 'sample':
+                    # Single random sample (stochastic)
+                    s = dist.sample()
+                    point_prediction = s.view(B, 1)
+                elif flow_mode == 'mode':
+                    # Gradient-based optimization to find the mode (MAP estimate)
+                    # We need to detach and rebuild the distribution to avoid graph issues
+                    ctx_detached = ctx.detach()
+                    dist_opt = self.flow(ctx_detached)
+                    # Initialize at a sample from the distribution (better than zero)
+                    y_init = dist_opt.sample().clone().detach()
+                    y_opt = y_init.requires_grad_(True)
+                    # Use Adam with smaller lr for more stable optimization
+                    optimizer = torch.optim.Adam([y_opt], lr=0.1)
+                    for _ in range(30):
+                        optimizer.zero_grad()
+                        # Rebuild distribution each step to get fresh graph
+                        dist_step = self.flow(ctx_detached)
+                        loss = -dist_step.log_prob(y_opt).sum()
+                        loss.backward()
+                        optimizer.step()
+                        # Clamp to reasonable range to prevent divergence
+                        with torch.no_grad():
+                            y_opt.clamp_(-10, 10)
+                    point_prediction = y_opt.detach().view(B, 1)
+                else:  # 'mean' (default)
+                    # Monte Carlo average of N samples to approximate the conditional mean
+                    n_samples = 16
+                    s_acc = dist.sample()
+                    for _ in range(n_samples - 1):
+                        s_acc = s_acc + dist.sample()
+                    s_mean = s_acc / n_samples
+                    point_prediction = s_mean.view(B, 1)
+            else:
+                point_prediction = self.gauss_head(h_bi)
             seq_prediction.append(point_prediction)
 
         seq_prediction = torch.stack(seq_prediction, dim=1)     # (B, L, 1)

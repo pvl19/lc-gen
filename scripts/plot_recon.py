@@ -77,26 +77,31 @@ def plot_recon(args):
         model.load_state_dict(target)
     model.eval()
     print('Loaded model from ', args.model_path)
+    if getattr(model, 'flow', None) is not None:
+        print('Flow head is enabled in model (zuko flow present).')
+    else:
+        print('Flow head not present in model; using Gaussian head for reconstructions.')
 
     # Load data and generate reconstructions
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     raw_data_path = Path('data/timeseries.h5')
-    ds = TimeSeriesDataset(raw_data_path, random_seed=args.random_seed, min_size=args.min_size, max_size=args.max_size, mask_portion=args.mask_portion, max_length=args.seq_length, num_samples=args.num_examples, mock_sinusoid=args.mock_sinusoid)
+    ds = TimeSeriesDataset(raw_data_path, random_seed=args.random_seed, min_size=args.min_size, max_size=args.max_size, mask_portion=args.mask_portion, max_length=args.seq_length, num_samples=args.num_examples, mock_sinusoid=args.mock_sinusoid, mock_noise=args.mock_noise)
     loader = DataLoader(ds, batch_size=args.num_examples, shuffle=False, collate_fn=collate_fn)
     batch_X = next(iter(loader)) 
-    flux, flux_err, times = batch_X
+    flux, flux_err, times, mask = batch_X
     flux = flux.to(device)
     flux_err = flux_err.to(device)
-    # masked_flux = masked_flux.to(device)
-    # masked_flux_err = masked_flux_err.to(device)
     times = times.to(device)
-    # mask = mask.to(device)
+    mask = mask.to(device)
 
     # Build input channels [flux, flux_err] -> (B, L, 2)
     x_in = torch.stack([flux, flux_err], dim=-1)
     t_in = torch.stack([times], dim=-1)
 
-    out = model(x_in, t_in, return_states=True)
+    # Pass flow_mode to control how flow head produces point predictions
+    flow_mode = getattr(args, 'flow_mode', 'mean')
+    print(f'Flow mode for reconstruction: {flow_mode}')
+    out = model(x_in, t_in, mask=mask, return_states=True, flow_mode=flow_mode)
     recon = out['reconstructed']  # (B, L, 1) -> [mean]
     mean = recon[..., 0]
     # get forward/backward hidden states from the model output
@@ -118,7 +123,7 @@ def plot_recon(args):
     times_np = times.cpu().numpy()
     mean_np = mean.detach().cpu().numpy()
     loss_np = loss.detach().cpu().numpy()
-    # mask_np = mask.cpu().numpy()
+    mask_np = mask.cpu().numpy()
 
     # Prepare multi-horizon reconstructions using hidden states at t-k
     if args.lags is None:
@@ -135,6 +140,7 @@ def plot_recon(args):
         B, L, H = h_fwd.shape
         Te = t_enc_in.size(-1)
         head = model.gauss_head
+        flow_head = getattr(model, 'flow', None)
         h_bwd = h_bwd_out
         with torch.no_grad():
             for k in ks:
@@ -162,14 +168,59 @@ def plot_recon(args):
                         h_hidden = normed[:, :-nt]
                         h_time = normed[:, -nt:] * model.time_scale
                         normed = torch.cat([h_hidden, h_time], dim=1)
-                    flat_preds = head(normed).view(B, L - k)
+
+                    # measurement error at target positions
+                    ferr_tgt = flux_err[:, k:]
+                    ferr_flat = ferr_tgt.contiguous().view(-1, 1)
+
+                    # If flow head is present, use flow_mode to produce predictions
+                    if flow_head is not None:
+                        ctx = torch.cat([normed, ferr_flat], dim=1)
+                        dist = flow_head(ctx)
+                        
+                        if flow_mode == 'sample':
+                            # Single random sample
+                            flat_preds = dist.sample().view(B, L - k)
+                        elif flow_mode == 'mode':
+                            # Gradient-based optimization to find the mode (MAP estimate)
+                            N = ctx.size(0)
+                            with torch.no_grad():
+                                y_init = dist.sample().clone()
+                            y_opt = y_init.requires_grad_(True)
+                            optimizer = torch.optim.Adam([y_opt], lr=0.1)
+                            for _ in range(50):
+                                optimizer.zero_grad()
+                                loss = -dist.log_prob(y_opt).sum()
+                                loss.backward()
+                                optimizer.step()
+                                with torch.no_grad():
+                                    y_opt.clamp_(-10, 10)
+                            flat_preds = y_opt.detach().view(B, L - k)
+                        else:  # 'mean'
+                            # Average multiple samples to approximate the conditional mean
+                            n_samples = 16
+                            s_acc = dist.sample()
+                            for _ in range(n_samples - 1):
+                                s_acc = s_acc + dist.sample()
+                            flat_preds = (s_acc / n_samples).view(B, L - k)
+                    else:
+                        flat_preds = head(normed).view(B, L - k)
                     preds_k[:, k:] = flat_preds
                     # compute per-prediction NLL aligned with target indices
                     with torch.no_grad():
                         preds_k_t = preds_k[:, k:]
                         flux_tgt = flux[:, k:]
-                        ferr_tgt = flux_err[:, k:]
-                        nll_k = recon_loss(flux_tgt, ferr_tgt, preds_k_t)  # (B, L-k)
+                        # Use flow log_prob for NLL if flow is present
+                        if flow_head is not None:
+                            flux_flat = flux_tgt.contiguous().view(-1, 1)
+                            ctx = torch.cat([normed, ferr_flat], dim=1)
+                            dist = flow_head(ctx)
+                            logp = dist.log_prob(flux_flat)
+                            if logp.dim() > 1:
+                                logp = logp.view(-1)
+                            nll_k = -logp.view(B, L - k)
+                        else:
+                            nll_k = recon_loss(flux_tgt, ferr_tgt, preds_k_t)  # (B, L-k)
                         loss_k = torch.full((B, L), float('nan'), device=device)
                         loss_k[:, k:] = nll_k
                         preds_ks_loss[k] = loss_k.cpu().numpy()
@@ -200,7 +251,38 @@ def plot_recon(args):
                         h_hidden = normed_rel[:, :-nt]
                         h_time = normed_rel[:, -nt:] * model.time_scale
                         normed_rel = torch.cat([h_hidden, h_time], dim=1)
-                    flat_preds_rel = head(normed_rel).view(B, L - k)
+
+                    # Also use flow for relative-time predictions if present
+                    if flow_head is not None:
+                        ferr_tgt_rel = flux_err[:, k:]
+                        ferr_flat_rel = ferr_tgt_rel.contiguous().view(-1, 1)
+                        ctx_rel = torch.cat([normed_rel, ferr_flat_rel], dim=1)
+                        dist_rel = flow_head(ctx_rel)
+                        
+                        if flow_mode == 'sample':
+                            flat_preds_rel = dist_rel.sample().view(B, L - k)
+                        elif flow_mode == 'mode':
+                            N_rel = ctx_rel.size(0)
+                            with torch.no_grad():
+                                y_init_rel = dist_rel.sample().clone()
+                            y_opt_rel = y_init_rel.requires_grad_(True)
+                            optimizer_rel = torch.optim.Adam([y_opt_rel], lr=0.1)
+                            for _ in range(50):
+                                optimizer_rel.zero_grad()
+                                loss = -dist_rel.log_prob(y_opt_rel).sum()
+                                loss.backward()
+                                optimizer_rel.step()
+                                with torch.no_grad():
+                                    y_opt_rel.clamp_(-10, 10)
+                            flat_preds_rel = y_opt_rel.detach().view(B, L - k)
+                        else:  # 'mean'
+                            n_samples = 16
+                            s_acc = dist_rel.sample()
+                            for _ in range(n_samples - 1):
+                                s_acc = s_acc + dist_rel.sample()
+                            flat_preds_rel = (s_acc / n_samples).view(B, L - k)
+                    else:
+                        flat_preds_rel = head(normed_rel).view(B, L - k)
                     preds_k_rel[:, k:] = flat_preds_rel
                 preds_ks_rel[k] = preds_k_rel.cpu().numpy()
     else:
@@ -220,15 +302,14 @@ def plot_recon(args):
     for i in range(args.num_examples):
 
         # Highlight masked intervals
-        # Boolean mask for the i-th sample (True = masked)
-        # masked_positions = (mask_np[i] == 0)
-        # intervals = mask_intervals(masked_positions)
+        # Boolean mask for the i-th sample (True = masked, i.e., mask_np == 0)
+        masked_positions = (mask_np[i] == 0)
+        intervals = mask_intervals(masked_positions)
 
         # Reconstruction: plot true flux and multiple reconstructions from different lagged states
         plt.subplot(args.num_examples*2, 1, (i*2) + 1)
         plt.errorbar(times_np[i], flux_np[i], yerr=flux_err_np[i], fmt='.', label='Original', alpha=0.5, color='black',
                      ecolor='lightgray')
-        # plt.plot(times_np[i], mean_np[i], label='Reconstruction (t-1 default)', color='black', linewidth=1.5)
         # plot each k prediction if available; pick colors from a colormap
         cmap = plt.get_cmap('tab10')
         for idx, k in enumerate(ks):
@@ -239,10 +320,11 @@ def plot_recon(args):
             color = cmap(idx % 10)
             # pred_k may contain NaNs for early timesteps; matplotlib will skip them
             plt.plot(times_np[i], pred_k_i, label=f'Pred from t-{k}', color=color, linestyle='--',linewidth=2)
-            # for start, end in intervals:
-            #     x0 = times_np[i, start]
-            #     x1 = times_np[i, end-1]
-            #     plt.axvspan(x0, x1, color='gray', alpha=0.2)
+        # Highlight masked regions
+        for start, end in intervals:
+            x0 = times_np[i, start]
+            x1 = times_np[i, end-1] if end > start else x0
+            plt.axvspan(x0, x1, color='red', alpha=0.15, label='Masked' if start == intervals[0][0] else None)
         plt.title(f'Example {i+1} - Reconstruction (multi-horizon)')
         plt.xlabel('Time')
         plt.ylabel('Flux')
@@ -258,10 +340,11 @@ def plot_recon(args):
             loss_i = loss_arr[i]
             color = cmap(idx % 10)
             plt.plot(times_np[i], loss_i, label=f'Loss from pred t-{k}', color=color)
-        # for start, end in intervals:
-        #     x0 = times_np[i, start]
-        #     x1 = times_np[i, end-1]
-        #     plt.axvspan(x0, x1, color='gray', alpha=0.2)
+        # Highlight masked regions
+        for start, end in intervals:
+            x0 = times_np[i, start]
+            x1 = times_np[i, end-1] if end > start else x0
+            plt.axvspan(x0, x1, color='red', alpha=0.15)
         plt.title(f'Example {i+1} - Reconstruction Loss')
         plt.xlabel('Time')
         plt.ylabel('Loss')
@@ -276,6 +359,7 @@ def plot_recon(args):
         'flux': flux_np,
         'flux_err': flux_err_np,
         'times': times_np,
+        'mask': mask_np,
         'mean': mean_np,
         'loss': loss_np,
         # include the time-encodings computed from the input times so we can
@@ -322,10 +406,12 @@ def parse_args():
     p.add_argument('--mask_portion', type=float, default=0.6)
     p.add_argument('--random_seed', type=int, default=19)
     p.add_argument('--mock_sinusoid', action='store_true')
+    p.add_argument('--mock_noise', type=float, default=0.1)
     p.add_argument('--mode', type=str, default='sequential', choices=['sequential', 'parallel'])
     p.add_argument('--lags', type=int, nargs='*', default=None, help='List of lag values (t-k) for multi-horizon reconstructions')
+    p.add_argument('--flow_mode', type=str, default='mean', choices=['mode', 'mean', 'sample'],
+                   help='How to produce point predictions from flow head: mode (MAP), mean (MC average), sample (single random)')
     return p.parse_args()
-
 
 if __name__ == '__main__':
     args = parse_args()
