@@ -1,0 +1,52 @@
+[
+  {
+    "timestamp": "2025-12-28T10:30:52.813963",
+    "args": {
+      "input": "data/timeseries.h5",
+      "max_length": 512,
+      "direction": "bi",
+      "random_seed": 19,
+      "num_samples": 2048,
+      "epochs": 3,
+      "batch_size": 16,
+      "lr": 0.001,
+      "hidden_size": 64,
+      "output_dir": "output/simple_rnn",
+      "output_name": "baseline_v16_masking_sim.pt",
+      "device": "auto",
+      "use_flow": true,
+      "min_size": 5,
+      "max_size": 100,
+      "mask_portion": 0.4,
+      "mock_sinusoid": true,
+      "mock_noise": 0.2,
+      "mode": "parallel",
+      "K": 64
+    }
+  },
+  {
+    "timestamp": "2025-12-28T10:36:41.577792",
+    "args": {
+      "input": "data/timeseries.h5",
+      "max_length": 512,
+      "direction": "bi",
+      "random_seed": 19,
+      "num_samples": 2048,
+      "epochs": 3,
+      "batch_size": 16,
+      "lr": 0.001,
+      "hidden_size": 64,
+      "output_dir": "output/simple_rnn",
+      "output_name": "baseline_v16_masking_sim.pt",
+      "device": "auto",
+      "use_flow": true,
+      "min_size": 5,
+      "max_size": 100,
+      "mask_portion": 0.4,
+      "mock_sinusoid": true,
+      "mock_noise": 0.2,
+      "mode": "parallel",
+      "K": 64
+    }
+  }
+]

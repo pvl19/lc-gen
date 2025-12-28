@@ -4,12 +4,14 @@ python src/lcgen/train_simple_rnn.py \
   --direction bi \
   --max_length 512 \
   --num_samples 2048 \
-  --output_name baseline_v16_masking_sim_20e.pt \
-  --epochs 20 \
+  --output_name baseline_v16_masking_sim.pt \
+  --epochs 3 \
   --lr 1e-3 \
   --min_size 5 \
   --max_size 100 \
   --mask_portion 0.4 \
+  --mock_sinusoid \
+  --mock_noise 0.2\
   --use_flow \
   --mode parallel \
   --K 64

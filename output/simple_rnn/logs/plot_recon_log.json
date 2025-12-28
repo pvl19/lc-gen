@@ -1,0 +1,79 @@
+[
+  {
+    "timestamp": "2025-12-28T10:17:47.876447",
+    "args": {
+      "model_path": "output/simple_rnn/models/baseline_v15_masking_real_60e.pt",
+      "seq_length": 512,
+      "output_name": "reconstructions_v15_masking_real_60e.png",
+      "direction": "bi",
+      "num_examples": 3,
+      "hidden_size": 64,
+      "use_flow": true,
+      "min_size": 5,
+      "max_size": 100,
+      "mask_portion": 0.3,
+      "random_seed": 87,
+      "mock_sinusoid": false,
+      "mock_noise": 0.1,
+      "mode": "parallel",
+      "lags": [
+        1,
+        8,
+        32,
+        64
+      ],
+      "flow_mode": "mean"
+    }
+  },
+  {
+    "timestamp": "2025-12-28T10:18:33.896770",
+    "args": {
+      "model_path": "output/simple_rnn/models/baseline_v15_masking_real_60e.pt",
+      "seq_length": 512,
+      "output_name": "reconstructions_v15_masking_real_60e.png",
+      "direction": "bi",
+      "num_examples": 3,
+      "hidden_size": 64,
+      "use_flow": true,
+      "min_size": 5,
+      "max_size": 100,
+      "mask_portion": 0.3,
+      "random_seed": 69,
+      "mock_sinusoid": false,
+      "mock_noise": 0.1,
+      "mode": "parallel",
+      "lags": [
+        1,
+        8,
+        32,
+        64
+      ],
+      "flow_mode": "mean"
+    }
+  },
+  {
+    "timestamp": "2025-12-28T10:28:46.545906",
+    "args": {
+      "model_path": "output/simple_rnn/models/baseline_v15_masking_real_60e.pt",
+      "seq_length": 512,
+      "output_name": "reconstructions_v15_masking_real_60e.png",
+      "direction": "bi",
+      "num_examples": 3,
+      "hidden_size": 64,
+      "use_flow": true,
+      "min_size": 5,
+      "max_size": 100,
+      "mask_portion": 0.3,
+      "random_seed": 69,
+      "mock_sinusoid": false,
+      "mock_noise": 0.1,
+      "mode": "parallel",
+      "lags": [
+        1,
+        16,
+        64
+      ],
+      "flow_mode": "mean"
+    }
+  }
+]

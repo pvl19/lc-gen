@@ -13,6 +13,7 @@ from lcgen.models.simple_min_gru import SimpleMinGRU
 from pathlib import Path
 from lcgen.utils.trunc_data import extract_data
 from lcgen.utils.loss import recon_loss
+from lcgen.utils.run_log import log_run_args
 from torch.utils.data import DataLoader
 from lcgen.models.simple_min_gru import SimpleMinGRU, BiDirectionalMinGRU
 from lcgen.train_simple_rnn import TimeSeriesDataset, collate_fn
@@ -131,6 +132,8 @@ def plot_recon(args):
     else:
         ks = list(args.lags)
     preds_ks = {}
+    preds_ks_p16 = {}  # 16th percentile of MC samples
+    preds_ks_p84 = {}  # 84th percentile of MC samples
     if h_fwd is not None and t_enc_in is not None:
         # We'll also compute predictions using relative time encodings (t_target - t_source)
         preds_ks_rel = {}
@@ -181,6 +184,8 @@ def plot_recon(args):
                         if flow_mode == 'sample':
                             # Single random sample
                             flat_preds = dist.sample().view(B, L - k)
+                            preds_p16 = None
+                            preds_p84 = None
                         elif flow_mode == 'mode':
                             # Gradient-based optimization to find the mode (MAP estimate)
                             N = ctx.size(0)
@@ -196,16 +201,29 @@ def plot_recon(args):
                                 with torch.no_grad():
                                     y_opt.clamp_(-10, 10)
                             flat_preds = y_opt.detach().view(B, L - k)
+                            preds_p16 = None
+                            preds_p84 = None
                         else:  # 'mean'
-                            # Average multiple samples to approximate the conditional mean
-                            n_samples = 16
-                            s_acc = dist.sample()
-                            for _ in range(n_samples - 1):
-                                s_acc = s_acc + dist.sample()
-                            flat_preds = (s_acc / n_samples).view(B, L - k)
+                            # Collect multiple samples to approximate the conditional mean and percentiles
+                            n_samples = 32
+                            samples = torch.stack([dist.sample() for _ in range(n_samples)], dim=0)  # (n_samples, B*(L-k), 1)
+                            samples = samples.squeeze(-1).view(n_samples, B, L - k)  # (n_samples, B, L-k)
+                            flat_preds = samples.mean(dim=0)  # (B, L-k)
+                            preds_p16 = torch.quantile(samples, 0.16, dim=0)  # (B, L-k)
+                            preds_p84 = torch.quantile(samples, 0.84, dim=0)  # (B, L-k)
                     else:
                         flat_preds = head(normed).view(B, L - k)
+                        preds_p16 = None
+                        preds_p84 = None
                     preds_k[:, k:] = flat_preds
+                    # Store percentiles if computed
+                    if preds_p16 is not None:
+                        preds_k_p16 = torch.full((B, L), float('nan'), device=device)
+                        preds_k_p84 = torch.full((B, L), float('nan'), device=device)
+                        preds_k_p16[:, k:] = preds_p16
+                        preds_k_p84[:, k:] = preds_p84
+                        preds_ks_p16[k] = preds_k_p16.cpu().numpy()
+                        preds_ks_p84[k] = preds_k_p84.cpu().numpy()
                     # compute per-prediction NLL aligned with target indices
                     with torch.no_grad():
                         preds_k_t = preds_k[:, k:]
@@ -319,7 +337,14 @@ def plot_recon(args):
             pred_k_i = pred_k[i]
             color = cmap(idx % 10)
             # pred_k may contain NaNs for early timesteps; matplotlib will skip them
-            plt.plot(times_np[i], pred_k_i, label=f'Pred from t-{k}', color=color, linestyle='--',linewidth=2)
+            # Mean as solid line
+            plt.plot(times_np[i], pred_k_i, label=f'Pred from t-{k}', color=color, linestyle='-', linewidth=2)
+            # Plot 16th and 84th percentiles as dashed lines if available
+            pred_p16 = preds_ks_p16.get(k)
+            pred_p84 = preds_ks_p84.get(k)
+            if pred_p16 is not None and pred_p84 is not None:
+                plt.plot(times_np[i], pred_p16[i], color=color, linestyle='--', linewidth=1, alpha=0.7)
+                plt.plot(times_np[i], pred_p84[i], color=color, linestyle='--', linewidth=1, alpha=0.7)
         # Highlight masked regions
         for start, end in intervals:
             x0 = times_np[i, start]
@@ -374,6 +399,10 @@ def plot_recon(args):
         save_dict[f'loss_k_{k}'] = arr
     for k, arr in preds_ks_rel.items():
         save_dict[f'pred_k_rel_{k}'] = arr
+    for k, arr in preds_ks_p16.items():
+        save_dict[f'pred_k_p16_{k}'] = arr
+    for k, arr in preds_ks_p84.items():
+        save_dict[f'pred_k_p84_{k}'] = arr
 
     try:
         np.savez_compressed(save_path, **save_dict)
@@ -415,5 +444,6 @@ def parse_args():
 
 if __name__ == '__main__':
     args = parse_args()
+    log_run_args(args, log_file='output/simple_rnn/logs/plot_recon_log.json')
     print('Starting at time', datetime.datetime.now())
     plot_recon(args)

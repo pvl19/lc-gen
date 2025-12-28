@@ -8,8 +8,8 @@ python scripts/plot_recon.py \
   --min_size 5 \
   --max_size 100 \
   --mask_portion 0.3 \
-  --random_seed 25 \
+  --random_seed 69 \
   --mode parallel \
-  --lags 1 8 32 64 \
+  --lags 1 16 64 \
   --use_flow \
   --flow_mode mean  # Options: mode, mean, sample

@@ -25,6 +25,7 @@ sys.path.insert(0, str(_P(__file__).resolve().parents[1]))
 from lcgen.models.simple_min_gru import SimpleMinGRU, BiDirectionalMinGRU
 from lcgen.utils.trunc_data import extract_data
 from lcgen.utils.loss import recon_loss, bounded_horizon_future_nll
+from lcgen.utils.run_log import log_run_args
 from collections import defaultdict
 import matplotlib.pyplot as plt
 from lcgen.models.TimeSeriesDataset import TimeSeriesDataset, collate_fn
@@ -172,6 +173,7 @@ def parse_args():
 
 if __name__ == '__main__':
     args = parse_args()
+    log_run_args(args, log_file='output/simple_rnn/logs/train_model_log.json')
     start = datetime.datetime.now()
     train(args)
     end = datetime.datetime.now()

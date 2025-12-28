@@ -27,6 +27,9 @@ ipykernel>=6.25.0
 # Optional: Progress bars and logging
 tqdm>=4.66.0
 
+# Dimensionality reduction for visualization
+umap-learn>=0.5.0
+
 # Optional: Weights & Biases for experiment tracking
 # wandb>=0.15.0
 
