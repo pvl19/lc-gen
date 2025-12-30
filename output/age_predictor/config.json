@@ -1,0 +1,31 @@
+{
+  "model_path": "output/simple_rnn/models/baseline_v15_masking_real_60e.pt",
+  "h5_path": "data/timeseries.h5",
+  "pickle_path": "data/star_sector_lc_formatted.pickle",
+  "age_csv": "data/TIC_cf_data.csv",
+  "output_dir": "output/age_predictor",
+  "hidden_size": 64,
+  "direction": "bi",
+  "mode": "parallel",
+  "use_flow": true,
+  "max_length": 2048,
+  "pooling_mode": "mean",
+  "max_samples": 2000,
+  "stratify_by_age": true,
+  "n_age_bins": 20,
+  "bprp0_min": null,
+  "bprp0_max": null,
+  "hidden_dims": [
+    128,
+    64,
+    32
+  ],
+  "dropout": 0.2,
+  "lr": 0.001,
+  "weight_decay": 0.0001,
+  "n_epochs": 100,
+  "batch_size": 64,
+  "val_split": 0.2,
+  "latent_dim": 128,
+  "n_samples": 2000
+}
