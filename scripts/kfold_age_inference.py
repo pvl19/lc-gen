@@ -115,7 +115,13 @@ def load_data_fresh(model_path: str, h5_path: str, pickle_path: str, csv_path: s
 
 def train_single_fold(X_train, y_train, X_val, y_val, 
                       hidden_dims, dropout, lr, weight_decay, n_epochs, batch_size, device):
-    """Train a single model on training data, return predictions on validation data."""
+    """Train a single model on training data, return predictions on validation data.
+    
+    Returns:
+        val_pred: predictions on validation set
+        train_loss: best training loss
+        best_state: model state dict (CPU)
+    """
     
     train_dataset = TensorDataset(
         torch.tensor(X_train, dtype=torch.float32, device=device),
@@ -160,20 +166,25 @@ def train_single_fold(X_train, y_train, X_val, y_val,
         X_val_t = torch.tensor(X_val, dtype=torch.float32, device=device)
         val_pred = model(X_val_t).cpu().numpy().squeeze()
     
-    return val_pred, best_train_loss
+    return val_pred, best_train_loss, best_state
 
 
 def run_kfold_cv(latent_vectors, ages, bprp0, tic_ids,
                  n_folds=10, hidden_dims=[128, 64, 32], dropout=0.2,
                  lr=1e-3, weight_decay=1e-4, n_epochs=100, batch_size=64,
-                 device=None, seed=42):
+                 device=None, seed=42, save_models_dir=None):
     """Run k-fold cross-validation.
+    
+    Args:
+        save_models_dir: if provided, save fold models to this directory
     
     Returns:
         predictions: array of predicted ages for all samples
         true_ages: array of true ages
         tic_ids: array of TIC IDs
         fold_indices: which fold each sample was in
+        fold_losses: list of training losses per fold
+        normalization_params: dict with X_mean, X_std, bprp0_mean, bprp0_std
     """
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -191,6 +202,16 @@ def run_kfold_cv(latent_vectors, ages, bprp0, tic_ids,
     X_mean, X_std = X.mean(axis=0), X.std(axis=0) + 1e-8
     X_normalized = (X - X_mean) / X_std
     
+    # Store normalization params for inference
+    normalization_params = {
+        'X_mean': X_mean,
+        'X_std': X_std,
+        'bprp0_mean': bprp0_mean,
+        'bprp0_std': bprp0_std,
+        'latent_dim': latent_vectors.shape[1],
+        'input_dim': X.shape[1],
+    }
+    
     # Shuffle indices and create folds
     indices = np.random.permutation(n_samples)
     fold_size = n_samples // n_folds
@@ -199,6 +220,7 @@ def run_kfold_cv(latent_vectors, ages, bprp0, tic_ids,
     all_predictions = np.zeros(n_samples)
     fold_assignments = np.zeros(n_samples, dtype=int)
     fold_losses = []
+    fold_models = []
     
     print(f"\nRunning {n_folds}-fold cross-validation on {n_samples} samples...")
     print(f"Each fold: ~{fold_size} validation samples, ~{n_samples - fold_size} training samples")
@@ -216,10 +238,12 @@ def run_kfold_cv(latent_vectors, ages, bprp0, tic_ids,
         X_val, y_val = X_normalized[val_idx], y[val_idx]
         
         # Train and predict
-        val_pred_log, train_loss = train_single_fold(
+        val_pred_log, train_loss, model_state = train_single_fold(
             X_train, y_train, X_val, y_val,
             hidden_dims, dropout, lr, weight_decay, n_epochs, batch_size, device
         )
+        
+        fold_models.append(model_state)
         
         # Store predictions (convert back from log space)
         all_predictions[val_idx] = 10 ** val_pred_log
@@ -233,7 +257,26 @@ def run_kfold_cv(latent_vectors, ages, bprp0, tic_ids,
         print(f"  Fold {fold+1}/{n_folds}: train_loss={train_loss:.4f}, "
               f"val_MAE={val_mae:.1f} Myr, val_corr={val_corr:.3f}")
     
-    return all_predictions, ages, tic_ids, fold_assignments, fold_losses
+    # Save models if directory provided
+    if save_models_dir is not None:
+        save_dir = Path(save_models_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save all fold models and normalization params
+        save_dict = {
+            'fold_models': fold_models,
+            'normalization_params': normalization_params,
+            'hidden_dims': hidden_dims,
+            'dropout': dropout,
+            'n_folds': n_folds,
+            'seed': seed,
+            'fold_indices': indices,  # To reconstruct which samples were in which fold
+        }
+        model_path = save_dir / 'kfold_models.pt'
+        torch.save(save_dict, model_path)
+        print(f"\nSaved {n_folds} fold models to {model_path}")
+    
+    return all_predictions, ages, tic_ids, fold_assignments, fold_losses, normalization_params
 
 
 def plot_kfold_results(predictions, true_ages, bprp0, tic_ids, fold_assignments, output_dir):
@@ -434,7 +477,7 @@ def main():
     
     # Run k-fold cross-validation
     print("\n=== Running K-Fold Cross-Validation ===")
-    predictions, true_ages, tic_ids, fold_assignments, fold_losses = run_kfold_cv(
+    predictions, true_ages, tic_ids, fold_assignments, fold_losses, norm_params = run_kfold_cv(
         latent_vectors=latent_vectors,
         ages=ages,
         bprp0=bprp0,
@@ -448,6 +491,7 @@ def main():
         batch_size=args.batch_size,
         device=device,
         seed=args.seed,
+        save_models_dir=output_dir,  # Save models to output directory
     )
     
     # Plot and save results

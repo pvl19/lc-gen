@@ -1,0 +1,33 @@
+{
+  "load_from_csv": true,
+  "latent_csv": "output/age_predictor/kfold_v1_multiscale/kfold_predictions.csv",
+  "gyro_csv": "output/age_predictor/gyro_baseline_default/gyro_kfold_predictions.csv",
+  "model_path": null,
+  "h5_path": "data/timeseries.h5",
+  "pickle_path": "data/star_sector_lc_formatted.pickle",
+  "age_csv": "data/TIC_cf_data.csv",
+  "output_dir": "output/age_predictor/comparison_comparison_multiscale_vs_gyro",
+  "hidden_size": 64,
+  "direction": "bi",
+  "mode": "parallel",
+  "use_flow": false,
+  "max_length": 2048,
+  "pooling_mode": "mean",
+  "max_samples": null,
+  "stratify_by_age": false,
+  "n_age_bins": 20,
+  "bprp0_min": null,
+  "bprp0_max": null,
+  "hidden_dims": [
+    128,
+    64,
+    32
+  ],
+  "dropout": 0.2,
+  "lr": 0.001,
+  "weight_decay": 0.0001,
+  "n_epochs": 100,
+  "batch_size": 64,
+  "n_folds": 10,
+  "seed": 42
+}

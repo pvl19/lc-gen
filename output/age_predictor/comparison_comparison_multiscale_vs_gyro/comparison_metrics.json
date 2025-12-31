@@ -1,0 +1,26 @@
+{
+  "n_common_samples": 2494,
+  "latent_model": {
+    "mae_myr": 89.31206886698747,
+    "rmse_myr": 211.0949112080082,
+    "median_ae_myr": 14.785511016845703,
+    "correlation": 0.8039135773068147,
+    "log_mae_dex": 0.24275592003249125,
+    "log_bias_dex": 0.073292792924775,
+    "log_scatter_dex": 0.4127030523205034
+  },
+  "gyro_baseline": {
+    "mae_myr": 169.5170102534145,
+    "rmse_myr": 302.545693899109,
+    "median_ae_myr": 50.89413093566894,
+    "correlation": 0.6109464555754236,
+    "log_mae_dex": 0.4533999842339297,
+    "log_bias_dex": 0.008688905891615077,
+    "log_scatter_dex": 0.6157102704928532
+  },
+  "improvement": {
+    "log_scatter_reduction_pct": 32.97122492529645,
+    "mae_reduction_pct": 47.313801291402555,
+    "correlation_improvement_pct": 31.58494823407132
+  }
+}

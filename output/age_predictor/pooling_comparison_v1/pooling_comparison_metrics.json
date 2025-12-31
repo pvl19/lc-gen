@@ -1,0 +1,35 @@
+{
+  "mean": {
+    "mae_myr": 143.39303740808856,
+    "median_ae_myr": 35.326066970825195,
+    "rmse_myr": 268.6791347123784,
+    "log_mae_dex": 0.288954754912251,
+    "log_bias_dex": 0.0034945696136938144,
+    "log_scatter_dex": 0.4474581068728123,
+    "correlation": 0.6496492160563352,
+    "within_2x_fraction": 0.6436556735606485,
+    "n_samples": 7156
+  },
+  "multiscale": {
+    "mae_myr": 104.6509982426397,
+    "median_ae_myr": 20.800708770751953,
+    "rmse_myr": 225.62890006836582,
+    "log_mae_dex": 0.2251260102624888,
+    "log_bias_dex": 0.0021343213243284996,
+    "log_scatter_dex": 0.40158695829623176,
+    "correlation": 0.7576897812322207,
+    "within_2x_fraction": 0.7530743432084964,
+    "n_samples": 7156
+  },
+  "final": {
+    "mae_myr": 176.96513282874832,
+    "median_ae_myr": 63.81269836425781,
+    "rmse_myr": 293.5582800595104,
+    "log_mae_dex": 0.34875802204320994,
+    "log_bias_dex": 0.007486002507285678,
+    "log_scatter_dex": 0.49152048051585173,
+    "correlation": 0.569355308829471,
+    "within_2x_fraction": 0.5691727221911682,
+    "n_samples": 7156
+  }
+}
