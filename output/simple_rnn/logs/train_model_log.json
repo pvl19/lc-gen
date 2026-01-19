@@ -48,5 +48,105 @@
       "mode": "parallel",
       "K": 64
     }
+  },
+  {
+    "timestamp": "2025-12-30T19:26:08.638241",
+    "args": {
+      "input": "data/timeseries.h5",
+      "max_length": 2048,
+      "direction": "bi",
+      "random_seed": 19,
+      "num_samples": 8192,
+      "epochs": 100,
+      "batch_size": 16,
+      "lr": 0.001,
+      "hidden_size": 64,
+      "output_dir": "output/simple_rnn",
+      "output_name": "baseline_v17_real_final.pt",
+      "device": "auto",
+      "use_flow": true,
+      "min_size": 5,
+      "max_size": 100,
+      "mask_portion": 0.4,
+      "mock_sinusoid": false,
+      "mock_noise": 0.1,
+      "mode": "parallel",
+      "K": 64
+    }
+  },
+  {
+    "timestamp": "2025-12-30T19:26:20.670982",
+    "args": {
+      "input": "data/timeseries.h5",
+      "max_length": 2048,
+      "direction": "bi",
+      "random_seed": 19,
+      "num_samples": 7911,
+      "epochs": 100,
+      "batch_size": 16,
+      "lr": 0.001,
+      "hidden_size": 64,
+      "output_dir": "output/simple_rnn",
+      "output_name": "baseline_v17_real_final.pt",
+      "device": "auto",
+      "use_flow": true,
+      "min_size": 5,
+      "max_size": 100,
+      "mask_portion": 0.4,
+      "mock_sinusoid": false,
+      "mock_noise": 0.1,
+      "mode": "parallel",
+      "K": 64
+    }
+  },
+  {
+    "timestamp": "2025-12-30T20:11:19.629704",
+    "args": {
+      "input": "data/timeseries.h5",
+      "max_length": 2048,
+      "direction": "bi",
+      "random_seed": 19,
+      "num_samples": 2048,
+      "epochs": 100,
+      "batch_size": 16,
+      "lr": 0.001,
+      "hidden_size": 64,
+      "output_dir": "output/simple_rnn",
+      "output_name": "baseline_v17_real_final.pt",
+      "device": "auto",
+      "use_flow": true,
+      "min_size": 5,
+      "max_size": 100,
+      "mask_portion": 0.4,
+      "mock_sinusoid": false,
+      "mock_noise": 0.1,
+      "mode": "parallel",
+      "K": 64
+    }
+  },
+  {
+    "timestamp": "2025-12-30T20:32:53.251104",
+    "args": {
+      "input": "data/timeseries.h5",
+      "max_length": 1024,
+      "direction": "bi",
+      "random_seed": 19,
+      "num_samples": 2048,
+      "epochs": 100,
+      "batch_size": 16,
+      "lr": 0.001,
+      "hidden_size": 64,
+      "output_dir": "output/simple_rnn",
+      "output_name": "baseline_v17_real_final.pt",
+      "device": "auto",
+      "use_flow": true,
+      "min_size": 5,
+      "max_size": 100,
+      "mask_portion": 0.4,
+      "mock_sinusoid": false,
+      "mock_noise": 0.1,
+      "mode": "parallel",
+      "K": 64
+    }
   }
 ]

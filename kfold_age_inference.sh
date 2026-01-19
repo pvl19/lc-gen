@@ -22,7 +22,7 @@ echo "  Pooling mode: ${POOLING_MODE}"
 echo "  Output directory: ${OUTPUT_DIR}"
 
 python scripts/kfold_age_inference.py \
-  --model_path output/simple_rnn/models/baseline_v15_masking_real_60e.pt \
+  --model_path output/simple_rnn/models/baseline_v17_real_final.pt \
   --h5_path data/timeseries.h5 \
   --pickle_path data/star_sector_lc_formatted.pickle \
   --age_csv data/TIC_cf_data.csv \

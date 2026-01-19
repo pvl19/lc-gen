@@ -2,16 +2,14 @@ python src/lcgen/train_simple_rnn.py \
   --input data/timeseries.h5 \
   --random_seed 19 \
   --direction bi \
-  --max_length 512 \
+  --max_length 1024 \
   --num_samples 2048 \
-  --output_name baseline_v16_masking_sim.pt \
-  --epochs 3 \
+  --output_name baseline_v17_real_final.pt \
+  --epochs 100 \
   --lr 1e-3 \
   --min_size 5 \
   --max_size 100 \
   --mask_portion 0.4 \
-  --mock_sinusoid \
-  --mock_noise 0.2\
   --use_flow \
   --mode parallel \
   --K 64

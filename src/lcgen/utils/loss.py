@@ -64,23 +64,34 @@ def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=
 
     per_k_mean = {}
     for k in range(1, max_k + 1):
-        src_slice = slice(0, L - k)
-        tgt_slice = slice(k, L)
-
-        t_tgt = t_enc[:, tgt_slice, :]        # (B, L-k, Te)
+        # Symmetric bidirectional offset: predict targets at positions k to L-1-k
+        # Forward hidden at j-k (info up to j-k-1), backward hidden at j+k (info from j+k+1)
+        # This ensures neither direction sees any data within k steps of the target
+        
+        if 2*k >= L:
+            # Not enough positions for symmetric offset
+            continue
+            
+        # Target positions: k to L-1-k (inclusive)
+        n_targets = L - 2*k
+        
+        # Time encodings at target positions
+        t_tgt = t_enc[:, k:L-k, :]        # (B, n_targets, Te)
 
         # prepare inputs for head: concat along last dim. If the model is
         # bidirectional and backward hidden states were provided, build the
         # same fused input used in `model.forward` (src_f, src_b, t_tgt).
         if getattr(model, 'direction', None) == 'bi' and h_bwd is not None:
-            src_f = h_fwd[:, src_slice, :]
-            src_b = h_bwd[:, tgt_slice, :]
-            inputs_k = torch.cat([src_f, src_b, t_tgt], dim=-1)   # (B, L-k, 2H+Te)
+            # Forward hidden at positions 0 to L-2k-1 (predicting k to L-1-k)
+            src_f = h_fwd[:, :n_targets, :]
+            # Backward hidden at positions 2k to L-1 (info from 2k+1 to L)
+            src_b = h_bwd[:, 2*k:, :]
+            inputs_k = torch.cat([src_f, src_b, t_tgt], dim=-1)   # (B, n_targets, 2H+Te)
             flat_in = inputs_k.view(-1, 2 * H + Te)
         else:
-            h_src = h_fwd[:, src_slice, :]        # (B, L-k, H)
-            inputs_k = torch.cat([h_src, t_tgt], dim=-1)   # (B, L-k, H+Te)
-            flat_in = inputs_k.view(-1, H + Te)           # (B*(L-k), H+Te)
+            h_src = h_fwd[:, :n_targets, :]        # (B, n_targets, H)
+            inputs_k = torch.cat([h_src, t_tgt], dim=-1)   # (B, n_targets, H+Te)
+            flat_in = inputs_k.view(-1, H + Te)           # (B*n_targets, H+Te)
 
         # Apply head normalization and the same time-conditioning used in
         # `model.forward` before calling the head so training/inference match.
@@ -95,21 +106,23 @@ def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=
         else:
             normed = flat_in
 
-        # target ground truth and errors
-        flux_tgt = flux[:, tgt_slice]                 # (B, L-k)
-        ferr_tgt = flux_err[:, tgt_slice]             # (B, L-k)
+        # target ground truth and errors (symmetric: positions k to L-1-k)
+        flux_tgt = flux[:, k:L-k]                 # (B, n_targets)
+        ferr_tgt = flux_err[:, k:L-k]             # (B, n_targets)
 
         # Compute validity mask for predictions
         # A prediction is valid if:
         # 1. The target position is unmasked (we have ground truth to compare against)
-        # 2. The source position is unmasked (the hidden state was computed from real data)
-        # For bidirectional models, we also need the backward source (at target position) to be valid,
-        # but h_bwd[j] only depends on positions > j, so we don't need to check the target itself.
+        # 2. The forward source position (j-k) is unmasked
+        # 3. The backward source position (j+k) is unmasked (for bidirectional)
         if mask is not None:
-            mask_src = mask[:, src_slice]  # (B, L-k) - mask at source positions
-            mask_tgt = mask[:, tgt_slice]  # (B, L-k) - mask at target positions
-            # Valid if both source and target are unmasked
-            valid = (mask_src * mask_tgt)  # (B, L-k)
+            mask_fwd_src = mask[:, :n_targets]     # (B, n_targets) - mask at forward source positions
+            mask_tgt = mask[:, k:L-k]              # (B, n_targets) - mask at target positions
+            if getattr(model, 'direction', None) == 'bi' and h_bwd is not None:
+                mask_bwd_src = mask[:, 2*k:]       # (B, n_targets) - mask at backward source positions
+                valid = (mask_fwd_src * mask_tgt * mask_bwd_src)
+            else:
+                valid = (mask_fwd_src * mask_tgt)
         else:
             valid = torch.ones_like(flux_tgt, device=device)
 
@@ -119,26 +132,26 @@ def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=
         # plus the measurement error at the target timestep.
         flow_module = getattr(model, 'flow', None)
         if flow_module is not None:
-            # Prepare context: normed is (B*(L-k), C); append ferr_tgt flattened
-            ferr_flat = ferr_tgt.contiguous().view(-1)          # (B*(L-k),)
+            # Prepare context: normed is (B*n_targets, C); append ferr_tgt flattened
+            ferr_flat = ferr_tgt.contiguous().view(-1)          # (B*n_targets,)
             ctx = torch.cat([normed, ferr_flat.unsqueeze(1)], dim=1)  # (N, C+1)
 
             # zuko flow call returns a Distribution-like object; compute log_prob
             dist = flow_module(ctx)
-            # flux targets: shape (B, L-k) -> flatten to (N, 1) for event dim 1
+            # flux targets: shape (B, n_targets) -> flatten to (N, 1) for event dim 1
             flux_flat = flux_tgt.contiguous().view(-1, 1)
             logp = dist.log_prob(flux_flat)   # expected shape (N, 1) or (N,)
             # normalize shape to (N,)
             if logp.dim() > 1:
                 logp = logp.view(-1)
             nll_flat = -logp
-            nll_k = nll_flat.view(B, L - k)
+            nll_k = nll_flat.view(B, n_targets)
         else:
             # predict means (allow gradients to flow)
-            preds_k = head(normed).view(B, L - k)        # (B, L-k)
+            preds_k = head(normed).view(B, n_targets)        # (B, n_targets)
 
             # compute NLL per prediction using existing recon_loss
-            nll_k = recon_loss(flux_tgt, ferr_tgt, preds_k)   # (B, L-k)
+            nll_k = recon_loss(flux_tgt, ferr_tgt, preds_k)   # (B, n_targets)
 
         # compute mean NLL for this k across valid predictions
         valid_count = int(valid.sum().item())

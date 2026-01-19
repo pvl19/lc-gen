@@ -75,5 +75,30 @@
       ],
       "flow_mode": "mean"
     }
+  },
+  {
+    "timestamp": "2026-01-03T12:11:18.285103",
+    "args": {
+      "model_path": "output/simple_rnn/models/baseline_v17_real_final.pt",
+      "seq_length": 512,
+      "output_name": "reconstructions_v17_real_final.png",
+      "direction": "bi",
+      "num_examples": 3,
+      "hidden_size": 64,
+      "use_flow": true,
+      "min_size": 5,
+      "max_size": 100,
+      "mask_portion": 0.3,
+      "random_seed": 69,
+      "mock_sinusoid": false,
+      "mock_noise": 0.1,
+      "mode": "parallel",
+      "lags": [
+        1,
+        16,
+        64
+      ],
+      "flow_mode": "mean"
+    }
   }
 ]

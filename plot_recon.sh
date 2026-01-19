@@ -1,6 +1,6 @@
 python scripts/plot_recon.py \
-  --model_path output/simple_rnn/models/baseline_v15_masking_real_60e.pt \
-  --output_name reconstructions_v15_masking_real_60e.png \
+  --model_path output/simple_rnn/models/baseline_v17_real_final.pt \
+  --output_name reconstructions_v17_real_final.png \
   --direction bi \
   --num_examples 3 \
   --seq_length 512 \

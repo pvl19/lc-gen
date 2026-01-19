@@ -1,0 +1,35 @@
+{
+  "mean": {
+    "mae_myr": 141.87598308217133,
+    "median_ae_myr": 33.93842315673828,
+    "rmse_myr": 267.88657332710267,
+    "log_mae_dex": 0.28524914548380864,
+    "log_bias_dex": 0.005650463048882269,
+    "log_scatter_dex": 0.4443971127171104,
+    "correlation": 0.6506606032795332,
+    "within_2x_fraction": 0.6482671883733929,
+    "n_samples": 7156
+  },
+  "multiscale": {
+    "mae_myr": 112.15372987248833,
+    "median_ae_myr": 22.730289459228516,
+    "rmse_myr": 237.77563553600083,
+    "log_mae_dex": 0.23817311380937647,
+    "log_bias_dex": 0.0026028854452648346,
+    "log_scatter_dex": 0.41408069020764426,
+    "correlation": 0.7274200409281626,
+    "within_2x_fraction": 0.7356064840693125,
+    "n_samples": 7156
+  },
+  "final": {
+    "mae_myr": 156.16272154739545,
+    "median_ae_myr": 44.243812561035156,
+    "rmse_myr": 280.17999310327434,
+    "log_mae_dex": 0.3190215653979658,
+    "log_bias_dex": 0.005160227687853174,
+    "log_scatter_dex": 0.47364699196765164,
+    "correlation": 0.6151218025779348,
+    "within_2x_fraction": 0.6157070989379542,
+    "n_samples": 7156
+  }
+}

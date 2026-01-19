@@ -148,160 +148,170 @@ def plot_recon(args):
         with torch.no_grad():
             for k in ks:
                 preds_k = torch.full((B, L), float('nan'), device=device)
-                if k < L:
-                    if args.direction == 'bi' and h_bwd is not None:
-                        # For bi-directional model, use forward hidden at source (i=j-k)
-                        # and backward hidden at target (j) so shapes align: src_f: (B,L-k,H), src_b: (B,L-k,H), tgt: (B,L-k,Te)
-                        src_f = h_fwd[:, :L-k, :]
-                        src_b = h_bwd[:, k:, :]
-                        # use time-encodings computed from input times
-                        tgt = t_enc_in[:, k:, :]
-                        inputs_k = torch.cat([src_f, src_b, tgt], dim=-1)   # (B, L-k, 2H+Te)
-                    else:
-                        # forward or backward single-direction model: use single hidden + time enc
-                        src = h_fwd[:, :L-k, :]
-                        tgt = t_enc_in[:, k:, :]
-                        inputs_k = torch.cat([src, tgt], dim=-1)   # (B, L-k, H+Te)
+                # Symmetric bidirectional offset: need 2*k < L for valid predictions
+                if 2*k >= L:
+                    preds_ks[k] = preds_k.cpu().numpy()
+                    continue
+                    
+                n_targets = L - 2*k  # number of valid target positions
+                
+                if args.direction == 'bi' and h_bwd is not None:
+                    # Symmetric bidirectional: forward hidden at j-k, backward hidden at j+k
+                    # Forward hidden at positions 0 to n_targets-1 (for targets k to L-1-k)
+                    src_f = h_fwd[:, :n_targets, :]
+                    # Backward hidden at positions 2*k to L-1 (for targets k to L-1-k)
+                    src_b = h_bwd[:, 2*k:, :]
+                    # Time encoding at target positions k to L-1-k
+                    tgt = t_enc_in[:, k:L-k, :]
+                    inputs_k = torch.cat([src_f, src_b, tgt], dim=-1)   # (B, n_targets, 2H+Te)
+                else:
+                    # forward or backward single-direction model: use single hidden + time enc
+                    src = h_fwd[:, :n_targets, :]
+                    tgt = t_enc_in[:, k:L-k, :]
+                    inputs_k = torch.cat([src, tgt], dim=-1)   # (B, n_targets, H+Te)
 
-                    flat_in = inputs_k.contiguous().view(-1, inputs_k.size(-1))
-                    # apply head normalization and post-LN time scaling to match model.forward
-                    normed = model.head_norm(flat_in)
-                    nt = Te
-                    if nt > 0:
-                        h_hidden = normed[:, :-nt]
-                        h_time = normed[:, -nt:] * model.time_scale
-                        normed = torch.cat([h_hidden, h_time], dim=1)
+                flat_in = inputs_k.contiguous().view(-1, inputs_k.size(-1))
+                # apply head normalization and post-LN time scaling to match model.forward
+                normed = model.head_norm(flat_in)
+                nt = Te
+                if nt > 0:
+                    h_hidden = normed[:, :-nt]
+                    h_time = normed[:, -nt:] * model.time_scale
+                    normed = torch.cat([h_hidden, h_time], dim=1)
 
-                    # measurement error at target positions
-                    ferr_tgt = flux_err[:, k:]
-                    ferr_flat = ferr_tgt.contiguous().view(-1, 1)
+                # measurement error at target positions (symmetric range)
+                ferr_tgt = flux_err[:, k:L-k]
+                ferr_flat = ferr_tgt.contiguous().view(-1, 1)
 
-                    # If flow head is present, use flow_mode to produce predictions
-                    if flow_head is not None:
-                        ctx = torch.cat([normed, ferr_flat], dim=1)
-                        dist = flow_head(ctx)
-                        
-                        if flow_mode == 'sample':
-                            # Single random sample
-                            flat_preds = dist.sample().view(B, L - k)
-                            preds_p16 = None
-                            preds_p84 = None
-                        elif flow_mode == 'mode':
-                            # Gradient-based optimization to find the mode (MAP estimate)
-                            N = ctx.size(0)
-                            with torch.no_grad():
-                                y_init = dist.sample().clone()
-                            y_opt = y_init.requires_grad_(True)
-                            optimizer = torch.optim.Adam([y_opt], lr=0.1)
-                            for _ in range(50):
-                                optimizer.zero_grad()
-                                loss = -dist.log_prob(y_opt).sum()
-                                loss.backward()
-                                optimizer.step()
-                                with torch.no_grad():
-                                    y_opt.clamp_(-10, 10)
-                            flat_preds = y_opt.detach().view(B, L - k)
-                            preds_p16 = None
-                            preds_p84 = None
-                        else:  # 'mean'
-                            # Collect multiple samples to approximate the conditional mean and percentiles
-                            n_samples = 32
-                            samples = torch.stack([dist.sample() for _ in range(n_samples)], dim=0)  # (n_samples, B*(L-k), 1)
-                            samples = samples.squeeze(-1).view(n_samples, B, L - k)  # (n_samples, B, L-k)
-                            flat_preds = samples.mean(dim=0)  # (B, L-k)
-                            preds_p16 = torch.quantile(samples, 0.16, dim=0)  # (B, L-k)
-                            preds_p84 = torch.quantile(samples, 0.84, dim=0)  # (B, L-k)
-                    else:
-                        flat_preds = head(normed).view(B, L - k)
+                # If flow head is present, use flow_mode to produce predictions
+                if flow_head is not None:
+                    ctx = torch.cat([normed, ferr_flat], dim=1)
+                    dist = flow_head(ctx)
+                    
+                    if flow_mode == 'sample':
+                        # Single random sample
+                        flat_preds = dist.sample().view(B, n_targets)
                         preds_p16 = None
                         preds_p84 = None
-                    preds_k[:, k:] = flat_preds
-                    # Store percentiles if computed
-                    if preds_p16 is not None:
-                        preds_k_p16 = torch.full((B, L), float('nan'), device=device)
-                        preds_k_p84 = torch.full((B, L), float('nan'), device=device)
-                        preds_k_p16[:, k:] = preds_p16
-                        preds_k_p84[:, k:] = preds_p84
-                        preds_ks_p16[k] = preds_k_p16.cpu().numpy()
-                        preds_ks_p84[k] = preds_k_p84.cpu().numpy()
-                    # compute per-prediction NLL aligned with target indices
-                    with torch.no_grad():
-                        preds_k_t = preds_k[:, k:]
-                        flux_tgt = flux[:, k:]
-                        # Use flow log_prob for NLL if flow is present
-                        if flow_head is not None:
-                            flux_flat = flux_tgt.contiguous().view(-1, 1)
-                            ctx = torch.cat([normed, ferr_flat], dim=1)
-                            dist = flow_head(ctx)
-                            logp = dist.log_prob(flux_flat)
-                            if logp.dim() > 1:
-                                logp = logp.view(-1)
-                            nll_k = -logp.view(B, L - k)
-                        else:
-                            nll_k = recon_loss(flux_tgt, ferr_tgt, preds_k_t)  # (B, L-k)
-                        loss_k = torch.full((B, L), float('nan'), device=device)
-                        loss_k[:, k:] = nll_k
-                        preds_ks_loss[k] = loss_k.cpu().numpy()
-                preds_ks[k] = preds_k.cpu().numpy()
-                # ---- relative time predictions for this k ----
-                preds_k_rel = torch.full((B, L), float('nan'), device=device)
-                if k < L:
-                    # build relative time differences: shape (B, L-k, 1)
-                    # t_src: times[:, :L-k], t_tgt: times[:, k:]
-                    t_src = times[:, :L-k]
-                    t_tgt = times[:, k:]
-                    t_rel = (t_tgt - t_src).unsqueeze(-1)  # (B, L-k, 1)
-                    # compute time-encodings from relative times
-                    t_rel_enc = model.time_enc(t_rel)
-                    if args.direction == 'bi' and h_bwd is not None:
-                        src_f = h_fwd[:, :L-k, :]
-                        src_b = h_bwd[:, k:, :]
-                        tgt_rel = t_rel_enc
-                        inputs_k_rel = torch.cat([src_f, src_b, tgt_rel], dim=-1)
-                    else:
-                        src = h_fwd[:, :L-k, :]
-                        tgt_rel = t_rel_enc
-                        inputs_k_rel = torch.cat([src, tgt_rel], dim=-1)
-
-                    flat_in_rel = inputs_k_rel.contiguous().view(-1, inputs_k_rel.size(-1))
-                    normed_rel = model.head_norm(flat_in_rel)
-                    if nt > 0:
-                        h_hidden = normed_rel[:, :-nt]
-                        h_time = normed_rel[:, -nt:] * model.time_scale
-                        normed_rel = torch.cat([h_hidden, h_time], dim=1)
-
-                    # Also use flow for relative-time predictions if present
-                    if flow_head is not None:
-                        ferr_tgt_rel = flux_err[:, k:]
-                        ferr_flat_rel = ferr_tgt_rel.contiguous().view(-1, 1)
-                        ctx_rel = torch.cat([normed_rel, ferr_flat_rel], dim=1)
-                        dist_rel = flow_head(ctx_rel)
-                        
-                        if flow_mode == 'sample':
-                            flat_preds_rel = dist_rel.sample().view(B, L - k)
-                        elif flow_mode == 'mode':
-                            N_rel = ctx_rel.size(0)
+                    elif flow_mode == 'mode':
+                        # Gradient-based optimization to find the mode (MAP estimate)
+                        N = ctx.size(0)
+                        with torch.no_grad():
+                            y_init = dist.sample().clone()
+                        y_opt = y_init.requires_grad_(True)
+                        optimizer = torch.optim.Adam([y_opt], lr=0.1)
+                        for _ in range(50):
+                            optimizer.zero_grad()
+                            loss = -dist.log_prob(y_opt).sum()
+                            loss.backward()
+                            optimizer.step()
                             with torch.no_grad():
-                                y_init_rel = dist_rel.sample().clone()
-                            y_opt_rel = y_init_rel.requires_grad_(True)
-                            optimizer_rel = torch.optim.Adam([y_opt_rel], lr=0.1)
-                            for _ in range(50):
-                                optimizer_rel.zero_grad()
-                                loss = -dist_rel.log_prob(y_opt_rel).sum()
-                                loss.backward()
-                                optimizer_rel.step()
-                                with torch.no_grad():
-                                    y_opt_rel.clamp_(-10, 10)
-                            flat_preds_rel = y_opt_rel.detach().view(B, L - k)
-                        else:  # 'mean'
-                            n_samples = 16
-                            s_acc = dist_rel.sample()
-                            for _ in range(n_samples - 1):
-                                s_acc = s_acc + dist_rel.sample()
-                            flat_preds_rel = (s_acc / n_samples).view(B, L - k)
+                                y_opt.clamp_(-10, 10)
+                        flat_preds = y_opt.detach().view(B, n_targets)
+                        preds_p16 = None
+                        preds_p84 = None
+                    else:  # 'mean'
+                        # Collect multiple samples to approximate the conditional mean and percentiles
+                        n_samples = 32
+                        samples = torch.stack([dist.sample() for _ in range(n_samples)], dim=0)
+                        samples = samples.squeeze(-1).view(n_samples, B, n_targets)
+                        flat_preds = samples.mean(dim=0)
+                        preds_p16 = torch.quantile(samples, 0.16, dim=0)
+                        preds_p84 = torch.quantile(samples, 0.84, dim=0)
+                else:
+                    flat_preds = head(normed).view(B, n_targets)
+                    preds_p16 = None
+                    preds_p84 = None
+                
+                # Store predictions at symmetric target positions k to L-1-k
+                preds_k[:, k:L-k] = flat_preds
+                
+                # Store percentiles if computed
+                if preds_p16 is not None:
+                    preds_k_p16 = torch.full((B, L), float('nan'), device=device)
+                    preds_k_p84 = torch.full((B, L), float('nan'), device=device)
+                    preds_k_p16[:, k:L-k] = preds_p16
+                    preds_k_p84[:, k:L-k] = preds_p84
+                    preds_ks_p16[k] = preds_k_p16.cpu().numpy()
+                    preds_ks_p84[k] = preds_k_p84.cpu().numpy()
+                
+                # compute per-prediction NLL aligned with target indices
+                with torch.no_grad():
+                    preds_k_t = preds_k[:, k:L-k]
+                    flux_tgt = flux[:, k:L-k]
+                    # Use flow log_prob for NLL if flow is present
+                    if flow_head is not None:
+                        flux_flat = flux_tgt.contiguous().view(-1, 1)
+                        ctx = torch.cat([normed, ferr_flat], dim=1)
+                        dist = flow_head(ctx)
+                        logp = dist.log_prob(flux_flat)
+                        if logp.dim() > 1:
+                            logp = logp.view(-1)
+                        nll_k = -logp.view(B, n_targets)
                     else:
-                        flat_preds_rel = head(normed_rel).view(B, L - k)
-                    preds_k_rel[:, k:] = flat_preds_rel
+                        nll_k = recon_loss(flux_tgt, ferr_tgt, preds_k_t)
+                    loss_k = torch.full((B, L), float('nan'), device=device)
+                    loss_k[:, k:L-k] = nll_k
+                    preds_ks_loss[k] = loss_k.cpu().numpy()
+                    
+                preds_ks[k] = preds_k.cpu().numpy()
+                
+                # ---- relative time predictions for this k (also symmetric) ----
+                preds_k_rel = torch.full((B, L), float('nan'), device=device)
+                # build relative time differences for symmetric targets
+                t_src = times[:, :n_targets]      # source at positions 0 to n_targets-1
+                t_tgt_times = times[:, k:L-k]     # targets at positions k to L-1-k
+                t_rel = (t_tgt_times - t_src).unsqueeze(-1)  # (B, n_targets, 1)
+                # compute time-encodings from relative times
+                t_rel_enc = model.time_enc(t_rel)
+                if args.direction == 'bi' and h_bwd is not None:
+                    src_f = h_fwd[:, :n_targets, :]
+                    src_b = h_bwd[:, 2*k:, :]
+                    tgt_rel = t_rel_enc
+                    inputs_k_rel = torch.cat([src_f, src_b, tgt_rel], dim=-1)
+                else:
+                    src = h_fwd[:, :n_targets, :]
+                    tgt_rel = t_rel_enc
+                    inputs_k_rel = torch.cat([src, tgt_rel], dim=-1)
+
+                flat_in_rel = inputs_k_rel.contiguous().view(-1, inputs_k_rel.size(-1))
+                normed_rel = model.head_norm(flat_in_rel)
+                if nt > 0:
+                    h_hidden = normed_rel[:, :-nt]
+                    h_time = normed_rel[:, -nt:] * model.time_scale
+                    normed_rel = torch.cat([h_hidden, h_time], dim=1)
+
+                # Also use flow for relative-time predictions if present
+                if flow_head is not None:
+                    ferr_flat_rel = ferr_tgt.contiguous().view(-1, 1)
+                    ctx_rel = torch.cat([normed_rel, ferr_flat_rel], dim=1)
+                    dist_rel = flow_head(ctx_rel)
+                    
+                    if flow_mode == 'sample':
+                        flat_preds_rel = dist_rel.sample().view(B, n_targets)
+                    elif flow_mode == 'mode':
+                        N_rel = ctx_rel.size(0)
+                        with torch.no_grad():
+                            y_init_rel = dist_rel.sample().clone()
+                        y_opt_rel = y_init_rel.requires_grad_(True)
+                        optimizer_rel = torch.optim.Adam([y_opt_rel], lr=0.1)
+                        for _ in range(50):
+                            optimizer_rel.zero_grad()
+                            loss = -dist_rel.log_prob(y_opt_rel).sum()
+                            loss.backward()
+                            optimizer_rel.step()
+                            with torch.no_grad():
+                                y_opt_rel.clamp_(-10, 10)
+                        flat_preds_rel = y_opt_rel.detach().view(B, n_targets)
+                    else:  # 'mean'
+                        n_samples = 16
+                        s_acc = dist_rel.sample()
+                        for _ in range(n_samples - 1):
+                            s_acc = s_acc + dist_rel.sample()
+                        flat_preds_rel = (s_acc / n_samples).view(B, n_targets)
+                else:
+                    flat_preds_rel = head(normed_rel).view(B, n_targets)
+                preds_k_rel[:, k:L-k] = flat_preds_rel
                 preds_ks_rel[k] = preds_k_rel.cpu().numpy()
     else:
         # fallback: repeat the single-step mean for all ks

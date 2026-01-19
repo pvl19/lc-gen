@@ -318,17 +318,23 @@ def load_ages(pickle_path: str, csv_path: str, sample_indices: np.ndarray = None
 
 def plot_umap(latent_vectors: np.ndarray, ages: np.ndarray, output_path: str,
               n_neighbors: int = 15, min_dist: float = 0.1, metric: str = 'euclidean',
-              bprp0_min: float = None, bprp0_max: float = None):
-    """Create UMAP embedding and plot colored by stellar age."""
+              bprp0_min: float = None, bprp0_max: float = None, bprp0: np.ndarray = None):
+    """Create UMAP embedding and plot colored by stellar age.
     
-    # Filter to only include samples with valid ages
+    UMAP is computed on ALL samples with valid ages first, then BPRP0 filtering
+    is applied for plotting. This preserves consistent UMAP coordinates across
+    different BPRP0 cuts.
+    """
+    
+    # Filter to only include samples with valid ages for UMAP computation
     valid_mask = ~np.isnan(ages)
     latent_valid = latent_vectors[valid_mask]
     ages_valid = ages[valid_mask]
+    bprp0_valid = bprp0[valid_mask] if bprp0 is not None else None
     
     print(f'Computing UMAP on {len(latent_valid)} samples with valid ages...')
     
-    # Fit UMAP
+    # Fit UMAP on ALL samples (before BPRP0 filtering)
     reducer = umap.UMAP(
         n_neighbors=n_neighbors,
         min_dist=min_dist,
@@ -341,16 +347,31 @@ def plot_umap(latent_vectors: np.ndarray, ages: np.ndarray, output_path: str,
     
     print(f'UMAP embedding shape: {embedding.shape}')
     
+    # Now apply BPRP0 filtering for plotting (after UMAP)
+    plot_mask = np.ones(len(ages_valid), dtype=bool)
+    if bprp0_valid is not None:
+        if bprp0_min is not None:
+            plot_mask &= (bprp0_valid >= bprp0_min)
+        if bprp0_max is not None:
+            plot_mask &= (bprp0_valid <= bprp0_max)
+    
+    embedding_plot = embedding[plot_mask]
+    ages_plot = ages_valid[plot_mask]
+    
+    n_filtered = len(ages_valid) - len(ages_plot)
+    if n_filtered > 0:
+        print(f'Filtered to {len(ages_plot)} samples for plotting (removed {n_filtered} outside BPRP0 range)')
+    
     # Create plot
     fig, ax = plt.subplots(figsize=(12, 10))
     
     # Use log scale for age coloring (ages span several orders of magnitude)
     scatter = ax.scatter(
-        embedding[:, 0],
-        embedding[:, 1],
-        c=ages_valid,
+        embedding_plot[:, 0],
+        embedding_plot[:, 1],
+        c=ages_plot,
         cmap='viridis',
-        norm=LogNorm(vmin=ages_valid.min(), vmax=ages_valid.max()),
+        norm=LogNorm(vmin=ages_plot.min(), vmax=ages_plot.max()),
         s=50,
         alpha=0.7
     )
@@ -363,7 +384,7 @@ def plot_umap(latent_vectors: np.ndarray, ages: np.ndarray, output_path: str,
     ax.set_title('UMAP of Light Curve Latent Space\nColored by Stellar Age', fontsize=14)
     
     # Add some statistics as text
-    textstr = f'N samples: {len(ages_valid)}\nAge range: {ages_valid.min():.1f} - {ages_valid.max():.1f} Myr'
+    textstr = f'N samples: {len(ages_plot)}\nAge range: {ages_plot.min():.1f} - {ages_plot.max():.1f} Myr'
     if bprp0_min is not None or bprp0_max is not None:
         bprp0_str = f'BPRP0: {bprp0_min if bprp0_min is not None else "—"} to {bprp0_max if bprp0_max is not None else "—"}'
         textstr += f'\n{bprp0_str}'
@@ -375,11 +396,13 @@ def plot_umap(latent_vectors: np.ndarray, ages: np.ndarray, output_path: str,
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f'Saved UMAP plot to {output_path}')
     
-    # Also save the embedding data for further analysis
+    # Save the FULL embedding data (before BPRP0 filtering) for further analysis
+    # This allows replotting with different BPRP0 cuts without recomputing UMAP
     npz_path = output_path.replace('.png', '_data.npz')
     np.savez(npz_path, 
-             embedding=embedding, 
-             ages=ages_valid,
+             embedding=embedding,  # Full embedding (all samples)
+             ages=ages_valid,      # All ages
+             bprp0=bprp0_valid if bprp0_valid is not None else np.array([]),  # All BPRP0
              latent_vectors=latent_valid)
     print(f'Saved embedding data to {npz_path}')
     
@@ -424,42 +447,25 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Determine which samples to use
+    # Determine which samples to use for UMAP (no BPRP0 filtering here)
+    # BPRP0 filtering is applied AFTER UMAP to preserve consistent embedding
     sample_indices = None
-    if args.max_samples is not None or args.bprp0_min is not None or args.bprp0_max is not None:
-        # Load all ages and BPRP0 first for filtering/stratified sampling
-        print('Loading ages and BPRP0 for filtering/stratified sampling...')
+    if args.max_samples is not None:
+        # Load all ages first for stratified sampling (ignore BPRP0 at this stage)
+        print('Loading ages for stratified sampling...')
         all_ages, all_bprp0, _ = load_ages(args.pickle_path, args.age_csv_path, sample_indices=None)
         
-        # Apply BPRP0 cuts to create a mask of valid indices
-        valid_mask = ~np.isnan(all_ages)  # Start with samples that have ages
-        if args.bprp0_min is not None:
-            valid_mask &= (all_bprp0 >= args.bprp0_min)
-            print(f'  Applied BPRP0 >= {args.bprp0_min}')
-        if args.bprp0_max is not None:
-            valid_mask &= (all_bprp0 <= args.bprp0_max)
-            print(f'  Applied BPRP0 <= {args.bprp0_max}')
-        
-        n_after_cuts = np.sum(valid_mask)
-        print(f'  {n_after_cuts} samples remain after BPRP0 cuts')
-        
-        if args.max_samples is not None:
-            if args.stratify_by_age:
-                # Stratified sampling on the filtered subset
-                # Create ages array with NaN for filtered-out samples
-                ages_for_stratify = np.where(valid_mask, all_ages, np.nan)
-                sample_indices = get_stratified_indices(
-                    ages_for_stratify, 
-                    max_samples=args.max_samples,
-                    n_bins=args.n_age_bins
-                )
-            else:
-                # Simple sequential sampling from valid indices
-                valid_indices = np.where(valid_mask)[0]
-                sample_indices = valid_indices[:args.max_samples]
+        if args.stratify_by_age:
+            # Stratified sampling based on age only (not BPRP0)
+            sample_indices = get_stratified_indices(
+                all_ages, 
+                max_samples=args.max_samples,
+                n_bins=args.n_age_bins
+            )
         else:
-            # No max_samples limit, just use all that pass the cuts
-            sample_indices = np.where(valid_mask)[0]
+            # Simple sequential sampling from samples with valid ages
+            valid_indices = np.where(~np.isnan(all_ages))[0]
+            sample_indices = valid_indices[:args.max_samples]
     
     # Load model
     model = load_model(
@@ -471,7 +477,7 @@ def main():
         device
     )
     
-    # Extract latent vectors
+    # Extract latent vectors (for all selected samples, no BPRP0 filtering)
     latent_vectors = extract_latent_vectors(
         model, 
         args.h5_path, 
@@ -482,7 +488,7 @@ def main():
         sample_indices=sample_indices
     )
     
-    # Load ages for selected samples
+    # Load ages and BPRP0 for selected samples
     ages, bprp0, tic_ids = load_ages(args.pickle_path, args.age_csv_path, sample_indices=sample_indices)
     
     # Generate output filename based on model name, pooling mode, and cuts
@@ -493,7 +499,7 @@ def main():
         suffix += f'_{bprp_range}'
     output_path = output_dir / f'umap_age_{model_name}_{suffix}.png'
     
-    # Create UMAP plot
+    # Create UMAP plot (BPRP0 filtering happens inside plot_umap after UMAP is computed)
     plot_umap(
         latent_vectors, 
         ages, 
@@ -501,7 +507,8 @@ def main():
         n_neighbors=args.n_neighbors,
         min_dist=args.min_dist,
         bprp0_min=args.bprp0_min,
-        bprp0_max=args.bprp0_max
+        bprp0_max=args.bprp0_max,
+        bprp0=bprp0  # Pass BPRP0 for post-UMAP filtering
     )
     
     print('Done!')
