@@ -18,13 +18,23 @@ from lcgen.models.simple_min_gru import SimpleMinGRU
 from lcgen.utils.trunc_data import extract_data
 from lcgen.utils.loss import recon_loss
 
+# Default metadata feature names (values + uncertainties)
+METADATA_FEATURES = [
+    'norm_G0', 'norm_BP0', 'norm_RP0', 'norm_parallax',
+    'norm_G0_err', 'norm_BP0_err', 'norm_RP0_err', 'norm_parallax_err'
+]
+
+
 class TimeSeriesDataset(Dataset):
-    def __init__(self, h5path, random_seed, min_size, max_size, mask_portion, max_length=16384, num_samples=None, mock_sinusoid=False, mock_noise=0.1):
+    def __init__(self, h5path, random_seed, min_size, max_size, mask_portion, max_length=16384, num_samples=None, mock_sinusoid=False, mock_noise=0.1, use_metadata=False, metadata_features=None):
         self.min_size = min_size
         self.max_size = max_size
         self.mask_portion = mask_portion
         self.rng = np.random.default_rng(random_seed)
         self.mock_noise = mock_noise
+        self.use_metadata = use_metadata
+        self.metadata_features = metadata_features or METADATA_FEATURES
+        self.num_meta_features = len(self.metadata_features)
         
         p = Path(h5path)
         if p.exists():
@@ -33,14 +43,44 @@ class TimeSeriesDataset(Dataset):
                 self.flux = data_dict['flux']
                 self.time = data_dict['time']
                 self.flux_err = data_dict['flux_err']
+                self.lengths = data_dict['length']  # Actual sequence lengths (capped at max_length)
+                # Get the indices used by extract_data so we can load matching metadata
+                sample_indices = data_dict.get('indices')
+                # Load metadata directly from H5 (it's a group, not a dataset)
+                if use_metadata:
+                    with h5py.File(h5path, 'r') as f:
+                        if 'metadata' in f:
+                            meta_grp = f['metadata']
+                            # Load all metadata first, then subset
+                            full_metadata = self._load_metadata_from_h5(meta_grp, f['flux'].shape[0])
+                            if sample_indices is not None:
+                                self.metadata = full_metadata[sample_indices]
+                            else:
+                                self.metadata = full_metadata[:len(self.flux)]
+                        else:
+                            self.metadata = None
+                else:
+                    self.metadata = None
             else:
                 with h5py.File(h5path, 'r') as f:
                     self.flux = f['flux'][:]
                     self.time = f['time'][:]
                     self.flux_err = f['flux_err'][:]
+                    # Load actual lengths if available
+                    if 'length' in f:
+                        self.lengths = f['length'][:]
+                    else:
+                        self.lengths = np.full(len(self.flux), self.flux.shape[1], dtype=np.int32)
+                    # Load stellar metadata if available and requested
+                    if use_metadata and 'metadata' in f:
+                        meta_grp = f['metadata']
+                        self.metadata = self._load_metadata_from_h5(meta_grp, len(self.flux))
+                    else:
+                        self.metadata = None
             self.flux = np.asarray(self.flux, dtype=np.float32)
             self.time = np.asarray(self.time, dtype=np.float32)
             self.flux_err = np.asarray(self.flux_err, dtype=np.float32)
+            self.lengths = np.asarray(self.lengths, dtype=np.int32)
         else:
             # Fall back to a synthetic dataset if file is missing (small and fast).
             print(f'Warning: {h5path} not found. Using synthetic data for smoke test.')
@@ -49,6 +89,8 @@ class TimeSeriesDataset(Dataset):
             self.flux = np.random.randn(N, L).astype(np.float32)
             self.flux_err = np.random.randn(N, L).astype(np.float32)
             self.time = np.random.randn(N, L).astype(np.float32)
+            self.lengths = np.full(N, L, dtype=np.int32)  # All positions valid for synthetic
+            self.metadata = None
         if mock_sinusoid:
             # Generate a mock sinusoidal dataset
             for i in range(len(self.flux)):
@@ -63,6 +105,28 @@ class TimeSeriesDataset(Dataset):
                 flux_at_t_noisy = flux_at_t + np.random.normal(0, self.mock_noise, size=flux_at_t.shape)  # Add noise
                 self.flux[i] = flux_at_t_noisy
                 self.flux_err[i] = np.abs(np.random.normal(1,0.5, size=self.flux.shape[1]))+0.05
+
+    def _load_metadata_from_h5(self, meta_grp, n_samples):
+        """Load metadata features from H5 group into a numpy array.
+        Raises an error if any required feature is missing.
+        """
+        meta_list = []
+        missing = []
+        for feat_name in self.metadata_features:
+            if feat_name in meta_grp:
+                vals = meta_grp[feat_name][:]
+                # Handle byte strings from HDF5
+                if vals.dtype.kind == 'S':
+                    vals = vals.astype(float)
+                meta_list.append(vals.astype(np.float32))
+            else:
+                missing.append(feat_name)
+        if missing:
+            raise RuntimeError(f"Missing required metadata features in H5 file: {missing}")
+        metadata = np.stack(meta_list, axis=1)  # (n_samples, num_features)
+        # Replace NaN with 0 for missing values
+        metadata = np.nan_to_num(metadata, nan=0.0)
+        return metadata
 
     def __len__(self):
         return len(self.flux)
@@ -106,11 +170,25 @@ class TimeSeriesDataset(Dataset):
         flux_err = self.flux_err[idx]
         time = self.time[idx]
         L = len(flux)
+        actual_length = self.lengths[idx]
         
         # Generate a fresh random mask for this sample
         mask = self._generate_block_mask(L)
         
-        return [flux, flux_err, time, mask]
+        # Create padding mask: 1 for real data, 0 for padding
+        padding_mask = np.zeros(L, dtype=np.float32)
+        padding_mask[:actual_length] = 1.0
+        
+        # Combine random mask with padding mask (both must be 1 for position to be valid)
+        combined_mask = mask * padding_mask
+        
+        # Get metadata if available
+        if self.use_metadata and self.metadata is not None:
+            meta = self.metadata[idx]
+        else:
+            meta = np.zeros(self.num_meta_features, dtype=np.float32)
+        
+        return [flux, flux_err, time, combined_mask, meta]
     
     def apply_block_mask(self, min_size, max_size, mask_portion):
         """
@@ -170,13 +248,15 @@ class TimeSeriesDataset(Dataset):
 def collate_fn(batch):
     """Collate list of samples into batched tensors.
 
-    Each item in batch is [flux, flux_err, time, mask] where each is a 1D numpy
-    array of length L. Return a tuple of torch.FloatTensors: (flux, flux_err, time, mask)
-    with shapes (B, L).
+    Each item in batch is [flux, flux_err, time, mask, metadata] where flux/flux_err/time/mask
+    are 1D numpy arrays of length L, and metadata is a 1D array of stellar features.
+    Return a tuple of torch.FloatTensors: (flux, flux_err, time, mask, metadata)
+    with shapes (B, L) for time series and (B, num_meta_features) for metadata.
     """
     fluxes = np.stack([b[0] for b in batch], axis=0).astype(np.float32)
     flux_errs = np.stack([b[1] for b in batch], axis=0).astype(np.float32)
     times = np.stack([b[2] for b in batch], axis=0).astype(np.float32)
     masks = np.stack([b[3] for b in batch], axis=0).astype(np.float32)
+    metadata = np.stack([b[4] for b in batch], axis=0).astype(np.float32)
 
-    return (torch.from_numpy(fluxes), torch.from_numpy(flux_errs), torch.from_numpy(times), torch.from_numpy(masks))
+    return (torch.from_numpy(fluxes), torch.from_numpy(flux_errs), torch.from_numpy(times), torch.from_numpy(masks), torch.from_numpy(metadata))

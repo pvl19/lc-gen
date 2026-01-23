@@ -58,7 +58,8 @@ def plot_recon(args):
 
     # Load model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = BiDirectionalMinGRU(hidden_size=args.hidden_size, direction=args.direction, mode=args.mode, use_flow=args.use_flow).to(device)
+    num_meta_features = 8 if args.use_metadata else 0
+    model = BiDirectionalMinGRU(hidden_size=args.hidden_size, direction=args.direction, mode=args.mode, use_flow=args.use_flow, num_meta_features=num_meta_features).to(device)
     ckpt = torch.load(args.model_path)
     # ckpt may store a dict under 'model_state_dict'
     if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
@@ -86,14 +87,15 @@ def plot_recon(args):
     # Load data and generate reconstructions
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     raw_data_path = Path('data/timeseries.h5')
-    ds = TimeSeriesDataset(raw_data_path, random_seed=args.random_seed, min_size=args.min_size, max_size=args.max_size, mask_portion=args.mask_portion, max_length=args.seq_length, num_samples=args.num_examples, mock_sinusoid=args.mock_sinusoid, mock_noise=args.mock_noise)
+    ds = TimeSeriesDataset(raw_data_path, random_seed=args.random_seed, min_size=args.min_size, max_size=args.max_size, mask_portion=args.mask_portion, max_length=args.seq_length, num_samples=args.num_examples, mock_sinusoid=args.mock_sinusoid, mock_noise=args.mock_noise, use_metadata=args.use_metadata)
     loader = DataLoader(ds, batch_size=args.num_examples, shuffle=False, collate_fn=collate_fn)
     batch_X = next(iter(loader)) 
-    flux, flux_err, times, mask = batch_X
+    flux, flux_err, times, mask, metadata = batch_X
     flux = flux.to(device)
     flux_err = flux_err.to(device)
     times = times.to(device)
     mask = mask.to(device)
+    metadata = metadata.to(device) if args.use_metadata else None
 
     # Build input channels [flux, flux_err] -> (B, L, 2)
     x_in = torch.stack([flux, flux_err], dim=-1)
@@ -102,7 +104,7 @@ def plot_recon(args):
     # Pass flow_mode to control how flow head produces point predictions
     flow_mode = getattr(args, 'flow_mode', 'mean')
     print(f'Flow mode for reconstruction: {flow_mode}')
-    out = model(x_in, t_in, mask=mask, return_states=True, flow_mode=flow_mode)
+    out = model(x_in, t_in, mask=mask, metadata=metadata, return_states=True, flow_mode=flow_mode)
     recon = out['reconstructed']  # (B, L, 1) -> [mean]
     mean = recon[..., 0]
     # get forward/backward hidden states from the model output
@@ -118,6 +120,17 @@ def plot_recon(args):
         t0 = t_seq[:, 0].unsqueeze(1)  # (B, 1)
         t_shifted = (t_seq - t0).unsqueeze(-1)  # (B, L, 1)
         t_enc_in = model.time_enc(t_shifted)
+        # Compute metadata embedding if model uses metadata
+        meta_encoder = getattr(model, 'meta_encoder', None)
+        meta_input_norm = getattr(model, 'meta_input_norm', None)
+        if meta_encoder is not None and metadata is not None:
+            if meta_input_norm is not None:
+                meta_normed = meta_input_norm(metadata)
+                meta_emb = meta_encoder(meta_normed)  # (B, meta_emb_dim)
+            else:
+                meta_emb = meta_encoder(metadata)  # (B, meta_emb_dim)
+        else:
+            meta_emb = None
     loss = recon_loss(flux, flux_err, mean)
     flux_np = flux.cpu().numpy()
     flux_err_np = flux_err.cpu().numpy()
@@ -163,12 +176,21 @@ def plot_recon(args):
                     src_b = h_bwd[:, 2*k:, :]
                     # Time encoding at target positions k to L-1-k
                     tgt = t_enc_in[:, k:L-k, :]
-                    inputs_k = torch.cat([src_f, src_b, tgt], dim=-1)   # (B, n_targets, 2H+Te)
+                    if meta_emb is not None:
+                        # Expand metadata embedding to n_targets
+                        meta_exp = meta_emb.unsqueeze(1).expand(-1, n_targets, -1)
+                        inputs_k = torch.cat([src_f, src_b, tgt, meta_exp], dim=-1)   # (B, n_targets, 2H+Te+M)
+                    else:
+                        inputs_k = torch.cat([src_f, src_b, tgt], dim=-1)   # (B, n_targets, 2H+Te)
                 else:
                     # forward or backward single-direction model: use single hidden + time enc
                     src = h_fwd[:, :n_targets, :]
                     tgt = t_enc_in[:, k:L-k, :]
-                    inputs_k = torch.cat([src, tgt], dim=-1)   # (B, n_targets, H+Te)
+                    if meta_emb is not None:
+                        meta_exp = meta_emb.unsqueeze(1).expand(-1, n_targets, -1)
+                        inputs_k = torch.cat([src, tgt, meta_exp], dim=-1)   # (B, n_targets, H+Te+M)
+                    else:
+                        inputs_k = torch.cat([src, tgt], dim=-1)   # (B, n_targets, H+Te)
 
                 flat_in = inputs_k.contiguous().view(-1, inputs_k.size(-1))
                 # apply head normalization and post-LN time scaling to match model.forward
@@ -268,11 +290,19 @@ def plot_recon(args):
                     src_f = h_fwd[:, :n_targets, :]
                     src_b = h_bwd[:, 2*k:, :]
                     tgt_rel = t_rel_enc
-                    inputs_k_rel = torch.cat([src_f, src_b, tgt_rel], dim=-1)
+                    if meta_emb is not None:
+                        meta_exp = meta_emb.unsqueeze(1).expand(-1, n_targets, -1)
+                        inputs_k_rel = torch.cat([src_f, src_b, tgt_rel, meta_exp], dim=-1)
+                    else:
+                        inputs_k_rel = torch.cat([src_f, src_b, tgt_rel], dim=-1)
                 else:
                     src = h_fwd[:, :n_targets, :]
                     tgt_rel = t_rel_enc
-                    inputs_k_rel = torch.cat([src, tgt_rel], dim=-1)
+                    if meta_emb is not None:
+                        meta_exp = meta_emb.unsqueeze(1).expand(-1, n_targets, -1)
+                        inputs_k_rel = torch.cat([src, tgt_rel, meta_exp], dim=-1)
+                    else:
+                        inputs_k_rel = torch.cat([src, tgt_rel], dim=-1)
 
                 flat_in_rel = inputs_k_rel.contiguous().view(-1, inputs_k_rel.size(-1))
                 normed_rel = model.head_norm(flat_in_rel)
@@ -450,6 +480,8 @@ def parse_args():
     p.add_argument('--lags', type=int, nargs='*', default=None, help='List of lag values (t-k) for multi-horizon reconstructions')
     p.add_argument('--flow_mode', type=str, default='mean', choices=['mode', 'mean', 'sample'],
                    help='How to produce point predictions from flow head: mode (MAP), mean (MC average), sample (single random)')
+    p.add_argument('--use_metadata', action='store_true',
+                   help='Use stellar metadata (G_0, BP_0, RP_0, parallax + uncertainties) as model input')
     return p.parse_args()
 
 if __name__ == '__main__':

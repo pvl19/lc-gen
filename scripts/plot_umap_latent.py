@@ -100,13 +100,14 @@ def get_stratified_indices(ages: np.ndarray, max_samples: int, n_bins: int = 20,
     return selected_indices
 
 
-def load_model(model_path: str, hidden_size: int, direction: str, mode: str, use_flow: bool, device: torch.device):
+def load_model(model_path: str, hidden_size: int, direction: str, mode: str, use_flow: bool, device: torch.device, num_meta_features: int = 0):
     """Load trained model from checkpoint."""
     model = BiDirectionalMinGRU(
         hidden_size=hidden_size,
         direction=direction,
         mode=mode,
-        use_flow=use_flow
+        use_flow=use_flow,
+        num_meta_features=num_meta_features
     ).to(device)
     
     ckpt = torch.load(model_path, map_location=device)
@@ -115,7 +116,17 @@ def load_model(model_path: str, hidden_size: int, direction: str, mode: str, use
     else:
         sd = ckpt
     
-    model.load_state_dict(sd)
+    # Try to load state dict, allowing for size mismatches in metadata-related layers
+    try:
+        model.load_state_dict(sd)
+    except Exception as e:
+        print(f'Warning: loading model state dict with best-effort key matching: {e}')
+        target = model.state_dict()
+        for k, v in sd.items():
+            if k in target and v.shape == target[k].shape:
+                target[k] = v
+        model.load_state_dict(target)
+    
     model.eval()
     print(f'Loaded model from {model_path}')
     return model
@@ -172,7 +183,7 @@ def compute_multiscale_features(h_valid: torch.Tensor, n_segments: int = 4) -> t
 
 def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length: int = 16384, 
                            batch_size: int = 32, pooling_mode: str = 'multiscale', 
-                           sample_indices: np.ndarray = None):
+                           sample_indices: np.ndarray = None, use_metadata: bool = False):
     """Extract latent vectors for all light curves in the H5 file.
     
     Args:
@@ -186,10 +197,14 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
             - 'multiscale': multi-scale temporal features (recommended)
             - 'final': use only final hidden states
         sample_indices: specific indices to process (None = all)
+        use_metadata: whether to load and use stellar metadata
     
     Returns:
         Latent vectors array of shape (N, D) where D depends on pooling_mode
     """
+    # Define metadata features (same as in TimeSeriesDataset)
+    metadata_features = ['G_0', 'BP_0', 'RP_0', 'parallax', 'G_0_err', 'BP_0_err', 'RP_0_err', 'parallax_err']
+    
     with h5py.File(h5_path, 'r') as f:
         if sample_indices is not None:
             # Sort indices for efficient HDF5 access
@@ -198,11 +213,43 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
             flux_err_all = f['flux_err'][sorted_indices]
             time_all = f['time'][sorted_indices]
             lengths = f['length'][sorted_indices]
+            # Load metadata if requested
+            if use_metadata and 'metadata' in f:
+                meta_grp = f['metadata']
+                meta_list = []
+                for feat in metadata_features:
+                    if feat in meta_grp:
+                        vals = meta_grp[feat][sorted_indices]
+                        if vals.dtype.kind == 'S':
+                            vals = vals.astype(float)
+                        meta_list.append(vals.astype(np.float32))
+                    else:
+                        meta_list.append(np.zeros(len(sorted_indices), dtype=np.float32))
+                metadata_all = np.stack(meta_list, axis=1)
+                metadata_all = np.nan_to_num(metadata_all, nan=0.0)
+            else:
+                metadata_all = None
         else:
             flux_all = f['flux'][:]
             flux_err_all = f['flux_err'][:]
             time_all = f['time'][:]
             lengths = f['length'][:]
+            # Load metadata if requested
+            if use_metadata and 'metadata' in f:
+                meta_grp = f['metadata']
+                meta_list = []
+                for feat in metadata_features:
+                    if feat in meta_grp:
+                        vals = meta_grp[feat][:]
+                        if vals.dtype.kind == 'S':
+                            vals = vals.astype(float)
+                        meta_list.append(vals.astype(np.float32))
+                    else:
+                        meta_list.append(np.zeros(len(flux_all), dtype=np.float32))
+                metadata_all = np.stack(meta_list, axis=1)
+                metadata_all = np.nan_to_num(metadata_all, nan=0.0)
+            else:
+                metadata_all = None
     
     n_samples = len(lengths)
     latent_vectors = []
@@ -237,8 +284,14 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
             x_in = torch.stack([flux_batch, flux_err_batch], dim=-1)  # (B, L, 2)
             t_in = time_batch.unsqueeze(-1)  # (B, L, 1)
             
+            # Build metadata tensor if available
+            if metadata_all is not None:
+                meta_batch = torch.tensor(metadata_all[start_idx:end_idx], dtype=torch.float32, device=device)
+            else:
+                meta_batch = None
+            
             # Forward pass with return_states=True to get hidden states
-            out = model(x_in, t_in, mask=mask, return_states=True)
+            out = model(x_in, t_in, mask=mask, metadata=meta_batch, return_states=True)
             
             # Get hidden states
             h_fwd = out.get('h_fwd_tensor')  # (B, L, H)
@@ -437,6 +490,8 @@ def main():
                         help='Minimum BPRP0 value (BP-RP color). None = no lower cut.')
     parser.add_argument('--bprp0_max', type=float, default=None,
                         help='Maximum BPRP0 value (BP-RP color). None = no upper cut.')
+    parser.add_argument('--use_metadata', action='store_true',
+                        help='Use stellar metadata (G_0, BP_0, RP_0, parallax + uncertainties) as model input')
     
     args = parser.parse_args()
     
@@ -468,13 +523,15 @@ def main():
             sample_indices = valid_indices[:args.max_samples]
     
     # Load model
+    num_meta_features = 8 if args.use_metadata else 0
     model = load_model(
         args.model_path, 
         args.hidden_size, 
         args.direction, 
         args.mode, 
         args.use_flow, 
-        device
+        device,
+        num_meta_features=num_meta_features
     )
     
     # Extract latent vectors (for all selected samples, no BPRP0 filtering)
@@ -485,7 +542,8 @@ def main():
         max_length=args.max_length,
         batch_size=args.batch_size,
         pooling_mode=args.pooling_mode,
-        sample_indices=sample_indices
+        sample_indices=sample_indices,
+        use_metadata=args.use_metadata
     )
     
     # Load ages and BPRP0 for selected samples

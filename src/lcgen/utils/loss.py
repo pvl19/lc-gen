@@ -11,7 +11,47 @@ def recon_loss(flux, flux_err, recon_flux):
     return nll
 
 
-def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=None, K: int = 128):
+def _generate_k_values(K: int, L: int, spacing: str = 'dense'):
+    """
+    Generate the list of k offset values to use for loss computation.
+    
+    Args:
+        K: maximum horizon
+        L: sequence length
+        spacing: how to space the k values
+            - 'dense': all integers from 1 to K (original behavior)
+            - 'fibonacci': Fibonacci-like spacing for diverse phase coverage
+            - 'log': logarithmically spaced values
+    
+    Returns:
+        List of k values to use
+    """
+    max_k = min(K, L // 2 - 1)  # k must satisfy 2k < L
+    
+    if spacing == 'dense':
+        return list(range(1, max_k + 1))
+    
+    elif spacing == 'fibonacci':
+        # Fibonacci sequence: ratios are irrational, ensuring diverse phase sampling
+        fibs = [1, 2]
+        while fibs[-1] < max_k:
+            fibs.append(fibs[-1] + fibs[-2])
+        return [k for k in fibs if k <= max_k]
+    
+    elif spacing == 'log':
+        # Logarithmically spaced, ~20 values covering the range
+        import numpy as np
+        if max_k <= 1:
+            return [1]
+        n_values = min(20, max_k)
+        log_k = np.logspace(0, np.log10(max_k), n_values)
+        return sorted(set(int(round(k)) for k in log_k if k >= 1))
+    
+    else:
+        raise ValueError(f"Unknown k_spacing: {spacing}. Choose 'dense', 'fibonacci', or 'log'.")
+
+
+def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=None, metadata=None, K: int = 128, k_spacing: str = 'dense'):
     """
     Compute the average NLL loss where each source hidden h_fwd[:, i] predicts up to K
     future targets j = i+1 .. i+K (bounded horizon). For each target j we average the
@@ -35,7 +75,11 @@ def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=
         mask: (B, L) optional mask where 1=observed, 0=masked. If provided,
               predictions are only computed for unmasked targets, and source
               hidden states must come from unmasked positions.
+        metadata: (B, num_meta_features) optional stellar metadata tensor. If provided
+                  and the model has a meta_encoder, the metadata embedding will be
+                  included in the head input (same as in model.forward).
         K: maximum horizon (int)
+        k_spacing: how to space k values - 'dense' (all 1..K), 'fibonacci', or 'log'
 
     Returns:
         loss: scalar tensor (average NLL across targets that have >=1 valid prediction)
@@ -51,7 +95,6 @@ def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=
 
     # We'll compute a global average over ALL valid predictions.
     # Accumulate total NLL and total prediction count.
-    max_k = min(K, L - 1)
     total_preds = 0
     total_sum_nll = torch.tensor(0.0, device=device)
 
@@ -61,9 +104,26 @@ def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=
     # time_scale expected to be a scalar nn.Parameter on the model; if absent
     # we simply won't scale the time slice.
     time_scale = getattr(model, 'time_scale', None)
+    
+    # Compute metadata embedding if available (same as model.forward)
+    meta_encoder = getattr(model, 'meta_encoder', None)
+    meta_input_norm = getattr(model, 'meta_input_norm', None)
+    meta_emb_dim = getattr(model, 'meta_emb_dim', 0)
+    if meta_encoder is not None and metadata is not None:
+        # Apply input normalization if the model has it
+        if meta_input_norm is not None:
+            meta_normed = meta_input_norm(metadata)
+            meta_emb = meta_encoder(meta_normed)  # (B, meta_emb_dim)
+        else:
+            meta_emb = meta_encoder(metadata)  # (B, meta_emb_dim)
+    else:
+        meta_emb = None
 
+    # Generate list of k values based on spacing strategy
+    k_values = _generate_k_values(K, L, k_spacing)
+    
     per_k_mean = {}
-    for k in range(1, max_k + 1):
+    for k in k_values:
         # Symmetric bidirectional offset: predict targets at positions k to L-1-k
         # Forward hidden at j-k (info up to j-k-1), backward hidden at j+k (info from j+k+1)
         # This ensures neither direction sees any data within k steps of the target
@@ -80,18 +140,29 @@ def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=
 
         # prepare inputs for head: concat along last dim. If the model is
         # bidirectional and backward hidden states were provided, build the
-        # same fused input used in `model.forward` (src_f, src_b, t_tgt).
+        # same fused input used in `model.forward` (src_f, src_b, t_tgt, meta_emb).
         if getattr(model, 'direction', None) == 'bi' and h_bwd is not None:
             # Forward hidden at positions 0 to L-2k-1 (predicting k to L-1-k)
             src_f = h_fwd[:, :n_targets, :]
             # Backward hidden at positions 2k to L-1 (info from 2k+1 to L)
             src_b = h_bwd[:, 2*k:, :]
-            inputs_k = torch.cat([src_f, src_b, t_tgt], dim=-1)   # (B, n_targets, 2H+Te)
-            flat_in = inputs_k.view(-1, 2 * H + Te)
+            if meta_emb is not None:
+                # Expand metadata embedding to match n_targets
+                meta_exp = meta_emb.unsqueeze(1).expand(-1, n_targets, -1)  # (B, n_targets, meta_emb_dim)
+                inputs_k = torch.cat([src_f, src_b, t_tgt, meta_exp], dim=-1)   # (B, n_targets, 2H+Te+M)
+                flat_in = inputs_k.view(-1, 2 * H + Te + meta_emb_dim)
+            else:
+                inputs_k = torch.cat([src_f, src_b, t_tgt], dim=-1)   # (B, n_targets, 2H+Te)
+                flat_in = inputs_k.view(-1, 2 * H + Te)
         else:
             h_src = h_fwd[:, :n_targets, :]        # (B, n_targets, H)
-            inputs_k = torch.cat([h_src, t_tgt], dim=-1)   # (B, n_targets, H+Te)
-            flat_in = inputs_k.view(-1, H + Te)           # (B*n_targets, H+Te)
+            if meta_emb is not None:
+                meta_exp = meta_emb.unsqueeze(1).expand(-1, n_targets, -1)
+                inputs_k = torch.cat([h_src, t_tgt, meta_exp], dim=-1)   # (B, n_targets, H+Te+M)
+                flat_in = inputs_k.view(-1, H + Te + meta_emb_dim)
+            else:
+                inputs_k = torch.cat([h_src, t_tgt], dim=-1)   # (B, n_targets, H+Te)
+                flat_in = inputs_k.view(-1, H + Te)           # (B*n_targets, H+Te)
 
         # Apply head normalization and the same time-conditioning used in
         # `model.forward` before calling the head so training/inference match.

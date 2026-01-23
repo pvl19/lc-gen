@@ -6,6 +6,7 @@ import numpy as np
 import h5py
 from pathlib import Path
 from tqdm import tqdm
+import json
 
 
 def convert_to_h5(input_pkl, output_h5, max_length=512):
@@ -25,6 +26,11 @@ def convert_to_h5(input_pkl, output_h5, max_length=512):
     time = lc_data['time']
     flux = lc_data['flux']
     flux_err = lc_data['flux_err']
+    freq = lc_data['frequencies']
+    power = lc_data['powers']
+    f_stat = lc_data['f_stats']
+    acfs = lc_data['acfs']
+    metadata = lc_data['metadatas']
 
     n_samples = len(time)
     print(f"Found {n_samples} light curves")
@@ -56,13 +62,31 @@ def convert_to_h5(input_pkl, output_h5, max_length=512):
             flux_err_data[i, :len(flux_err_i)] = flux_err_i
             # Note: padding positions will be zeros
 
+    # Convert metadata from list of dicts to dict of lists
+    if metadata and isinstance(metadata, list):
+        meta_keys = metadata[0].keys()
+        metadata_dict = {k: [m[k] for m in metadata] for k in meta_keys}
+    else:
+        metadata_dict = metadata if metadata else {}
+
     # Save to HDF5
     print(f"Saving to {output_h5}...")
     with h5py.File(output_h5, 'w') as f:
         f.create_dataset('flux', data=flux_data, compression='gzip')
         f.create_dataset('time', data=time_data, compression='gzip')
         f.create_dataset('flux_err', data=flux_err_data, compression='gzip')
+        f.create_dataset('frequency', data=freq, compression='gzip')
+        f.create_dataset('power', data=power, compression='gzip')
+        f.create_dataset('f_stat', data=f_stat, compression='gzip')
+        f.create_dataset('acf', data=acfs, compression='gzip')
         f.create_dataset('length', data=lengths, compression='gzip')
+        meta_grp = f.create_group('metadata')
+        for k, v in metadata_dict.items():
+            v_arr = np.array(v)
+            # Handle string arrays for HDF5 compatibility
+            if v_arr.dtype.kind == 'U':
+                v_arr = v_arr.astype('S')
+            meta_grp.create_dataset(k, data=v_arr, compression='gzip')
 
         # Metadata
         f.attrs['n_samples'] = n_samples

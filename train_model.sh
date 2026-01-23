@@ -1,15 +1,16 @@
 python src/lcgen/train_simple_rnn.py \
-  --input data/timeseries.h5 \
+  --input data/timeseries_x.h5 \
   --random_seed 19 \
   --direction bi \
-  --max_length 1024 \
-  --num_samples 2048 \
-  --output_name baseline_v17_real_final.pt \
-  --epochs 100 \
+  --max_length 512 \
+  --num_samples 1024 \
+  --output_name baseline_v18_fib_k.pt \
+  --epochs 40 \
   --lr 1e-3 \
   --min_size 5 \
   --max_size 100 \
   --mask_portion 0.4 \
   --use_flow \
   --mode parallel \
-  --K 64
+  --K 128 \
+  --k_spacing fibonacci

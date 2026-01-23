@@ -35,12 +35,21 @@ def train(args):
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     else:
         device = torch.device(args.device)
+    
+    # Print CUDA diagnostics
+    print(f"Using device: {device}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
-    ds = TimeSeriesDataset(args.input, args.random_seed,  args.min_size, args.max_size, args.mask_portion, args.max_length, args.num_samples, args.mock_sinusoid, args.mock_noise)
+    ds = TimeSeriesDataset(args.input, args.random_seed, args.min_size, args.max_size, args.mask_portion, args.max_length, args.num_samples, args.mock_sinusoid, args.mock_noise, use_metadata=args.use_metadata)
     print('Shape of TimeSeriesDataset:', ds.flux.shape)
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
 
-    model = BiDirectionalMinGRU(hidden_size=args.hidden_size, direction=args.direction, mode=args.mode, use_flow=args.use_flow).to(device)
+    # Determine number of metadata features from dataset
+    num_meta_features = ds.num_meta_features if args.use_metadata else 0
+    model = BiDirectionalMinGRU(hidden_size=args.hidden_size, direction=args.direction, mode=args.mode, use_flow=args.use_flow, num_meta_features=num_meta_features).to(device)
     # Ensure the post-LN time scaling parameter is trainable (unfrozen) so it
     # can be fine-tuned during training. This prints its requires_grad status
     # for transparency when the user launches training.
@@ -60,18 +69,21 @@ def train(args):
     step_losses = []            # overall loss per optimizer.step
     per_k_losses = defaultdict(list)  # maps k -> list of mean NLL for that k per step
 
+    import time as time_module
     for epoch in range(args.epochs):
+        epoch_start = time_module.time()
         model.train()
         total_loss = 0.0
         n = 0
         for batch in loader:
             optimizer.zero_grad()
-            # batch is a tuple: (flux, flux_err, time, mask) each shaped (B, L)
-            flux, flux_err, times, mask = batch
+            # batch is a tuple: (flux, flux_err, time, mask, metadata) each shaped (B, L) or (B, num_features)
+            flux, flux_err, times, mask, metadata = batch
             flux = flux.to(device)
             flux_err = flux_err.to(device)
             times = times.to(device)
             mask = mask.to(device)
+            metadata = metadata.to(device) if args.use_metadata else None
 
             # Build input channels [flux, flux_err] -> (B, L, 2)
             x_in = torch.stack([flux, flux_err], dim=-1)
@@ -79,7 +91,7 @@ def train(args):
 
             # Request hidden states for multi-step supervision
             # Pass mask so the model zeros out masked flux/flux_err in RNN input
-            out = model(x_in, t_in, mask=mask, return_states=True)
+            out = model(x_in, t_in, mask=mask, metadata=metadata, return_states=True)
             recon = out['reconstructed']  # (B, L, 1)
 
             # Extract forward/backward hidden states and time encodings
@@ -93,7 +105,8 @@ def train(args):
             # that `model.forward` applies during inference. Also pass h_bwd so
             # bidirectional models can form the same fused head input.
             # Pass mask so loss is only computed on valid (unmasked) predictions.
-            loss, stats, per_k_mean = bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=mask, K=args.K)
+            # Pass metadata so the head can use stellar properties for predictions.
+            loss, stats, per_k_mean = bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=mask, metadata=metadata, K=args.K, k_spacing=args.k_spacing)
 
             loss.backward()
 
@@ -110,7 +123,8 @@ def train(args):
                 per_k_losses[int(k)].append(v)
 
         avg = total_loss / max(1, n)
-        print(f'Epoch {epoch+1}/{args.epochs} - Loss: {avg:.6f}')
+        epoch_time = time_module.time() - epoch_start
+        print(f'Epoch {epoch+1}/{args.epochs} - Loss: {avg:.6f} - Time: {epoch_time:.1f}s')
 
     # Save final model
     outp_model = Path(args.output_dir + '/models/')
@@ -168,6 +182,10 @@ def parse_args():
     p.add_argument('--mock_noise', type=float, default=0.1)
     p.add_argument('--mode', type=str, default='sequential', choices=['sequential', 'parallel'])
     p.add_argument('--K', type=int, default=128)
+    p.add_argument('--k_spacing', type=str, default='dense', choices=['dense', 'fibonacci', 'log'],
+                   help="How to space k offset values: 'dense' (all 1..K), 'fibonacci', or 'log'")
+    p.add_argument('--use_metadata', action='store_true',
+                   help='Use stellar metadata (G_0, BP_0, RP_0, parallax + uncertainties) as model input')
     return p.parse_args()
 
 

@@ -114,7 +114,7 @@ class minGRUCell(nn.Module):
 
 class BiDirectionalMinGRU(nn.Module):
     """Bidirectional minGRU model."""
-    def __init__(self, hidden_size: int = 64, direction: str = "bi", mode: str = "sequential", use_flow: bool = False):
+    def __init__(self, hidden_size: int = 64, direction: str = "bi", mode: str = "sequential", use_flow: bool = False, num_meta_features: int = 8):
         super().__init__()
         self.hidden_size = hidden_size
         self.use_flow = use_flow
@@ -131,18 +131,38 @@ class BiDirectionalMinGRU(nn.Module):
             nn.Linear(num_time_enc_dims, num_time_enc_dims),
         )
 
-        # We'll accept scalar flux + flux_err + mask = time encoding inputs per timestep (2D)
-        self.forward_input_proj = nn.Linear(2 + num_time_enc_dims, hidden_size)
-        self.backward_input_proj = nn.Linear(2 + num_time_enc_dims, hidden_size)
+        # Stellar metadata encoder: [G_0, BP_0, RP_0, parallax, + uncertainties] -> embedding
+        # Projects static stellar properties to a learned representation used at each timestep
+        # Only create metadata layers if num_meta_features > 0
+        self.num_meta_features = num_meta_features
+        if num_meta_features > 0:
+            meta_emb_dim = 32  # embedding dimension for metadata
+            # Layer normalization on input metadata to handle different scales
+            self.meta_input_norm = nn.LayerNorm(num_meta_features)
+            self.meta_encoder = nn.Sequential(
+                nn.Linear(num_meta_features, meta_emb_dim),
+                nn.ReLU(),
+                nn.Linear(meta_emb_dim, meta_emb_dim),
+            )
+        else:
+            meta_emb_dim = 0
+            self.meta_input_norm = None
+            self.meta_encoder = None
+        self.meta_emb_dim = meta_emb_dim
+
+        # We'll accept scalar flux + flux_err + time encoding + metadata embedding per timestep
+        rnn_input_dim = 2 + num_time_enc_dims + meta_emb_dim
+        self.forward_input_proj = nn.Linear(rnn_input_dim, hidden_size)
+        self.backward_input_proj = nn.Linear(rnn_input_dim, hidden_size)
 
         # forward and backward minGRU cells
         self.forward_cell = minGRUCell(hidden_size, hidden_size)
         self.backward_cell = minGRUCell(hidden_size, hidden_size)
 
         if self.direction == 'bi':
-            self.output_size = hidden_size * 2 + num_time_enc_dims
+            self.output_size = hidden_size * 2 + num_time_enc_dims + meta_emb_dim
         else:
-            self.output_size = hidden_size + num_time_enc_dims
+            self.output_size = hidden_size + num_time_enc_dims + meta_emb_dim
         # single LayerNorm for head inputs (defined after output_size)
         self.head_norm = nn.LayerNorm(self.output_size)
         # initialize time_scale to 2.0 to give the time-encoding a larger initial
@@ -169,7 +189,7 @@ class BiDirectionalMinGRU(nn.Module):
             # small NSF: 2 transforms, small hidden networks
             self.flow = zuko.flows.NSF(1, flow_context_dim, transforms=2, hidden_features=[64, 64])
 
-    def forward(self, x, t, mask=None, return_states: bool = False, flow_mode: str = 'mean'):
+    def forward(self, x, t, mask=None, metadata=None, return_states: bool = False, flow_mode: str = 'mean'):
         """Forward pass through the model.
 
         Args:
@@ -177,6 +197,9 @@ class BiDirectionalMinGRU(nn.Module):
             t: (B, L) or (B, L, 1) timestamps
             mask: (B, L) optional mask tensor where 1=observed, 0=masked.
                   Masked positions will have their flux/flux_err zeroed in RNN input.
+            metadata: (B, num_meta_features) optional stellar metadata tensor
+                      [G_0, BP_0, RP_0, parallax, G_0_err, BP_0_err, RP_0_err, parallax_err]
+                      If None, zeros are used.
             return_states: if True, return hidden states and time encodings
             flow_mode: how to produce point predictions when flow head is present.
                 - 'mean': Monte Carlo average of N samples (default, good for reconstruction)
@@ -215,7 +238,19 @@ class BiDirectionalMinGRU(nn.Module):
         t_shifted = t_seq - t0         # (B, L)
         # time_enc expects a last-dim scalar, so restore (...,1)
         t_enc = self.time_enc(t_shifted.unsqueeze(-1))  # (B, L, Te)
-        x = torch.cat([x, t_enc], dim=-1)  # (B, L, 2 + Te)
+
+        # Encode stellar metadata (computed once, used at every timestep)
+        # Only if metadata encoder exists and metadata is provided
+        if self.meta_encoder is not None and metadata is not None:
+            # Normalize metadata to handle different scales (magnitudes, parallax, errors)
+            meta_normed = self.meta_input_norm(metadata)
+            meta_emb = self.meta_encoder(meta_normed)  # (B, meta_emb_dim)
+            # Expand metadata embedding to sequence length for RNN input
+            meta_emb_seq = meta_emb.unsqueeze(1).expand(-1, L, -1)  # (B, L, meta_emb_dim)
+            x = torch.cat([x, t_enc, meta_emb_seq], dim=-1)  # (B, L, 2 + Te + meta_emb_dim)
+        else:
+            meta_emb = None
+            x = torch.cat([x, t_enc], dim=-1)  # (B, L, 2 + Te)
 
         seq_prediction = []
 
@@ -269,17 +304,26 @@ class BiDirectionalMinGRU(nn.Module):
             # Use closest hidden states available from unmasked data at this index
             time_enc_t = t_enc[:, ti, :]
 
-            # Concatenate and predict
+            # Concatenate and predict (include metadata embedding in head input if available)
             if self.direction == 'forward':
                 h_fwd_apply = h_fwd_tensor[:, ti, :]
-                h_bi = torch.cat([h_fwd_apply, time_enc_t], dim=1)
+                if meta_emb is not None:
+                    h_bi = torch.cat([h_fwd_apply, time_enc_t, meta_emb], dim=1)
+                else:
+                    h_bi = torch.cat([h_fwd_apply, time_enc_t], dim=1)
             elif self.direction == 'backward':
                 h_bwd_apply = h_bwd_tensor[:, ti, :]
-                h_bi = torch.cat([h_bwd_apply, time_enc_t], dim=1)
+                if meta_emb is not None:
+                    h_bi = torch.cat([h_bwd_apply, time_enc_t, meta_emb], dim=1)
+                else:
+                    h_bi = torch.cat([h_bwd_apply, time_enc_t], dim=1)
             else:
                 h_fwd_apply = h_fwd_tensor[:, ti, :]
                 h_bwd_apply = h_bwd_tensor[:, ti, :]
-                h_bi = torch.cat([h_fwd_apply, h_bwd_apply, time_enc_t], dim=1)
+                if meta_emb is not None:
+                    h_bi = torch.cat([h_fwd_apply, h_bwd_apply, time_enc_t, meta_emb], dim=1)
+                else:
+                    h_bi = torch.cat([h_fwd_apply, h_bwd_apply, time_enc_t], dim=1)
             # normalize fused vector so time and hidden parts have comparable scale
             h_bi = self.head_norm(h_bi)
             # Apply a learnable scalar to the time-encoding portion AFTER LayerNorm

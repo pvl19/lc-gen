@@ -11,6 +11,7 @@ python scripts/plot_umap_latent.py \
   --direction bi \
   --mode parallel \
   --use_flow \
+  --use_metadata \
   --max_length 2048 \
   --batch_size 32 \
   --n_neighbors 15 \

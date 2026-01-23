@@ -100,5 +100,109 @@
       ],
       "flow_mode": "mean"
     }
+  },
+  {
+    "timestamp": "2026-01-22T14:29:32.176493",
+    "args": {
+      "model_path": "output/simple_rnn/models/baseline_v18_stellar_params.pt",
+      "seq_length": 1024,
+      "output_name": "reconstructions_v18_stellar_params.png",
+      "direction": "bi",
+      "num_examples": 3,
+      "hidden_size": 64,
+      "use_flow": true,
+      "min_size": 5,
+      "max_size": 100,
+      "mask_portion": 0.3,
+      "random_seed": 69,
+      "mock_sinusoid": false,
+      "mock_noise": 0.1,
+      "mode": "parallel",
+      "lags": [
+        1,
+        16,
+        64
+      ],
+      "flow_mode": "mean",
+      "use_metadata": true
+    }
+  },
+  {
+    "timestamp": "2026-01-22T14:30:44.257221",
+    "args": {
+      "model_path": "output/simple_rnn/models/baseline_v18_stellar_params.pt",
+      "seq_length": 1024,
+      "output_name": "reconstructions_v18_stellar_params.png",
+      "direction": "bi",
+      "num_examples": 3,
+      "hidden_size": 64,
+      "use_flow": true,
+      "min_size": 5,
+      "max_size": 100,
+      "mask_portion": 0.3,
+      "random_seed": 69,
+      "mock_sinusoid": false,
+      "mock_noise": 0.1,
+      "mode": "parallel",
+      "lags": [
+        1,
+        16,
+        64
+      ],
+      "flow_mode": "mean",
+      "use_metadata": true
+    }
+  },
+  {
+    "timestamp": "2026-01-22T14:31:32.103893",
+    "args": {
+      "model_path": "output/simple_rnn/models/baseline_v18_stellar_params.pt",
+      "seq_length": 1024,
+      "output_name": "reconstructions_v18_stellar_params.png",
+      "direction": "bi",
+      "num_examples": 3,
+      "hidden_size": 64,
+      "use_flow": true,
+      "min_size": 5,
+      "max_size": 100,
+      "mask_portion": 0.3,
+      "random_seed": 69,
+      "mock_sinusoid": false,
+      "mock_noise": 0.1,
+      "mode": "parallel",
+      "lags": [
+        1,
+        16,
+        64
+      ],
+      "flow_mode": "mean",
+      "use_metadata": true
+    }
+  },
+  {
+    "timestamp": "2026-01-22T14:44:08.551171",
+    "args": {
+      "model_path": "output/simple_rnn/models/baseline_v18_stellar_params.pt",
+      "seq_length": 1024,
+      "output_name": "reconstructions_v18_stellar_params.png",
+      "direction": "bi",
+      "num_examples": 3,
+      "hidden_size": 64,
+      "use_flow": true,
+      "min_size": 5,
+      "max_size": 100,
+      "mask_portion": 0.3,
+      "random_seed": 69,
+      "mock_sinusoid": false,
+      "mock_noise": 0.1,
+      "mode": "parallel",
+      "lags": [
+        1,
+        16,
+        64
+      ],
+      "flow_mode": "mean",
+      "use_metadata": true
+    }
   }
 ]
