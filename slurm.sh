@@ -8,9 +8,9 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --gpus=1
-#SBATCH --time=00:30:00
-#SBATCH --output=lcgen-%j.out
-#SBATCH --error=lcgen-%j.err
+#SBATCH --time=12:00:00
+#SBATCH --output=slurm_logs/lcgen-%j.out
+#SBATCH --error=slurm_logs/lcgen-%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=pvanlane@ucsd.edu
 
@@ -68,19 +68,19 @@ time -p singularity exec --bind /expanse,/scratch --nv \
         --output_dir output \
         --random_seed 19 \
         --direction bi \
-        --max_length 16384 \
+        --max_length 8192 \
         --num_samples 10000 \
-        --batch_size 2048 \
-        --output_name smoke_test_meta.pt \
+        --batch_size 32 \
+        --output_name meta_smoke.pt \
         --epochs 2 \
         --lr 1e-3 \
         --min_size 5 \
-        --max_size 1024 \
+        --max_size 512 \
         --mask_portion 0.4 \
         --use_flow \
         --use_metadata \
         --mode parallel \
-        --K 8192 \
+        --K 4096 \
         --k_spacing fibonacci
 
 echo "========================================"

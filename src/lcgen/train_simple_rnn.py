@@ -190,9 +190,19 @@ def parse_args():
 
 
 if __name__ == '__main__':
+    import sys
     args = parse_args()
     log_run_args(args, log_file='output/simple_rnn/logs/train_model_log.json')
     start = datetime.datetime.now()
-    train(args)
+    try:
+        print("Run arguments:")
+        for k, v in vars(args).items():
+            print(f"  {k}: {v}")
+        train(args)
+    except Exception as e:
+        print(f"ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
     end = datetime.datetime.now()
     print('Total training time:', end - start)
