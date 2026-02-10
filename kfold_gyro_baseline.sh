@@ -5,7 +5,7 @@
 # Example: ./kfold_gyro_baseline.sh v1
 
 VERSION=${1:-"default"}
-OUTPUT_DIR="output/age_predictor/gyro_baseline_${VERSION}"
+OUTPUT_DIR="output/age_predictor/gyro_baseline_init_slurm_comp"
 
 echo "Running gyro baseline k-fold with version: ${VERSION}"
 echo "Output directory: ${OUTPUT_DIR}"

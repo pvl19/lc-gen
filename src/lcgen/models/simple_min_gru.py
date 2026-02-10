@@ -114,12 +114,13 @@ class minGRUCell(nn.Module):
 
 class BiDirectionalMinGRU(nn.Module):
     """Bidirectional minGRU model."""
-    def __init__(self, hidden_size: int = 64, direction: str = "bi", mode: str = "sequential", use_flow: bool = False, num_meta_features: int = 8):
+    def __init__(self, hidden_size: int = 64, direction: str = "bi", mode: str = "sequential", use_flow: bool = False, num_meta_features: int = 8, use_conv_channels: bool = False, conv_config: dict = None):
         super().__init__()
         self.hidden_size = hidden_size
         self.use_flow = use_flow
         self.direction = direction
         self.mode = mode
+        self.use_conv_channels = use_conv_channels
 
         num_time_enc_dims = 8
         self.num_time_enc_dims = num_time_enc_dims
@@ -150,8 +151,100 @@ class BiDirectionalMinGRU(nn.Module):
             self.meta_encoder = None
         self.meta_emb_dim = meta_emb_dim
 
-        # We'll accept scalar flux + flux_err + time encoding + metadata embedding per timestep
-        rnn_input_dim = 2 + num_time_enc_dims + meta_emb_dim
+        # Convolutional encoders for power spectra and ACF
+        # These encode global frequency-domain features of the light curve
+        if use_conv_channels:
+            # Default conv config if not provided
+            if conv_config is None:
+                conv_config = {
+                    'encoder_type': 'lightweight',  # 'lightweight' or 'unet'
+                    'hidden_channels': 16,
+                    'num_layers': 3,
+                    'activation': 'gelu'
+                }
+
+            encoder_type = conv_config.get('encoder_type', 'lightweight')
+
+            if encoder_type == 'lightweight':
+                # Use fast lightweight encoder (recommended)
+                from .lightweight_conv import LightweightConv1DEncoder
+
+                # Encoder for power spectrum + f-statistic (2 channels)
+                self.ps_encoder = LightweightConv1DEncoder(
+                    in_channels=2,
+                    hidden_channels=conv_config.get('hidden_channels', 16),
+                    num_layers=conv_config.get('num_layers', 3),
+                    activation=conv_config.get('activation', 'gelu')
+                )
+
+                # Encoder for autocorrelation function (1 channel)
+                self.acf_encoder = LightweightConv1DEncoder(
+                    in_channels=1,
+                    hidden_channels=conv_config.get('hidden_channels', 16),
+                    num_layers=conv_config.get('num_layers', 3),
+                    activation=conv_config.get('activation', 'gelu')
+                )
+
+                conv_bottleneck_channels = self.ps_encoder.output_channels
+
+            else:
+                # Use UNet encoder (slower but more expressive)
+                from .conv_models import PowerSpectrumUNetEncoder
+
+                # Create config object
+                class ConvArgs:
+                    def __init__(self, **kwargs):
+                        for k, v in kwargs.items():
+                            setattr(self, k, v)
+
+                # Encoder for power spectrum + f-statistic (2 channels)
+                conv_args_ps = ConvArgs(
+                    input_length=conv_config.get('input_length', 16000),
+                    encoder_dims=conv_config.get('encoder_dims', [4, 8, 16, 32]),
+                    num_layers=conv_config.get('num_layers', 4),
+                    activation=conv_config.get('activation', 'gelu'),
+                    in_channels=2
+                )
+                self.ps_encoder = PowerSpectrumUNetEncoder(conv_args_ps)
+
+                # Encoder for autocorrelation function (1 channel)
+                conv_args_acf = ConvArgs(
+                    input_length=conv_config.get('input_length', 16000),
+                    encoder_dims=conv_config.get('encoder_dims', [4, 8, 16, 32]),
+                    num_layers=conv_config.get('num_layers', 4),
+                    activation=conv_config.get('activation', 'gelu'),
+                    in_channels=1
+                )
+                self.acf_encoder = PowerSpectrumUNetEncoder(conv_args_acf)
+
+                conv_bottleneck_channels = conv_config['encoder_dims'][-1]
+
+            # Use global average pooling on the bottleneck to get one value per channel
+            # This reduces [batch, channels, spatial] -> [batch, channels] via mean pooling
+            # Much more efficient than flattening all spatial features!
+
+            # Project pooled conv outputs to embedding dimension (per channel)
+            conv_emb_dim = 32  # embedding dimension for each conv channel
+            self.ps_conv_proj = nn.Sequential(
+                nn.Linear(conv_bottleneck_channels, conv_emb_dim),
+                nn.ReLU(),
+                nn.Linear(conv_emb_dim, conv_emb_dim)
+            )
+            self.acf_conv_proj = nn.Sequential(
+                nn.Linear(conv_bottleneck_channels, conv_emb_dim),
+                nn.ReLU(),
+                nn.Linear(conv_emb_dim, conv_emb_dim)
+            )
+            self.conv_emb_dim = conv_emb_dim * 2  # Total conv embedding size (PS + ACF)
+        else:
+            self.ps_encoder = None
+            self.acf_encoder = None
+            self.ps_conv_proj = None
+            self.acf_conv_proj = None
+            self.conv_emb_dim = 0
+
+        # We'll accept scalar flux + flux_err + time encoding + metadata embedding + conv embeddings per timestep
+        rnn_input_dim = 2 + num_time_enc_dims + meta_emb_dim + self.conv_emb_dim
         self.forward_input_proj = nn.Linear(rnn_input_dim, hidden_size)
         self.backward_input_proj = nn.Linear(rnn_input_dim, hidden_size)
 
@@ -189,7 +282,7 @@ class BiDirectionalMinGRU(nn.Module):
             # small NSF: 2 transforms, small hidden networks
             self.flow = zuko.flows.NSF(1, flow_context_dim, transforms=2, hidden_features=[64, 64])
 
-    def forward(self, x, t, mask=None, metadata=None, return_states: bool = False, flow_mode: str = 'mean'):
+    def forward(self, x, t, mask=None, metadata=None, conv_data=None, return_states: bool = False, flow_mode: str = 'mean'):
         """Forward pass through the model.
 
         Args:
@@ -200,6 +293,11 @@ class BiDirectionalMinGRU(nn.Module):
             metadata: (B, num_meta_features) optional stellar metadata tensor
                       [G_0, BP_0, RP_0, parallax, G_0_err, BP_0_err, RP_0_err, parallax_err]
                       If None, zeros are used.
+            conv_data: dict with optional convolutional inputs:
+                      - 'power': (B, freq_length) power spectrum
+                      - 'f_stat': (B, freq_length) f-statistic
+                      - 'acf': (B, freq_length) autocorrelation function
+                      If None or use_conv_channels=False, zeros are used.
             return_states: if True, return hidden states and time encodings
             flow_mode: how to produce point predictions when flow head is present.
                 - 'mean': Monte Carlo average of N samples (default, good for reconstruction)
@@ -247,10 +345,54 @@ class BiDirectionalMinGRU(nn.Module):
             meta_emb = self.meta_encoder(meta_normed)  # (B, meta_emb_dim)
             # Expand metadata embedding to sequence length for RNN input
             meta_emb_seq = meta_emb.unsqueeze(1).expand(-1, L, -1)  # (B, L, meta_emb_dim)
-            x = torch.cat([x, t_enc, meta_emb_seq], dim=-1)  # (B, L, 2 + Te + meta_emb_dim)
         else:
             meta_emb = None
-            x = torch.cat([x, t_enc], dim=-1)  # (B, L, 2 + Te)
+            meta_emb_seq = None
+
+        # Encode convolutional channels (power spectrum + f-stat, and ACF)
+        # These provide global frequency-domain context for the light curve
+        if self.use_conv_channels and conv_data is not None:
+            # Encode power spectrum + f-statistic
+            if 'power' in conv_data and 'f_stat' in conv_data:
+                power = conv_data['power']  # (B, freq_length)
+                f_stat = conv_data['f_stat']  # (B, freq_length)
+
+                # Stack as 2-channel input: (B, 2, freq_length)
+                ps_input = torch.stack([power, f_stat], dim=1)
+                ps_result = self.ps_encoder(ps_input)  # Can be tensor or tuple
+                ps_encoded = ps_result[0] if isinstance(ps_result, tuple) else ps_result
+                # Apply global average pooling: (B, channels, spatial) -> (B, channels)
+                ps_pooled = ps_encoded.mean(dim=-1)  # Much more efficient than flattening!
+                ps_emb = self.ps_conv_proj(ps_pooled)  # (B, conv_emb_dim/2)
+            else:
+                ps_emb = torch.zeros(B, self.conv_emb_dim // 2, device=x.device)
+
+            # Encode autocorrelation function
+            if 'acf' in conv_data:
+                acf = conv_data['acf']  # (B, freq_length)
+                acf_result = self.acf_encoder(acf)  # Can be tensor or tuple
+                acf_encoded = acf_result[0] if isinstance(acf_result, tuple) else acf_result
+                # Apply global average pooling: (B, channels, spatial) -> (B, channels)
+                acf_pooled = acf_encoded.mean(dim=-1)
+                acf_emb = self.acf_conv_proj(acf_pooled)  # (B, conv_emb_dim/2)
+            else:
+                acf_emb = torch.zeros(B, self.conv_emb_dim // 2, device=x.device)
+
+            # Combine both conv embeddings
+            conv_emb = torch.cat([ps_emb, acf_emb], dim=-1)  # (B, conv_emb_dim)
+            # Expand to sequence length for RNN input
+            conv_emb_seq = conv_emb.unsqueeze(1).expand(-1, L, -1)  # (B, L, conv_emb_dim)
+        else:
+            conv_emb = None
+            conv_emb_seq = None
+
+        # Concatenate all embeddings to RNN input
+        x_parts = [x, t_enc]
+        if meta_emb_seq is not None:
+            x_parts.append(meta_emb_seq)
+        if conv_emb_seq is not None:
+            x_parts.append(conv_emb_seq)
+        x = torch.cat(x_parts, dim=-1)  # (B, L, 2 + Te + meta_emb_dim + conv_emb_dim)
 
         seq_prediction = []
 
@@ -304,26 +446,27 @@ class BiDirectionalMinGRU(nn.Module):
             # Use closest hidden states available from unmasked data at this index
             time_enc_t = t_enc[:, ti, :]
 
-            # Concatenate and predict (include metadata embedding in head input if available)
+            # Concatenate and predict (include metadata in head input if available)
+            # Note: conv embeddings only affect RNN hidden state, not head input directly
             if self.direction == 'forward':
                 h_fwd_apply = h_fwd_tensor[:, ti, :]
+                h_parts = [h_fwd_apply, time_enc_t]
                 if meta_emb is not None:
-                    h_bi = torch.cat([h_fwd_apply, time_enc_t, meta_emb], dim=1)
-                else:
-                    h_bi = torch.cat([h_fwd_apply, time_enc_t], dim=1)
+                    h_parts.append(meta_emb)
+                h_bi = torch.cat(h_parts, dim=1)
             elif self.direction == 'backward':
                 h_bwd_apply = h_bwd_tensor[:, ti, :]
+                h_parts = [h_bwd_apply, time_enc_t]
                 if meta_emb is not None:
-                    h_bi = torch.cat([h_bwd_apply, time_enc_t, meta_emb], dim=1)
-                else:
-                    h_bi = torch.cat([h_bwd_apply, time_enc_t], dim=1)
+                    h_parts.append(meta_emb)
+                h_bi = torch.cat(h_parts, dim=1)
             else:
                 h_fwd_apply = h_fwd_tensor[:, ti, :]
                 h_bwd_apply = h_bwd_tensor[:, ti, :]
+                h_parts = [h_fwd_apply, h_bwd_apply, time_enc_t]
                 if meta_emb is not None:
-                    h_bi = torch.cat([h_fwd_apply, h_bwd_apply, time_enc_t, meta_emb], dim=1)
-                else:
-                    h_bi = torch.cat([h_fwd_apply, h_bwd_apply, time_enc_t], dim=1)
+                    h_parts.append(meta_emb)
+                h_bi = torch.cat(h_parts, dim=1)
             # normalize fused vector so time and hidden parts have comparable scale
             h_bi = self.head_norm(h_bi)
             # Apply a learnable scalar to the time-encoding portion AFTER LayerNorm

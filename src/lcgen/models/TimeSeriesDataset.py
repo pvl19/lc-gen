@@ -26,13 +26,14 @@ METADATA_FEATURES = [
 
 
 class TimeSeriesDataset(Dataset):
-    def __init__(self, h5path, random_seed, min_size, max_size, mask_portion, max_length=16384, num_samples=None, mock_sinusoid=False, mock_noise=0.1, use_metadata=False, metadata_features=None):
+    def __init__(self, h5path, random_seed, min_size, max_size, mask_portion, max_length=16384, num_samples=None, mock_sinusoid=False, mock_noise=0.1, use_metadata=False, metadata_features=None, use_conv_channels=False):
         self.min_size = min_size
         self.max_size = max_size
         self.mask_portion = mask_portion
         self.rng = np.random.default_rng(random_seed)
         self.mock_noise = mock_noise
         self.use_metadata = use_metadata
+        self.use_conv_channels = use_conv_channels
         self.metadata_features = metadata_features or METADATA_FEATURES
         self.num_meta_features = len(self.metadata_features)
         
@@ -61,6 +62,31 @@ class TimeSeriesDataset(Dataset):
                             self.metadata = None
                 else:
                     self.metadata = None
+
+                # Load convolutional channel data (power spectra, f-stat, ACF)
+                if use_conv_channels:
+                    with h5py.File(h5path, 'r') as f:
+                        if 'power' in f and 'f_stat' in f and 'acf' in f:
+                            full_power = f['power'][:]
+                            full_f_stat = f['f_stat'][:]
+                            full_acf = f['acf'][:]
+                            if sample_indices is not None:
+                                self.power = full_power[sample_indices]
+                                self.f_stat = full_f_stat[sample_indices]
+                                self.acf = full_acf[sample_indices]
+                            else:
+                                self.power = full_power[:len(self.flux)]
+                                self.f_stat = full_f_stat[:len(self.flux)]
+                                self.acf = full_acf[:len(self.flux)]
+                        else:
+                            print("Warning: Conv channel data (power/f_stat/acf) not found in HDF5 file")
+                            self.power = None
+                            self.f_stat = None
+                            self.acf = None
+                else:
+                    self.power = None
+                    self.f_stat = None
+                    self.acf = None
             else:
                 with h5py.File(h5path, 'r') as f:
                     self.flux = f['flux'][:]
@@ -77,10 +103,29 @@ class TimeSeriesDataset(Dataset):
                         self.metadata = self._load_metadata_from_h5(meta_grp, len(self.flux))
                     else:
                         self.metadata = None
+                    # Load convolutional channel data
+                    if use_conv_channels:
+                        if 'power' in f and 'f_stat' in f and 'acf' in f:
+                            self.power = f['power'][:]
+                            self.f_stat = f['f_stat'][:]
+                            self.acf = f['acf'][:]
+                        else:
+                            print("Warning: Conv channel data (power/f_stat/acf) not found in HDF5 file")
+                            self.power = None
+                            self.f_stat = None
+                            self.acf = None
+                    else:
+                        self.power = None
+                        self.f_stat = None
+                        self.acf = None
             self.flux = np.asarray(self.flux, dtype=np.float32)
             self.time = np.asarray(self.time, dtype=np.float32)
             self.flux_err = np.asarray(self.flux_err, dtype=np.float32)
             self.lengths = np.asarray(self.lengths, dtype=np.int32)
+            if use_conv_channels and self.power is not None:
+                self.power = np.asarray(self.power, dtype=np.float32)
+                self.f_stat = np.asarray(self.f_stat, dtype=np.float32)
+                self.acf = np.asarray(self.acf, dtype=np.float32)
         else:
             # Fall back to a synthetic dataset if file is missing (small and fast).
             print(f'Warning: {h5path} not found. Using synthetic data for smoke test.')
@@ -91,6 +136,15 @@ class TimeSeriesDataset(Dataset):
             self.time = np.random.randn(N, L).astype(np.float32)
             self.lengths = np.full(N, L, dtype=np.int32)  # All positions valid for synthetic
             self.metadata = None
+            # Synthetic conv data
+            if use_conv_channels:
+                self.power = np.random.randn(N, 16000).astype(np.float32)
+                self.f_stat = np.random.randn(N, 16000).astype(np.float32)
+                self.acf = np.random.randn(N, 16000).astype(np.float32)
+            else:
+                self.power = None
+                self.f_stat = None
+                self.acf = None
         if mock_sinusoid:
             # Generate a mock sinusoidal dataset
             for i in range(len(self.flux)):
@@ -133,25 +187,36 @@ class TimeSeriesDataset(Dataset):
 
     def _generate_block_mask(self, L):
         """Generate a random block mask for a single sample.
-        
+
+        Block sizes are sampled from a log-uniform distribution between min_size and max_size,
+        which gives more smaller blocks and fewer larger blocks.
+
         Args:
             L: sequence length
-            
+
         Returns:
             mask: np.ndarray of shape (L,) with 1=observed, 0=masked
         """
         if self.mask_portion <= 0:
             return np.ones(L, dtype=np.float32)
-        
+
         mask = np.ones(L, dtype=np.float32)
         total_mask_size = int(L * self.mask_portion)
-        
+
         if total_mask_size == 0:
             return mask
-            
+
         masked_so_far = 0
         while masked_so_far < total_mask_size:
-            block_size = self.rng.integers(self.min_size, self.max_size + 1)
+            # Sample block size from log-uniform distribution
+            # This favors smaller blocks (more small blocks, fewer large blocks)
+            log_min = np.log10(self.min_size)
+            log_max = np.log10(self.max_size)
+            log_size = self.rng.uniform(log_min, log_max)
+            block_size = int(round(10 ** log_size))
+            # Clamp to valid range [min_size, max_size]
+            block_size = max(self.min_size, min(block_size, self.max_size))
+
             if masked_so_far + block_size > total_mask_size:
                 block_size = total_mask_size - masked_so_far
             if block_size <= 0:
@@ -162,7 +227,7 @@ class TimeSeriesDataset(Dataset):
             start_idx = self.rng.integers(0, max_start + 1)
             mask[start_idx:start_idx + block_size] = 0.0
             masked_so_far += block_size
-        
+
         return mask
 
     def __getitem__(self, idx):
@@ -171,24 +236,35 @@ class TimeSeriesDataset(Dataset):
         time = self.time[idx]
         L = len(flux)
         actual_length = self.lengths[idx]
-        
+
         # Generate a fresh random mask for this sample
         mask = self._generate_block_mask(L)
-        
+
         # Create padding mask: 1 for real data, 0 for padding
         padding_mask = np.zeros(L, dtype=np.float32)
         padding_mask[:actual_length] = 1.0
-        
+
         # Combine random mask with padding mask (both must be 1 for position to be valid)
         combined_mask = mask * padding_mask
-        
+
         # Get metadata if available
         if self.use_metadata and self.metadata is not None:
             meta = self.metadata[idx]
         else:
             meta = np.zeros(self.num_meta_features, dtype=np.float32)
-        
-        return [flux, flux_err, time, combined_mask, meta]
+
+        # Get convolutional channel data if available
+        if self.use_conv_channels and self.power is not None:
+            power = self.power[idx]
+            f_stat = self.f_stat[idx]
+            acf = self.acf[idx]
+        else:
+            # Return empty arrays if not using conv channels
+            power = np.zeros(0, dtype=np.float32)
+            f_stat = np.zeros(0, dtype=np.float32)
+            acf = np.zeros(0, dtype=np.float32)
+
+        return [flux, flux_err, time, combined_mask, meta, power, f_stat, acf]
     
     def apply_block_mask(self, min_size, max_size, mask_portion):
         """
@@ -248,10 +324,14 @@ class TimeSeriesDataset(Dataset):
 def collate_fn(batch):
     """Collate list of samples into batched tensors.
 
-    Each item in batch is [flux, flux_err, time, mask, metadata] where flux/flux_err/time/mask
-    are 1D numpy arrays of length L, and metadata is a 1D array of stellar features.
-    Return a tuple of torch.FloatTensors: (flux, flux_err, time, mask, metadata)
-    with shapes (B, L) for time series and (B, num_meta_features) for metadata.
+    Each item in batch is [flux, flux_err, time, mask, metadata, power, f_stat, acf]
+    where flux/flux_err/time/mask are 1D numpy arrays of length L,
+    metadata is a 1D array of stellar features,
+    and power/f_stat/acf are 1D arrays of frequency-domain features.
+
+    Return a tuple of torch.FloatTensors: (flux, flux_err, time, mask, metadata, conv_data)
+    with shapes (B, L) for time series, (B, num_meta_features) for metadata,
+    and conv_data is a dict with power/f_stat/acf of shape (B, freq_length) or None.
     """
     fluxes = np.stack([b[0] for b in batch], axis=0).astype(np.float32)
     flux_errs = np.stack([b[1] for b in batch], axis=0).astype(np.float32)
@@ -259,4 +339,19 @@ def collate_fn(batch):
     masks = np.stack([b[3] for b in batch], axis=0).astype(np.float32)
     metadata = np.stack([b[4] for b in batch], axis=0).astype(np.float32)
 
-    return (torch.from_numpy(fluxes), torch.from_numpy(flux_errs), torch.from_numpy(times), torch.from_numpy(masks), torch.from_numpy(metadata))
+    # Check if conv data is present (non-empty arrays)
+    if len(batch[0][5]) > 0:
+        power = np.stack([b[5] for b in batch], axis=0).astype(np.float32)
+        f_stat = np.stack([b[6] for b in batch], axis=0).astype(np.float32)
+        acf = np.stack([b[7] for b in batch], axis=0).astype(np.float32)
+        conv_data = {
+            'power': torch.from_numpy(power),
+            'f_stat': torch.from_numpy(f_stat),
+            'acf': torch.from_numpy(acf)
+        }
+    else:
+        conv_data = None
+
+    return (torch.from_numpy(fluxes), torch.from_numpy(flux_errs),
+            torch.from_numpy(times), torch.from_numpy(masks),
+            torch.from_numpy(metadata), conv_data)

@@ -59,26 +59,32 @@ def load_data_fresh(model_path: str, h5_path: str, pickle_path: str, csv_path: s
                     max_length: int, batch_size: int, pooling_mode: str,
                     max_samples: int = None, stratify_by_age: bool = False,
                     n_age_bins: int = 20, bprp0_min: float = None, bprp0_max: float = None,
+                    use_metadata: bool = False, use_conv_channels: bool = False,
+                    conv_config: dict = None, require_prot: bool = False,
                     device: torch.device = None):
     """Extract latent vectors from the model."""
     from plot_umap_latent import (
         load_model, extract_latent_vectors, load_ages, get_stratified_indices
     )
-    
+
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+
     # Determine which samples to use
     sample_indices = None
-    all_ages, all_bprp0, _ = load_ages(pickle_path, csv_path, sample_indices=None)
-    
-    # Apply BPRP0 cuts
+    all_ages, all_bprp0, _, all_prot = load_ages(pickle_path, csv_path, sample_indices=None)
+
+    # Apply BPRP0 cuts and optional Prot requirement
     valid_mask = ~np.isnan(all_ages) & ~np.isnan(all_bprp0)
     if bprp0_min is not None:
         valid_mask &= (all_bprp0 >= bprp0_min)
     if bprp0_max is not None:
         valid_mask &= (all_bprp0 <= bprp0_max)
-    
+    if require_prot:
+        valid_mask &= (~np.isnan(all_prot) & (all_prot > 0))
+        n_with_prot = np.sum(~np.isnan(all_prot) & (all_prot > 0))
+        print(f'Filtering to stars with rotation periods: {n_with_prot} stars have valid Prot')
+
     if max_samples is not None:
         if stratify_by_age:
             ages_for_stratify = np.where(valid_mask, all_ages, np.nan)
@@ -88,22 +94,43 @@ def load_data_fresh(model_path: str, h5_path: str, pickle_path: str, csv_path: s
             sample_indices = valid_indices[:max_samples]
     else:
         sample_indices = np.where(valid_mask)[0]
-    
+
+    # Determine number of metadata features
+    num_meta_features = 8 if use_metadata else 0
+
+    # Filter sample_indices to only include valid HDF5 indices
+    if sample_indices is not None:
+        import h5py
+        with h5py.File(h5_path, 'r') as f:
+            h5_size = len(f['flux'])
+        valid_mask = sample_indices < h5_size
+        if not np.all(valid_mask):
+            n_invalid = np.sum(~valid_mask)
+            print(f'Warning: {n_invalid} sample indices exceed HDF5 size ({h5_size}). Filtering to valid indices.')
+            sample_indices = sample_indices[valid_mask]
+
     # Load model and extract latents
-    model = load_model(model_path, hidden_size, direction, mode, use_flow, device)
+    model = load_model(model_path, hidden_size, direction, mode, use_flow, device,
+                      num_meta_features=num_meta_features,
+                      use_conv_channels=use_conv_channels,
+                      conv_config=conv_config)
     latent_vectors = extract_latent_vectors(
-        model, h5_path, device, max_length, batch_size, pooling_mode, sample_indices
+        model, h5_path, device, max_length, batch_size, pooling_mode, sample_indices,
+        use_metadata=use_metadata, use_conv_channels=use_conv_channels
     )
-    
-    # Load ages and BPRP0 for selected samples
-    ages, bprp0, tic_ids = load_ages(pickle_path, csv_path, sample_indices)
-    
-    # Filter to valid ages and BPRP0
+
+    # Load ages, BPRP0, and Prot for selected samples
+    ages, bprp0, tic_ids, prot = load_ages(pickle_path, csv_path, sample_indices)
+
+    # Filter to valid ages and BPRP0 (and optionally Prot)
     valid_mask = ~np.isnan(ages) & ~np.isnan(bprp0)
+    if require_prot:
+        valid_mask &= (~np.isnan(prot) & (prot > 0))
     latent_vectors = latent_vectors[valid_mask]
     ages = ages[valid_mask]
     bprp0 = bprp0[valid_mask]
     tic_ids = tic_ids[valid_mask]
+    prot = prot[valid_mask]
     
     print(f"Extracted {len(latent_vectors)} samples with valid ages and BPRP0")
     print(f"Latent dimension: {latent_vectors.shape[1]}")
@@ -420,6 +447,10 @@ def main():
     parser.add_argument('--direction', type=str, default='bi', choices=['forward', 'backward', 'bi'])
     parser.add_argument('--mode', type=str, default='parallel', choices=['sequential', 'parallel'])
     parser.add_argument('--use_flow', action='store_true', help='Whether RNN uses flow head')
+    parser.add_argument('--use_metadata', action='store_true', help='Use stellar metadata (G_0, BP_0, RP_0, parallax + uncertainties) as model input')
+    parser.add_argument('--use_conv_channels', action='store_true', help='Use convolutional encoders for power spectrum, f-statistic, and ACF as additional model input')
+    parser.add_argument('--conv_encoder_type', type=str, default='unet', choices=['lightweight', 'unet'],
+                       help="Conv encoder architecture: 'unet' (default, richer but slower) or 'lightweight' (faster but simpler)")
     parser.add_argument('--max_length', type=int, default=2048, help='Max sequence length')
     parser.add_argument('--pooling_mode', type=str, default='mean', choices=['mean', 'multiscale', 'final'])
     
@@ -429,6 +460,7 @@ def main():
     parser.add_argument('--n_age_bins', type=int, default=20, help='Number of age bins for stratification')
     parser.add_argument('--bprp0_min', type=float, default=None, help='Min BPRP0 cut')
     parser.add_argument('--bprp0_max', type=float, default=None, help='Max BPRP0 cut')
+    parser.add_argument('--require_prot', action='store_true', help='Only use stars with valid rotation periods (for fair comparison with gyro baseline)')
     
     # K-fold settings
     parser.add_argument('--n_folds', type=int, default=10, help='Number of folds')
@@ -452,7 +484,26 @@ def main():
     
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
+    # Build conv_config if using convolutional channels
+    conv_config = None
+    if args.use_conv_channels:
+        if args.conv_encoder_type == 'lightweight':
+            conv_config = {
+                'encoder_type': 'lightweight',
+                'hidden_channels': 16,
+                'num_layers': 3,
+                'activation': 'gelu'
+            }
+        else:  # unet
+            conv_config = {
+                'encoder_type': 'unet',
+                'input_length': 16000,
+                'encoder_dims': [4, 8, 16, 32],
+                'num_layers': 4,
+                'activation': 'gelu'
+            }
+
     # Extract latent vectors
     print("\n=== Extracting latent vectors ===")
     latent_vectors, ages, bprp0, tic_ids = load_data_fresh(
@@ -472,6 +523,10 @@ def main():
         n_age_bins=args.n_age_bins,
         bprp0_min=args.bprp0_min,
         bprp0_max=args.bprp0_max,
+        use_metadata=args.use_metadata,
+        use_conv_channels=args.use_conv_channels,
+        conv_config=conv_config,
+        require_prot=args.require_prot,
         device=device,
     )
     

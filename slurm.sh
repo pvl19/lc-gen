@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=lcgen-train-01
+# SLURM training script with checkpoint resume support
+#
+# To resume from a previous checkpoint:
+#   1. Set RESUME_FROM variable below (line 26) to point to your checkpoint
+#   2. Update --epochs to your new target (e.g., 50 or 100)
+#   3. Training will continue from where it left off
+#
+#SBATCH --job-name=lcgen-base-single-k-cont
 #### Change account below
 #SBATCH --account=csd902
 #SBATCH --partition=gpu-shared
@@ -8,7 +15,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --gpus=1
-#SBATCH --time=12:00:00
+#SBATCH --time=08:00:00
 #SBATCH --output=slurm_logs/lcgen-%j.out
 #SBATCH --error=slurm_logs/lcgen-%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -17,7 +24,14 @@
 #### Define paths
 PROJECT_DIR="$HOME/lcgen"
 SCRATCH_DIR="/scratch/$USER/job_$SLURM_JOBID"
-OUTPUT_DIR="$PROJECT_DIR/output"
+OUTPUT_DIR="$PROJECT_DIR/output/$SLURM_JOBID-$SLURM_JOB_NAME"
+
+#### OPTIONAL: Set to resume training from a previous checkpoint
+#### Recommended: Use checkpoints/resume/model.pt (see EXPANSE_FOLDER_STRUCTURE.md)
+#### Example: RESUME_FROM="checkpoints/resume/model.pt"
+#### Or direct path: RESUME_FROM="output/46136857-lcgen-baseline-metadata-xchannels/baseline_metadata_xchannels.pt"
+#### Leave empty ("") for fresh training
+RESUME_FROM="checkpoints/resume/model.pt"
 
 declare -xr SINGULARITY_MODULE='singularitypro/3.11'
 
@@ -38,10 +52,19 @@ mkdir -p $SCRATCH_DIR
 cp -r $PROJECT_DIR/data $SCRATCH_DIR/
 cp -r $PROJECT_DIR/src $SCRATCH_DIR/
 
-#### Create output directory on scratch
-mkdir -p $SCRATCH_DIR/output/models
-mkdir -p $SCRATCH_DIR/output/logs
-mkdir -p $SCRATCH_DIR/output/training_loss
+#### Copy checkpoint if resuming from previous training
+if [ -n "$RESUME_FROM" ]; then
+    CHECKPOINT_DIR=$(dirname "$PROJECT_DIR/$RESUME_FROM")
+    CHECKPOINT_NAME=$(basename "$RESUME_FROM")
+    mkdir -p $SCRATCH_DIR/checkpoint
+    cp "$CHECKPOINT_DIR"/* $SCRATCH_DIR/checkpoint/ 2>/dev/null || true
+    echo "Resuming from checkpoint: $RESUME_FROM"
+else
+    echo "Starting fresh training (no checkpoint specified)"
+fi
+
+#### mkdir output directory on scratch
+mkdir -p $SCRATCH_DIR/output
 
 #### Change to scratch directory
 cd $SCRATCH_DIR
@@ -59,6 +82,13 @@ singularity exec --bind /expanse,/scratch --nv \
 echo "Running training..."
 echo "========================================"
 
+#### Build resume flag if checkpoint specified
+RESUME_FLAG=""
+if [ -n "$RESUME_FROM" ]; then
+    CHECKPOINT_NAME=$(basename "$RESUME_FROM")
+    RESUME_FLAG="--resume_from checkpoint/$CHECKPOINT_NAME"
+fi
+
 #### Run training with singularity container (has PyTorch + CUDA)
 #### Use python3 -u for unbuffered output so logs appear in real-time
 time -p singularity exec --bind /expanse,/scratch --nv \
@@ -68,20 +98,25 @@ time -p singularity exec --bind /expanse,/scratch --nv \
         --output_dir output \
         --random_seed 19 \
         --direction bi \
-        --max_length 8192 \
-        --num_samples 10000 \
-        --batch_size 32 \
-        --output_name meta_smoke.pt \
-        --epochs 2 \
+        --max_length 2048 \
+        --num_samples 8192 \
+        --batch_size 256 \
+        --hidden_size 64 \
+        --output_name model.pt \
+        --epochs 56 \
         --lr 1e-3 \
         --min_size 5 \
-        --max_size 512 \
+        --max_size 256 \
         --mask_portion 0.4 \
         --use_flow \
-        --use_metadata \
         --mode parallel \
-        --K 4096 \
-        --k_spacing fibonacci
+        --val_split 0.1 \
+        --val_k_values 1,2,4,8 \
+        --K 128 \
+        --k_spacing log \
+        --patience 10 \
+        --min_delta 0.0 \
+        $RESUME_FLAG
 
 echo "========================================"
 echo "Training complete. Copying results back..."

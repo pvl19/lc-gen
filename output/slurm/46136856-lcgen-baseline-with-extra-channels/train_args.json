@@ -1,0 +1,34 @@
+[
+  {
+    "timestamp": "2026-01-30T06:10:57.162676",
+    "args": {
+      "input": "data/timeseries_x.h5",
+      "max_length": 2048,
+      "direction": "bi",
+      "random_seed": 19,
+      "num_samples": 2048,
+      "epochs": 20,
+      "batch_size": 128,
+      "lr": 0.001,
+      "hidden_size": 64,
+      "output_dir": "output",
+      "output_name": "baseline_with_extra_channels.pt",
+      "device": "auto",
+      "use_flow": true,
+      "min_size": 5,
+      "max_size": 256,
+      "mask_portion": 0.4,
+      "mock_sinusoid": false,
+      "mock_noise": 0.1,
+      "mode": "parallel",
+      "K": 1024,
+      "k_spacing": "fibonacci",
+      "use_metadata": false,
+      "use_conv_channels": true,
+      "conv_encoder_type": "unet",
+      "val_split": 0.1,
+      "patience": 5,
+      "min_delta": 0.0
+    }
+  }
+]

@@ -17,7 +17,6 @@ import pickle
 import torch
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
-import umap
 
 # Ensure local 'src' is on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
@@ -100,14 +99,16 @@ def get_stratified_indices(ages: np.ndarray, max_samples: int, n_bins: int = 20,
     return selected_indices
 
 
-def load_model(model_path: str, hidden_size: int, direction: str, mode: str, use_flow: bool, device: torch.device, num_meta_features: int = 0):
+def load_model(model_path: str, hidden_size: int, direction: str, mode: str, use_flow: bool, device: torch.device, num_meta_features: int = 0, use_conv_channels: bool = False, conv_config: dict = None):
     """Load trained model from checkpoint."""
     model = BiDirectionalMinGRU(
         hidden_size=hidden_size,
         direction=direction,
         mode=mode,
         use_flow=use_flow,
-        num_meta_features=num_meta_features
+        num_meta_features=num_meta_features,
+        use_conv_channels=use_conv_channels,
+        conv_config=conv_config
     ).to(device)
     
     ckpt = torch.load(model_path, map_location=device)
@@ -181,11 +182,12 @@ def compute_multiscale_features(h_valid: torch.Tensor, n_segments: int = 4) -> t
     return torch.cat(features, dim=0)
 
 
-def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length: int = 16384, 
-                           batch_size: int = 32, pooling_mode: str = 'multiscale', 
-                           sample_indices: np.ndarray = None, use_metadata: bool = False):
+def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length: int = 16384,
+                           batch_size: int = 32, pooling_mode: str = 'multiscale',
+                           sample_indices: np.ndarray = None, use_metadata: bool = False,
+                           use_conv_channels: bool = False):
     """Extract latent vectors for all light curves in the H5 file.
-    
+
     Args:
         model: trained BiDirectionalMinGRU model
         h5_path: path to H5 data file
@@ -198,21 +200,46 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
             - 'final': use only final hidden states
         sample_indices: specific indices to process (None = all)
         use_metadata: whether to load and use stellar metadata
-    
+        use_conv_channels: whether to load and use conv channel data (power, ACF, f-statistic)
+
     Returns:
         Latent vectors array of shape (N, D) where D depends on pooling_mode
     """
     # Define metadata features (same as in TimeSeriesDataset)
     metadata_features = ['G_0', 'BP_0', 'RP_0', 'parallax', 'G_0_err', 'BP_0_err', 'RP_0_err', 'parallax_err']
-    
+
     with h5py.File(h5_path, 'r') as f:
+        # Get the actual size of the HDF5 dataset
+        h5_size = len(f['flux'])
+
         if sample_indices is not None:
+            # Filter indices to only include valid HDF5 indices (defensive check)
+            valid_mask = sample_indices < h5_size
+            if not np.all(valid_mask):
+                n_invalid = np.sum(~valid_mask)
+                print(f'Warning: {n_invalid} sample indices exceed HDF5 size ({h5_size}). Filtering to valid indices.')
+                sample_indices = sample_indices[valid_mask]
+
+            if len(sample_indices) == 0:
+                raise ValueError('No valid sample indices remain after filtering')
+
             # Sort indices for efficient HDF5 access
             sorted_indices = np.sort(sample_indices)
             flux_all = f['flux'][sorted_indices]
             flux_err_all = f['flux_err'][sorted_indices]
             time_all = f['time'][sorted_indices]
             lengths = f['length'][sorted_indices]
+
+            # Load conv channel data if requested
+            if use_conv_channels:
+                power_all = f['power'][sorted_indices]
+                acf_all = f['acf'][sorted_indices]
+                f_stat_all = f['f_stat'][sorted_indices]
+            else:
+                power_all = None
+                acf_all = None
+                f_stat_all = None
+
             # Load metadata if requested
             if use_metadata and 'metadata' in f:
                 meta_grp = f['metadata']
@@ -234,6 +261,17 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
             flux_err_all = f['flux_err'][:]
             time_all = f['time'][:]
             lengths = f['length'][:]
+
+            # Load conv channel data if requested
+            if use_conv_channels:
+                power_all = f['power'][:]
+                acf_all = f['acf'][:]
+                f_stat_all = f['f_stat'][:]
+            else:
+                power_all = None
+                acf_all = None
+                f_stat_all = None
+
             # Load metadata if requested
             if use_metadata and 'metadata' in f:
                 meta_grp = f['metadata']
@@ -289,9 +327,23 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
                 meta_batch = torch.tensor(metadata_all[start_idx:end_idx], dtype=torch.float32, device=device)
             else:
                 meta_batch = None
-            
+
+            # Build conv data dict if available
+            if use_conv_channels and power_all is not None:
+                power_batch = torch.tensor(power_all[start_idx:end_idx], dtype=torch.float32, device=device)
+                acf_batch = torch.tensor(acf_all[start_idx:end_idx], dtype=torch.float32, device=device)
+                f_stat_batch = torch.tensor(f_stat_all[start_idx:end_idx], dtype=torch.float32, device=device)
+                # Pass as dictionary (model expects dict format)
+                conv_data_batch = {
+                    'power': power_batch,
+                    'acf': acf_batch,
+                    'f_stat': f_stat_batch
+                }
+            else:
+                conv_data_batch = None
+
             # Forward pass with return_states=True to get hidden states
-            out = model(x_in, t_in, mask=mask, metadata=meta_batch, return_states=True)
+            out = model(x_in, t_in, mask=mask, metadata=meta_batch, conv_data=conv_data_batch, return_states=True)
             
             # Get hidden states
             h_fwd = out.get('h_fwd_tensor')  # (B, L, H)
@@ -332,53 +384,57 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
 
 
 def load_ages(pickle_path: str, csv_path: str, sample_indices: np.ndarray = None):
-    """Load ages and BPRP0 from CSV and map to light curves via TIC ID.
-    
+    """Load ages, BPRP0, and Prot from CSV and map to light curves via TIC ID.
+
     Args:
         pickle_path: path to pickle file with metadata
-        csv_path: path to CSV with stellar ages and BPRP0
+        csv_path: path to CSV with stellar ages, BPRP0, and Prot
         sample_indices: specific indices to load (None = all)
-    
+
     Returns:
         ages: array of ages (NaN for light curves without age data)
         bprp0: array of BPRP0 values (NaN for light curves without data)
         tic_ids: array of TIC IDs for each light curve
+        prot: array of rotation periods in days (NaN for light curves without data)
     """
     # Load pickle to get TIC IDs for each light curve
     with open(pickle_path, 'rb') as f:
         pickle_data = pickle.load(f)
-    
+
     metadatas = pickle_data['metadatas']
     if sample_indices is not None:
         sorted_indices = np.sort(sample_indices)
         metadatas = [metadatas[i] for i in sorted_indices]
     tic_ids = np.array([m['tic'] for m in metadatas])
-    
+
     # Load age CSV
     age_df = pd.read_csv(csv_path)
     tic_to_age = dict(zip(age_df['TIC_ID'], age_df['age_Myr']))
     tic_to_bprp0 = dict(zip(age_df['TIC_ID'], age_df['BPRP0']))
-    
-    # Map ages and BPRP0 to each light curve
+    tic_to_prot = dict(zip(age_df['TIC_ID'], age_df.get('Prot', pd.Series([np.nan]*len(age_df)))))
+
+    # Map ages, BPRP0, and Prot to each light curve
     ages = np.array([tic_to_age.get(tic, np.nan) for tic in tic_ids])
     bprp0 = np.array([tic_to_bprp0.get(tic, np.nan) for tic in tic_ids])
-    
+    prot = np.array([tic_to_prot.get(tic, np.nan) for tic in tic_ids])
+
     n_with_age = np.sum(~np.isnan(ages))
     print(f'Loaded ages for {n_with_age}/{len(ages)} light curves ({100*n_with_age/len(ages):.1f}%)')
-    
-    return ages, bprp0, tic_ids
+
+    return ages, bprp0, tic_ids, prot
 
 
 def plot_umap(latent_vectors: np.ndarray, ages: np.ndarray, output_path: str,
               n_neighbors: int = 15, min_dist: float = 0.1, metric: str = 'euclidean',
               bprp0_min: float = None, bprp0_max: float = None, bprp0: np.ndarray = None):
     """Create UMAP embedding and plot colored by stellar age.
-    
+
     UMAP is computed on ALL samples with valid ages first, then BPRP0 filtering
     is applied for plotting. This preserves consistent UMAP coordinates across
     different BPRP0 cuts.
     """
-    
+    import umap  # Lazy import to avoid requiring umap for non-plotting scripts
+
     # Filter to only include samples with valid ages for UMAP computation
     valid_mask = ~np.isnan(ages)
     latent_valid = latent_vectors[valid_mask]
@@ -492,7 +548,11 @@ def main():
                         help='Maximum BPRP0 value (BP-RP color). None = no upper cut.')
     parser.add_argument('--use_metadata', action='store_true',
                         help='Use stellar metadata (G_0, BP_0, RP_0, parallax + uncertainties) as model input')
-    
+    parser.add_argument('--use_conv_channels', action='store_true',
+                        help='Use convolutional encoders for power spectrum, f-statistic, and ACF as additional model input')
+    parser.add_argument('--conv_encoder_type', type=str, default='unet', choices=['lightweight', 'unet'],
+                        help="Conv encoder architecture: 'unet' (default, richer but slower) or 'lightweight' (faster but simpler)")
+
     args = parser.parse_args()
     
     # Setup
@@ -508,7 +568,7 @@ def main():
     if args.max_samples is not None:
         # Load all ages first for stratified sampling (ignore BPRP0 at this stage)
         print('Loading ages for stratified sampling...')
-        all_ages, all_bprp0, _ = load_ages(args.pickle_path, args.age_csv_path, sample_indices=None)
+        all_ages, all_bprp0, _, _ = load_ages(args.pickle_path, args.age_csv_path, sample_indices=None)
         
         if args.stratify_by_age:
             # Stratified sampling based on age only (not BPRP0)
@@ -522,32 +582,65 @@ def main():
             valid_indices = np.where(~np.isnan(all_ages))[0]
             sample_indices = valid_indices[:args.max_samples]
     
+    # Filter sample_indices to only include valid HDF5 indices
+    if sample_indices is not None:
+        with h5py.File(args.h5_path, 'r') as f:
+            h5_size = len(f['flux'])
+        valid_mask = sample_indices < h5_size
+        if not np.all(valid_mask):
+            n_invalid = np.sum(~valid_mask)
+            print(f'Warning: {n_invalid} sample indices exceed HDF5 size ({h5_size}). Filtering to valid indices.')
+            sample_indices = sample_indices[valid_mask]
+
     # Load model
     num_meta_features = 8 if args.use_metadata else 0
+
+    # Build conv_config if using convolutional channels
+    conv_config = None
+    if args.use_conv_channels:
+        if args.conv_encoder_type == 'lightweight':
+            conv_config = {
+                'encoder_type': 'lightweight',
+                'hidden_channels': 16,
+                'num_layers': 3,
+                'activation': 'gelu'
+            }
+        else:  # unet
+            conv_config = {
+                'encoder_type': 'unet',
+                'input_length': 16000,
+                'encoder_dims': [4, 8, 16, 32],
+                'num_layers': 4,
+                'activation': 'gelu'
+            }
+
     model = load_model(
-        args.model_path, 
-        args.hidden_size, 
-        args.direction, 
-        args.mode, 
-        args.use_flow, 
+        args.model_path,
+        args.hidden_size,
+        args.direction,
+        args.mode,
+        args.use_flow,
         device,
-        num_meta_features=num_meta_features
+        num_meta_features=num_meta_features,
+        use_conv_channels=args.use_conv_channels,
+        conv_config=conv_config
     )
     
     # Extract latent vectors (for all selected samples, no BPRP0 filtering)
     latent_vectors = extract_latent_vectors(
-        model, 
-        args.h5_path, 
-        device, 
+        model,
+        args.h5_path,
+        device,
         max_length=args.max_length,
         batch_size=args.batch_size,
         pooling_mode=args.pooling_mode,
         sample_indices=sample_indices,
-        use_metadata=args.use_metadata
+        use_metadata=args.use_metadata,
+        use_conv_channels=args.use_conv_channels
     )
     
     # Load ages and BPRP0 for selected samples
-    ages, bprp0, tic_ids = load_ages(args.pickle_path, args.age_csv_path, sample_indices=sample_indices)
+    ages, bprp0, tic_ids, prot = load_ages(args.pickle_path, args.age_csv_path, sample_indices=sample_indices)
     
     # Generate output filename based on model name, pooling mode, and cuts
     model_name = Path(args.model_path).stem
