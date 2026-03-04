@@ -14,20 +14,30 @@
 #   multiscale - Multi-scale features: mean, max, std, quartiles, chunks (1536 dims)
 #   final      - Final hidden state only (128 dims)
 
-MODEL_PATH=${1:-"output/slurm/46224669-lcgen-ext-k-dense-small/model.pt"}
+MODEL_PATH=${1:-"output/performance_tests/baseline_long/model.pt"}
 VERSION=${2:-"default"}
-POOLING_MODE=${3:-"mean"}
-USE_METADATA=${4:-"true"}
-USE_CONV=${5:-"true"}
+POOLING_MODE=${3:-"multiscale"}
+USE_METADATA=${4:-"false"}
+USE_CONV=${5:-"false"}
 CONV_TYPE=${6:-"unet"}
 REQUIRE_PROT=${7:-"true"}
 H5_PATH=${8:-"data/timeseries_x.h5"}
 
-OUTPUT_DIR="output/age_predictor/46224669-lcgen-ext-k-dense-small_${POOLING_MODE}"
+# Select the correct pickle file based on h5 file
+# timeseries.h5 -> star_sector_lc_formatted.pickle
+# timeseries_x.h5 -> star_sector_lc_formatted_with_extra_channels.pickle
+if [[ "${H5_PATH}" == *"timeseries_x"* ]]; then
+    PICKLE_PATH="data/star_sector_lc_formatted_with_extra_channels.pickle"
+else
+    PICKLE_PATH="data/star_sector_lc_formatted.pickle"
+fi
+
+OUTPUT_DIR="output/age_predictor/performance_tests/baseline-long-${POOLING_MODE}"
 
 echo "Running k-fold age inference:"
 echo "  Model: ${MODEL_PATH}"
 echo "  H5 file: ${H5_PATH}"
+echo "  Pickle file: ${PICKLE_PATH}"
 echo "  Version: ${VERSION}"
 echo "  Pooling mode: ${POOLING_MODE}"
 echo "  Use metadata: ${USE_METADATA}"
@@ -40,14 +50,14 @@ echo "  Output directory: ${OUTPUT_DIR}"
 CMD="python scripts/kfold_age_inference.py \
   --model_path ${MODEL_PATH} \
   --h5_path ${H5_PATH} \
-  --pickle_path data/star_sector_lc_formatted.pickle \
+  --pickle_path ${PICKLE_PATH} \
   --age_csv data/TIC_cf_data.csv \
   --output_dir ${OUTPUT_DIR} \
   --hidden_size 64 \
   --direction bi \
   --mode parallel \
   --use_flow \
-  --max_length 2048 \
+  --max_length 8192 \
   --pooling_mode ${POOLING_MODE} \
   --stratify_by_age \
   --n_age_bins 20 \

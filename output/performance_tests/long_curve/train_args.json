@@ -1,0 +1,41 @@
+[
+  {
+    "timestamp": "2026-02-27T12:30:27.455702",
+    "args": {
+      "input": "data/timeseries_x.h5",
+      "max_length": 8192,
+      "direction": "bi",
+      "random_seed": 19,
+      "num_samples": 8192,
+      "epochs": 45,
+      "batch_size": 256,
+      "lr": 0.001,
+      "hidden_size": 64,
+      "output_dir": "output",
+      "output_name": "model.pt",
+      "device": "auto",
+      "use_flow": true,
+      "min_size": 5,
+      "max_size": 256,
+      "mask_portion": 0.4,
+      "mock_sinusoid": false,
+      "mock_noise": 0.1,
+      "mode": "parallel",
+      "K": 128,
+      "k_spacing": "log",
+      "use_metadata": true,
+      "use_conv_channels": true,
+      "conv_encoder_type": "unet",
+      "val_split": 0.1,
+      "val_k_values": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "patience": 10,
+      "min_delta": 0.0,
+      "resume_from": "checkpoint/model.pt"
+    }
+  }
+]
