@@ -95,8 +95,9 @@ def load_data_fresh(model_path: str, h5_path: str, pickle_path: str, csv_path: s
     else:
         sample_indices = np.where(valid_mask)[0]
 
-    # Determine number of metadata features
-    num_meta_features = 8 if use_metadata else 0
+    # Determine number of metadata features (load_model will override from checkpoint if stored)
+    from lcgen.models.MetadataAgePredictor import DEFAULT_METADATA_FIELDS
+    num_meta_features = len(DEFAULT_METADATA_FIELDS) if use_metadata else 0
 
     # Filter sample_indices to only include valid HDF5 indices
     if sample_indices is not None:

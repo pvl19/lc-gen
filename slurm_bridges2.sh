@@ -7,7 +7,7 @@
 #   2. Update --epochs to your new target (e.g., 50 or 100)
 #   3. Training will continue from where it left off
 #
-#SBATCH --job-name=lcgen-bridges2-full-curve-to-60e
+#SBATCH --job-name=lcgen-bridges2-cf-final
 #### Change account to your allocation (e.g., abc123p)
 #SBATCH --account=phy260003p
 #SBATCH --partition=GPU-shared
@@ -30,7 +30,7 @@ OUTPUT_DIR="$PROJECT_DIR/output/$SLURM_JOBID-$SLURM_JOB_NAME"
 #### OPTIONAL: Set to resume training from a previous checkpoint
 #### Example: RESUME_FROM="checkpoints/resume/model.pt"
 #### Leave empty ("") for fresh training
-RESUME_FROM="checkpoints/resume/model.pt"
+RESUME_FROM=""
 
 # Define container
 CONTAINER="/ocean/containers/ngc/pytorch/pytorch_24.11-py3.sif"
@@ -95,24 +95,27 @@ time -p singularity exec --nv --bind /ocean,$LOCAL,$HOME \
     --output_dir output \
     --random_seed 19 \
     --direction bi \
-    --max_length 8192 \
+    --max_length 16384 \
     --num_samples 8192 \
-    --batch_size 256 \
+    --batch_size 128 \
     --hidden_size 64 \
     --output_name model.pt \
-    --epochs 60 \
+    --epochs 5 \
     --lr 1e-3 \
     --min_size 5 \
-    --max_size 256 \
+    --max_size 720 \
     --mask_portion 0.4 \
     --use_flow \
+    --use_metadata \
     --mode parallel \
     --val_split 0.1 \
     --val_k_values 1,2,4,8 \
-    --K 128 \
+    --K 720 \
     --k_spacing log \
     --patience 10 \
     --min_delta 0.0 \
+    --save_every 1 \
+    --checkpoint_copy_dir $PROJECT_DIR/checkpoints/resume \
     $RESUME_FLAG
 
 echo "========================================"

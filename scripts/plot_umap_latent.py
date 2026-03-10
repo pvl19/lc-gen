@@ -21,6 +21,7 @@ from matplotlib.colors import LogNorm
 # Ensure local 'src' is on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from lcgen.models.simple_min_gru import BiDirectionalMinGRU
+from lcgen.models.MetadataAgePredictor import DEFAULT_METADATA_FIELDS
 
 
 def get_stratified_indices(ages: np.ndarray, max_samples: int, n_bins: int = 20, seed: int = 42) -> np.ndarray:
@@ -100,7 +101,35 @@ def get_stratified_indices(ages: np.ndarray, max_samples: int, n_bins: int = 20,
 
 
 def load_model(model_path: str, hidden_size: int, direction: str, mode: str, use_flow: bool, device: torch.device, num_meta_features: int = 0, use_conv_channels: bool = False, conv_config: dict = None):
-    """Load trained model from checkpoint."""
+    """Load trained model from checkpoint.
+
+    Infers the architecture from the checkpoint (either from a stored
+    'num_meta_features' key, or by inspecting the state dict weights) and
+    raises ValueError if it does not match the requested num_meta_features.
+    """
+    ckpt = torch.load(model_path, map_location=device)
+    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+        sd = ckpt['model_state_dict']
+        # Determine num_meta_features from checkpoint
+        if 'num_meta_features' in ckpt:
+            ckpt_num_meta = ckpt['num_meta_features']
+        elif 'meta_encoder.0.weight' in sd:
+            # Infer from first linear layer: weight shape is (out, in) = (64, num_meta_features)
+            ckpt_num_meta = sd['meta_encoder.0.weight'].shape[1]
+        else:
+            ckpt_num_meta = 0
+    else:
+        sd = ckpt
+        ckpt_num_meta = num_meta_features  # old-format checkpoint, no way to verify
+
+    if ckpt_num_meta != num_meta_features:
+        raise ValueError(
+            f"Architecture mismatch: checkpoint at '{model_path}' was trained with "
+            f"num_meta_features={ckpt_num_meta}, but script requested "
+            f"num_meta_features={num_meta_features}. "
+            f"Pass --use_metadata (or omit it) to match the checkpoint."
+        )
+
     model = BiDirectionalMinGRU(
         hidden_size=hidden_size,
         direction=direction,
@@ -110,26 +139,10 @@ def load_model(model_path: str, hidden_size: int, direction: str, mode: str, use
         use_conv_channels=use_conv_channels,
         conv_config=conv_config
     ).to(device)
-    
-    ckpt = torch.load(model_path, map_location=device)
-    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-        sd = ckpt['model_state_dict']
-    else:
-        sd = ckpt
-    
-    # Try to load state dict, allowing for size mismatches in metadata-related layers
-    try:
-        model.load_state_dict(sd)
-    except Exception as e:
-        print(f'Warning: loading model state dict with best-effort key matching: {e}')
-        target = model.state_dict()
-        for k, v in sd.items():
-            if k in target and v.shape == target[k].shape:
-                target[k] = v
-        model.load_state_dict(target)
-    
+
+    model.load_state_dict(sd)
     model.eval()
-    print(f'Loaded model from {model_path}')
+    print(f'Loaded model from {model_path} (num_meta_features={num_meta_features})')
     return model
 
 
@@ -205,8 +218,9 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
     Returns:
         Latent vectors array of shape (N, D) where D depends on pooling_mode
     """
-    # Define metadata features (same as in TimeSeriesDataset)
-    metadata_features = ['G_0', 'BP_0', 'RP_0', 'parallax', 'G_0_err', 'BP_0_err', 'RP_0_err', 'parallax_err']
+    # Only load metadata if the model actually has a meta_encoder
+    load_metadata = use_metadata and (model.meta_encoder is not None)
+    metadata_features = DEFAULT_METADATA_FIELDS
 
     with h5py.File(h5_path, 'r') as f:
         # Get the actual size of the HDF5 dataset
@@ -240,8 +254,8 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
                 acf_all = None
                 f_stat_all = None
 
-            # Load metadata if requested
-            if use_metadata and 'metadata' in f:
+            # Load metadata only if the model has a meta_encoder
+            if load_metadata and 'metadata' in f:
                 meta_grp = f['metadata']
                 meta_list = []
                 for feat in metadata_features:
@@ -272,8 +286,8 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
                 acf_all = None
                 f_stat_all = None
 
-            # Load metadata if requested
-            if use_metadata and 'metadata' in f:
+            # Load metadata only if the model has a meta_encoder
+            if load_metadata and 'metadata' in f:
                 meta_grp = f['metadata']
                 meta_list = []
                 for feat in metadata_features:
@@ -592,8 +606,8 @@ def main():
             print(f'Warning: {n_invalid} sample indices exceed HDF5 size ({h5_size}). Filtering to valid indices.')
             sample_indices = sample_indices[valid_mask]
 
-    # Load model
-    num_meta_features = 8 if args.use_metadata else 0
+    # Load model (num_meta_features will be overridden by checkpoint if stored there)
+    num_meta_features = len(DEFAULT_METADATA_FIELDS) if args.use_metadata else 0
 
     # Build conv_config if using convolutional channels
     conv_config = None

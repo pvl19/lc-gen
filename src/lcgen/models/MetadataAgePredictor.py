@@ -23,6 +23,8 @@ DEFAULT_METADATA_FIELDS = [
     'cadence_s',
     'Tmag',
     'sector',
+    'camera',
+    'ccd',
     'dr3_parallax_zpt_corrected',
     'parallax_error',
     'G_0',
@@ -420,6 +422,8 @@ class MetadataStandardizer:
     # Fields that are passed through raw
     RAW_FIELDS = {
         'BPRP0',
+        'camera',
+        'ccd',
     }
 
     def __init__(self, fields: list = None):

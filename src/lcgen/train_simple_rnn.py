@@ -90,6 +90,50 @@ def validate(model, val_loader, device, args):
     avg_val_loss = total_loss / max(1, n)
     return avg_val_loss
 
+def _save_rolling_checkpoint(
+    model, optimizer, epoch,
+    previous_train_losses, train_epoch_losses,
+    previous_val_losses, val_epoch_losses,
+    k_stats_per_epoch, output_path, persistent_dir,
+):
+    """Save a rolling checkpoint and losses after each epoch, then optionally
+    copy both files to a persistent directory (e.g. the project home dir on
+    Bridges-2) so progress is safe even if the SLURM job is killed mid-run."""
+    import shutil
+
+    all_train = previous_train_losses + train_epoch_losses
+    all_val   = previous_val_losses   + val_epoch_losses
+
+    # Write checkpoint_latest.pt  (always overwritten – no storage bloat)
+    ckpt_path = output_path / 'checkpoint_latest.pt'
+    torch.save({
+        'model_state_dict':     model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'epoch': epoch,
+        'num_meta_features':    model.num_meta_features,
+    }, ckpt_path)
+
+    # Write losses_per_epoch.npz
+    losses_path = output_path / 'losses_per_epoch.npz'
+    save_dict = {'train_loss': np.array(all_train, dtype=np.float32)}
+    if all_val:
+        save_dict['val_loss'] = np.array(all_val, dtype=np.float32)
+    if k_stats_per_epoch:
+        save_dict['k_mean'] = np.array([s['mean'] for s in k_stats_per_epoch], dtype=np.float32)
+        save_dict['k_min']  = np.array([s['min']  for s in k_stats_per_epoch], dtype=np.int32)
+        save_dict['k_max']  = np.array([s['max']  for s in k_stats_per_epoch], dtype=np.int32)
+        save_dict['k_std']  = np.array([s['std']  for s in k_stats_per_epoch], dtype=np.float32)
+    np.savez_compressed(losses_path, **save_dict)
+
+    print(f'  → Saved rolling checkpoint (epoch {epoch}): {ckpt_path}')
+
+    # Copy to persistent storage so the files survive a job timeout
+    if persistent_dir is not None:
+        shutil.copy2(ckpt_path,    persistent_dir / 'model.pt')
+        shutil.copy2(losses_path,  persistent_dir / 'losses_per_epoch.npz')
+        print(f'  → Copied checkpoint to {persistent_dir}')
+
+
 def train(args):
     if args.device == 'auto':
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -227,6 +271,15 @@ def train(args):
     train_epoch_losses = []     # NEW training loss per epoch (for this session)
     val_epoch_losses = []       # NEW validation loss per epoch (for this session)
     k_stats_per_epoch = []      # NEW k-value statistics per epoch (mean, min, max)
+
+    # Set up output path early so per-epoch checkpoints can be written inside the loop
+    output_path = Path(args.output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Set up persistent checkpoint dir for mid-job copies
+    persistent_dir = Path(args.checkpoint_copy_dir) if args.checkpoint_copy_dir else None
+    if persistent_dir is not None:
+        persistent_dir.mkdir(parents=True, exist_ok=True)
 
     # early stopping tracking
     # If resuming, initialize best_val_loss from previous validation losses
@@ -368,14 +421,26 @@ def train(args):
                         print(f'\nEarly stopping triggered after {epoch+1} epochs (patience={args.patience})')
                         print(f'Best validation loss: {best_val_loss:.6f} at epoch {epoch+1-args.patience}')
                         stopped_early = True
+                        # Save checkpoint before breaking so progress is not lost
+                        _save_rolling_checkpoint(
+                            model, optimizer, epoch + 1,
+                            previous_train_losses, train_epoch_losses,
+                            previous_val_losses, val_epoch_losses,
+                            k_stats_per_epoch, output_path, persistent_dir,
+                        )
                         break
         else:
             print(f'Epoch {epoch+1}/{args.epochs} - Loss: {avg:.6f} - Time: {epoch_time:.1f}s')
             print(f'  Timing breakdown: Data={time_data_load:.1f}s Forward={time_forward:.1f}s Loss={time_loss:.1f}s Backward={time_backward:.1f}s Optimizer={time_optimizer:.1f}s')
 
-    # Save outputs directly to output_dir (no subfolders)
-    output_path = Path(args.output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+        # ---- Per-epoch rolling checkpoint ----
+        if not stopped_early and args.save_every > 0 and (epoch + 1) % args.save_every == 0:
+            _save_rolling_checkpoint(
+                model, optimizer, epoch + 1,
+                previous_train_losses, train_epoch_losses,
+                previous_val_losses, val_epoch_losses,
+                k_stats_per_epoch, output_path, persistent_dir,
+            )
 
     # Restore best model if early stopping was used
     if best_model_state is not None:
@@ -393,7 +458,8 @@ def train(args):
     checkpoint_dict = {
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'epoch': len(all_train_losses)
+        'epoch': len(all_train_losses),
+        'num_meta_features': model.num_meta_features,
     }
     torch.save(checkpoint_dict, model_path)
     if stopped_early:
@@ -471,6 +537,12 @@ def parse_args():
                    help='Minimum change in validation loss to qualify as improvement for early stopping')
     p.add_argument('--resume_from', type=str, default=None,
                    help='Path to checkpoint .pt file to resume training from. Will load model state, optimizer state, and previous losses.')
+    p.add_argument('--save_every', type=int, default=1,
+                   help='Save a rolling checkpoint every N epochs (default: 1). Set to 0 to disable mid-run saves.')
+    p.add_argument('--checkpoint_copy_dir', type=str, default=None,
+                   help='If set, copy checkpoint_latest.pt and losses_per_epoch.npz here after every save. '
+                        'Use a path on persistent storage (e.g. $HOME/lcgen/checkpoints/resume) so progress '
+                        'survives a SLURM job timeout.')
     return p.parse_args()
 
 

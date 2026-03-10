@@ -14,7 +14,7 @@
 #   multiscale - Multi-scale features: mean, max, std, quartiles, chunks (1536 dims)
 #   final      - Final hidden state only (128 dims)
 
-MODEL_PATH=${1:-"output/performance_tests/baseline_long/model.pt"}
+MODEL_PATH=${1:-"output/performance_tests/cf_final/model.pt"}
 VERSION=${2:-"default"}
 POOLING_MODE=${3:-"multiscale"}
 USE_METADATA=${4:-"false"}
@@ -32,7 +32,7 @@ else
     PICKLE_PATH="data/star_sector_lc_formatted.pickle"
 fi
 
-OUTPUT_DIR="output/age_predictor/performance_tests/baseline-long-${POOLING_MODE}"
+OUTPUT_DIR="output/age_predictor/performance_tests/cf-final-${POOLING_MODE}"
 
 echo "Running k-fold age inference:"
 echo "  Model: ${MODEL_PATH}"
@@ -57,7 +57,7 @@ CMD="python scripts/kfold_age_inference.py \
   --direction bi \
   --mode parallel \
   --use_flow \
-  --max_length 8192 \
+  --max_length 16384 \
   --pooling_mode ${POOLING_MODE} \
   --stratify_by_age \
   --n_age_bins 20 \
