@@ -25,22 +25,22 @@ python3 src/lcgen/train_simple_rnn.py \
     --random_seed 19 \
     --direction bi \
     --max_length 2048 \
-    --num_samples 8192 \
-    --batch_size 512 \
+    --num_samples 1024 \
+    --batch_size 256 \
     --hidden_size 64 \
     --output_name model.pt \
     --epochs 3 \
     --lr 1e-3 \
     --min_size 5 \
-    --max_size 256 \
+    --max_size 720 \
     --mask_portion 0.4 \
     --use_flow \
     --mode parallel \
-    --use_metadata \
     --val_split 0.1 \
     --val_k_values 1,2,4,8 \
     --K 128 \
     --k_spacing log \
     --patience 10 \
     --min_delta 0.0 \
+    --save_every 1 \
     $RESUME_FLAG
