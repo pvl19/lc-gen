@@ -13,7 +13,6 @@ from pathlib import Path
 import h5py
 import numpy as np
 import pandas as pd
-import pickle
 import torch
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
@@ -21,7 +20,7 @@ from matplotlib.colors import LogNorm
 # Ensure local 'src' is on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from lcgen.models.simple_min_gru import BiDirectionalMinGRU
-from lcgen.models.MetadataAgePredictor import DEFAULT_METADATA_FIELDS
+from lcgen.models.TimeSeriesDataset import METADATA_FEATURES
 
 
 def get_stratified_indices(ages: np.ndarray, max_samples: int, n_bins: int = 20, seed: int = 42) -> np.ndarray:
@@ -100,35 +99,44 @@ def get_stratified_indices(ages: np.ndarray, max_samples: int, n_bins: int = 20,
     return selected_indices
 
 
-def load_model(model_path: str, hidden_size: int, direction: str, mode: str, use_flow: bool, device: torch.device, num_meta_features: int = 0, use_conv_channels: bool = False, conv_config: dict = None):
-    """Load trained model from checkpoint.
+def load_model(model_path: str, device: torch.device, hidden_size: int = 64,
+               direction: str = 'bi', mode: str = 'parallel', use_flow: bool = False,
+               num_meta_features: int = 0, use_conv_channels: bool = False,
+               conv_config: dict = None):
+    """Load trained model from checkpoint, auto-detecting architecture from state dict.
 
-    Infers the architecture from the checkpoint (either from a stored
-    'num_meta_features' key, or by inspecting the state dict weights) and
-    raises ValueError if it does not match the requested num_meta_features.
+    The passed num_meta_features / use_conv_channels serve as hints but are overridden
+    if the checkpoint's weights are inconsistent — e.g. a checkpoint trained without
+    metadata will have no meta_encoder keys and a smaller input_proj.
     """
     ckpt = torch.load(model_path, map_location=device)
-    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-        sd = ckpt['model_state_dict']
-        # Determine num_meta_features from checkpoint
-        if 'num_meta_features' in ckpt:
-            ckpt_num_meta = ckpt['num_meta_features']
-        elif 'meta_encoder.0.weight' in sd:
-            # Infer from first linear layer: weight shape is (out, in) = (64, num_meta_features)
-            ckpt_num_meta = sd['meta_encoder.0.weight'].shape[1]
-        else:
-            ckpt_num_meta = 0
-    else:
-        sd = ckpt
-        ckpt_num_meta = num_meta_features  # old-format checkpoint, no way to verify
+    sd = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
 
-    if ckpt_num_meta != num_meta_features:
+    # --- Auto-detect architecture from state dict ---
+    has_meta = any(k.startswith('meta_encoder.') for k in sd)
+    has_conv = any(k.startswith('ps_encoder.') for k in sd)
+
+    if not has_meta and num_meta_features > 0:
+        print(f'  [load_model] checkpoint has no meta_encoder; '
+              f'overriding num_meta_features {num_meta_features} → 0')
+        num_meta_features = 0
+    if has_meta and num_meta_features == 0:
+        # checkpoint has meta but caller said 0 — infer a nonzero placeholder so
+        # meta_encoder is created; actual num_meta_features is stored on the model
+        # after load_state_dict succeeds.  We can't know the original value from
+        # weights alone so raise an informative error instead.
         raise ValueError(
-            f"Architecture mismatch: checkpoint at '{model_path}' was trained with "
-            f"num_meta_features={ckpt_num_meta}, but script requested "
-            f"num_meta_features={num_meta_features}. "
-            f"Pass --use_metadata (or omit it) to match the checkpoint."
+            'Checkpoint has meta_encoder weights but num_meta_features=0 was passed. '
+            'Re-run with the correct --num_meta_features used during training.'
         )
+    if not has_conv and use_conv_channels:
+        print(f'  [load_model] checkpoint has no conv encoders; '
+              f'overriding use_conv_channels → False')
+        use_conv_channels = False
+
+    # Override from saved config if present (newer checkpoints only)
+    if isinstance(ckpt, dict):
+        num_meta_features = ckpt.get('num_meta_features', num_meta_features)
 
     model = BiDirectionalMinGRU(
         hidden_size=hidden_size,
@@ -137,12 +145,14 @@ def load_model(model_path: str, hidden_size: int, direction: str, mode: str, use
         use_flow=use_flow,
         num_meta_features=num_meta_features,
         use_conv_channels=use_conv_channels,
-        conv_config=conv_config
+        conv_config=conv_config,
     ).to(device)
 
     model.load_state_dict(sd)
     model.eval()
-    print(f'Loaded model from {model_path} (num_meta_features={num_meta_features})')
+    print(f'Loaded model from {model_path} '
+          f'(hidden={hidden_size}, direction={direction}, num_meta={num_meta_features}, '
+          f'conv={use_conv_channels}, flow={use_flow})')
     return model
 
 
@@ -220,7 +230,7 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
     """
     # Only load metadata if the model actually has a meta_encoder
     load_metadata = use_metadata and (model.meta_encoder is not None)
-    metadata_features = DEFAULT_METADATA_FIELDS
+    metadata_features = METADATA_FEATURES
 
     with h5py.File(h5_path, 'r') as f:
         # Get the actual size of the HDF5 dataset
@@ -397,50 +407,54 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
     return latent_vectors
 
 
-def load_ages(pickle_path: str, csv_path: str, sample_indices: np.ndarray = None):
-    """Load ages, BPRP0, and Prot from CSV and map to light curves via TIC ID.
+def load_ages(h5_path: str, csv_path: str, sample_indices: np.ndarray = None):
+    """Load ages, BPRP0, gaia_ids, tic_ids, and sectors from the H5 file and phot_all.csv.
 
     Args:
-        pickle_path: path to pickle file with metadata
-        csv_path: path to CSV with stellar ages, BPRP0, and Prot
+        h5_path: path to H5 data file (used to read GaiaDR3_ID, tic, and sector per light curve)
+        csv_path: path to phot_all.csv with stellar ages and BPRP0 keyed by GaiaDR3_ID
         sample_indices: specific indices to load (None = all)
 
     Returns:
-        ages: array of ages (NaN for light curves without age data)
+        ages: array of ages in Myr (NaN for light curves without age data)
         bprp0: array of BPRP0 values (NaN for light curves without data)
-        tic_ids: array of TIC IDs for each light curve
-        prot: array of rotation periods in days (NaN for light curves without data)
+        gaia_ids: array of GaiaDR3_ID strings for each light curve
+        tic_ids: array of TESS TIC IDs (int64) for each light curve
+        sectors: array of TESS sector numbers (int64) for each light curve
     """
-    # Load pickle to get TIC IDs for each light curve
-    with open(pickle_path, 'rb') as f:
-        pickle_data = pickle.load(f)
+    # Read GaiaDR3_IDs, TIC IDs, and sectors from H5 metadata
+    with h5py.File(h5_path, 'r') as f:
+        raw_ids = f['metadata']['GaiaDR3_ID'][:]  # bytes strings
+        tic_ids = f['metadata']['tic'][:]          # int64
+        sectors = f['metadata']['sector'][:]       # int64
 
-    metadatas = pickle_data['metadatas']
     if sample_indices is not None:
         sorted_indices = np.sort(sample_indices)
-        metadatas = [metadatas[i] for i in sorted_indices]
-    tic_ids = np.array([m['tic'] for m in metadatas])
+        raw_ids = raw_ids[sorted_indices]
+        tic_ids = tic_ids[sorted_indices]
+        sectors = sectors[sorted_indices]
 
-    # Load age CSV
-    age_df = pd.read_csv(csv_path)
-    tic_to_age = dict(zip(age_df['TIC_ID'], age_df['age_Myr']))
-    tic_to_bprp0 = dict(zip(age_df['TIC_ID'], age_df['BPRP0']))
-    tic_to_prot = dict(zip(age_df['TIC_ID'], age_df.get('Prot', pd.Series([np.nan]*len(age_df)))))
+    gaia_ids = np.array([g.decode('utf-8').strip() for g in raw_ids])
 
-    # Map ages, BPRP0, and Prot to each light curve
-    ages = np.array([tic_to_age.get(tic, np.nan) for tic in tic_ids])
-    bprp0 = np.array([tic_to_bprp0.get(tic, np.nan) for tic in tic_ids])
-    prot = np.array([tic_to_prot.get(tic, np.nan) for tic in tic_ids])
+    # Load phot_all.csv and build lookup dicts keyed by GaiaDR3_ID string
+    df = pd.read_csv(csv_path)
+    df['GaiaDR3_ID'] = df['GaiaDR3_ID'].astype(str)
+    id_to_age   = dict(zip(df['GaiaDR3_ID'], df['age_Myr']))
+    id_to_bprp0 = dict(zip(df['GaiaDR3_ID'], df['BPRP0']))
+
+    ages  = np.array([id_to_age.get(gid, np.nan)   for gid in gaia_ids], dtype=float)
+    bprp0 = np.array([id_to_bprp0.get(gid, np.nan) for gid in gaia_ids], dtype=float)
 
     n_with_age = np.sum(~np.isnan(ages))
     print(f'Loaded ages for {n_with_age}/{len(ages)} light curves ({100*n_with_age/len(ages):.1f}%)')
 
-    return ages, bprp0, tic_ids, prot
+    return ages, bprp0, gaia_ids, tic_ids, sectors
 
 
 def plot_umap(latent_vectors: np.ndarray, ages: np.ndarray, output_path: str,
               n_neighbors: int = 15, min_dist: float = 0.1, metric: str = 'euclidean',
-              bprp0_min: float = None, bprp0_max: float = None, bprp0: np.ndarray = None):
+              bprp0_min: float = None, bprp0_max: float = None, bprp0: np.ndarray = None,
+              gaia_ids: np.ndarray = None, tic_ids: np.ndarray = None, sectors: np.ndarray = None):
     """Create UMAP embedding and plot colored by stellar age.
 
     UMAP is computed on ALL samples with valid ages first, then BPRP0 filtering
@@ -454,6 +468,9 @@ def plot_umap(latent_vectors: np.ndarray, ages: np.ndarray, output_path: str,
     latent_valid = latent_vectors[valid_mask]
     ages_valid = ages[valid_mask]
     bprp0_valid = bprp0[valid_mask] if bprp0 is not None else None
+    gaia_ids_valid = gaia_ids[valid_mask] if gaia_ids is not None else None
+    tic_ids_valid = tic_ids[valid_mask] if tic_ids is not None else None
+    sectors_valid = sectors[valid_mask] if sectors is not None else None
     
     print(f'Computing UMAP on {len(latent_valid)} samples with valid ages...')
     
@@ -522,11 +539,19 @@ def plot_umap(latent_vectors: np.ndarray, ages: np.ndarray, output_path: str,
     # Save the FULL embedding data (before BPRP0 filtering) for further analysis
     # This allows replotting with different BPRP0 cuts without recomputing UMAP
     npz_path = output_path.replace('.png', '_data.npz')
-    np.savez(npz_path, 
-             embedding=embedding,  # Full embedding (all samples)
-             ages=ages_valid,      # All ages
-             bprp0=bprp0_valid if bprp0_valid is not None else np.array([]),  # All BPRP0
-             latent_vectors=latent_valid)
+    save_dict = dict(
+        embedding=embedding,
+        ages=ages_valid,
+        bprp0=bprp0_valid if bprp0_valid is not None else np.array([]),
+        latent_vectors=latent_valid,
+    )
+    if gaia_ids_valid is not None:
+        save_dict['gaia_ids'] = gaia_ids_valid.astype(str)
+    if tic_ids_valid is not None:
+        save_dict['tic_ids'] = tic_ids_valid
+    if sectors_valid is not None:
+        save_dict['sectors'] = sectors_valid
+    np.savez(npz_path, **save_dict)
     print(f'Saved embedding data to {npz_path}')
     
     return embedding, ages_valid
@@ -535,37 +560,33 @@ def plot_umap(latent_vectors: np.ndarray, ages: np.ndarray, output_path: str,
 def main():
     parser = argparse.ArgumentParser(description='UMAP visualization of latent space colored by stellar age')
     parser.add_argument('--model_path', type=str, required=True, help='Path to trained model checkpoint')
-    parser.add_argument('--h5_path', type=str, default='data/timeseries.h5', help='Path to H5 data file')
-    parser.add_argument('--pickle_path', type=str, default='data/star_sector_lc_formatted.pickle', help='Path to pickle file with metadata')
-    parser.add_argument('--age_csv_path', type=str, default='data/TIC_cf_data.csv', help='Path to CSV with stellar ages')
+    parser.add_argument('--h5_path', type=str, default='data/timeseries_x.h5', help='Path to H5 data file')
+    parser.add_argument('--age_csv_path', type=str, default='data/phot_all.csv', help='Path to phot_all.csv with stellar ages keyed by GaiaDR3_ID')
     parser.add_argument('--output_dir', type=str, default='output/simple_rnn/umap_plots', help='Output directory')
     parser.add_argument('--hidden_size', type=int, default=64, help='Model hidden size')
-    parser.add_argument('--direction', type=str, default='bi', choices=['forward', 'backward', 'bi'], help='Model direction')
-    parser.add_argument('--mode', type=str, default='parallel', choices=['sequential', 'parallel'], help='Model mode')
-    parser.add_argument('--use_flow', action='store_true', help='Whether model uses flow head')
-    parser.add_argument('--max_length', type=int, default=2048, help='Max sequence length for processing')
+    parser.add_argument('--direction', type=str, default='bi', choices=['forward', 'backward', 'bi'])
+    parser.add_argument('--mode', type=str, default='parallel', choices=['sequential', 'parallel'])
+    parser.add_argument('--use_flow', action='store_true')
+    parser.add_argument('--use_metadata', action='store_true')
+    parser.add_argument('--use_conv_channels', action='store_true')
+    parser.add_argument('--conv_encoder_type', type=str, default='unet', choices=['lightweight', 'unet'])
+    parser.add_argument('--max_length', type=int, default=2048, help='Max sequence length for inference')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for inference')
     parser.add_argument('--n_neighbors', type=int, default=15, help='UMAP n_neighbors parameter')
     parser.add_argument('--min_dist', type=float, default=0.1, help='UMAP min_dist parameter')
-    parser.add_argument('--pooling_mode', type=str, default='multiscale', 
+    parser.add_argument('--pooling_mode', type=str, default='multiscale',
                         choices=['mean', 'multiscale', 'final'],
-                        help='How to aggregate hidden states: mean (original), multiscale (recommended), final')
+                        help='How to aggregate hidden states into a latent vector')
     parser.add_argument('--max_samples', type=int, default=None,
-                        help='Maximum number of samples to process (for faster testing). None = use all.')
+                        help='Maximum number of samples to process. None = use all.')
     parser.add_argument('--stratify_by_age', action='store_true',
-                        help='If set, sample evenly across log-age bins instead of taking first N samples')
+                        help='Sample evenly across log-age bins instead of taking first N samples')
     parser.add_argument('--n_age_bins', type=int, default=20,
                         help='Number of age bins for stratified sampling')
     parser.add_argument('--bprp0_min', type=float, default=None,
-                        help='Minimum BPRP0 value (BP-RP color). None = no lower cut.')
+                        help='Minimum BPRP0 value for plot filtering (post-UMAP). None = no cut.')
     parser.add_argument('--bprp0_max', type=float, default=None,
-                        help='Maximum BPRP0 value (BP-RP color). None = no upper cut.')
-    parser.add_argument('--use_metadata', action='store_true',
-                        help='Use stellar metadata (G_0, BP_0, RP_0, parallax + uncertainties) as model input')
-    parser.add_argument('--use_conv_channels', action='store_true',
-                        help='Use convolutional encoders for power spectrum, f-statistic, and ACF as additional model input')
-    parser.add_argument('--conv_encoder_type', type=str, default='unet', choices=['lightweight', 'unet'],
-                        help="Conv encoder architecture: 'unet' (default, richer but slower) or 'lightweight' (faster but simpler)")
+                        help='Maximum BPRP0 value for plot filtering (post-UMAP). None = no cut.')
 
     args = parser.parse_args()
     
@@ -582,7 +603,7 @@ def main():
     if args.max_samples is not None:
         # Load all ages first for stratified sampling (ignore BPRP0 at this stage)
         print('Loading ages for stratified sampling...')
-        all_ages, all_bprp0, _, _ = load_ages(args.pickle_path, args.age_csv_path, sample_indices=None)
+        all_ages, _, _, _, _ = load_ages(args.h5_path, args.age_csv_path, sample_indices=None)
         
         if args.stratify_by_age:
             # Stratified sampling based on age only (not BPRP0)
@@ -606,40 +627,30 @@ def main():
             print(f'Warning: {n_invalid} sample indices exceed HDF5 size ({h5_size}). Filtering to valid indices.')
             sample_indices = sample_indices[valid_mask]
 
-    # Load model (num_meta_features will be overridden by checkpoint if stored there)
-    num_meta_features = len(DEFAULT_METADATA_FIELDS) if args.use_metadata else 0
+    num_meta_features = len(METADATA_FEATURES) if args.use_metadata else 0
 
-    # Build conv_config if using convolutional channels
     conv_config = None
     if args.use_conv_channels:
-        if args.conv_encoder_type == 'lightweight':
-            conv_config = {
-                'encoder_type': 'lightweight',
-                'hidden_channels': 16,
-                'num_layers': 3,
-                'activation': 'gelu'
-            }
-        else:  # unet
-            conv_config = {
-                'encoder_type': 'unet',
-                'input_length': 16000,
-                'encoder_dims': [4, 8, 16, 32],
-                'num_layers': 4,
-                'activation': 'gelu'
-            }
+        conv_config = {
+            'encoder_type': args.conv_encoder_type,
+            'input_length': 16000,
+            'encoder_dims': [4, 8, 16, 32],
+            'num_layers': 4 if args.conv_encoder_type == 'unet' else 3,
+            'hidden_channels': 16,
+            'activation': 'gelu',
+        }
 
     model = load_model(
-        args.model_path,
-        args.hidden_size,
-        args.direction,
-        args.mode,
-        args.use_flow,
-        device,
+        args.model_path, device,
+        hidden_size=args.hidden_size,
+        direction=args.direction,
+        mode=args.mode,
+        use_flow=args.use_flow,
         num_meta_features=num_meta_features,
         use_conv_channels=args.use_conv_channels,
-        conv_config=conv_config
+        conv_config=conv_config,
     )
-    
+
     # Extract latent vectors (for all selected samples, no BPRP0 filtering)
     latent_vectors = extract_latent_vectors(
         model,
@@ -653,8 +664,8 @@ def main():
         use_conv_channels=args.use_conv_channels
     )
     
-    # Load ages and BPRP0 for selected samples
-    ages, bprp0, tic_ids, prot = load_ages(args.pickle_path, args.age_csv_path, sample_indices=sample_indices)
+    # Load ages, BPRP0, and IDs for selected samples
+    ages, bprp0, gaia_ids, tic_ids, sectors = load_ages(args.h5_path, args.age_csv_path, sample_indices=sample_indices)
     
     # Generate output filename based on model name, pooling mode, and cuts
     model_name = Path(args.model_path).stem
@@ -666,14 +677,17 @@ def main():
     
     # Create UMAP plot (BPRP0 filtering happens inside plot_umap after UMAP is computed)
     plot_umap(
-        latent_vectors, 
-        ages, 
+        latent_vectors,
+        ages,
         str(output_path),
         n_neighbors=args.n_neighbors,
         min_dist=args.min_dist,
         bprp0_min=args.bprp0_min,
         bprp0_max=args.bprp0_max,
-        bprp0=bprp0  # Pass BPRP0 for post-UMAP filtering
+        bprp0=bprp0,
+        gaia_ids=gaia_ids,
+        tic_ids=tic_ids,
+        sectors=sectors,
     )
     
     print('Done!')

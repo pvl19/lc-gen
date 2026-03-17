@@ -18,11 +18,10 @@ from lcgen.models.simple_min_gru import SimpleMinGRU
 from lcgen.utils.trunc_data import extract_data
 from lcgen.utils.loss import recon_loss
 
-# Default metadata feature names (values + uncertainties)
-METADATA_FEATURES = [
-    'norm_G0', 'norm_BP0', 'norm_RP0', 'norm_parallax',
-    'norm_G0_err', 'norm_BP0_err', 'norm_RP0_err', 'norm_parallax_err'
-]
+from lcgen.models.MetadataAgePredictor import DEFAULT_METADATA_FIELDS, MetadataStandardizer
+
+# Default metadata feature names — mirrors DEFAULT_METADATA_FIELDS from MetadataAgePredictor
+METADATA_FEATURES = DEFAULT_METADATA_FIELDS
 
 
 class TimeSeriesDataset(Dataset):
@@ -161,26 +160,20 @@ class TimeSeriesDataset(Dataset):
                 self.flux_err[i] = np.abs(np.random.normal(1,0.5, size=self.flux.shape[1]))+0.05
 
     def _load_metadata_from_h5(self, meta_grp, n_samples):
-        """Load metadata features from H5 group into a numpy array.
-        Raises an error if any required feature is missing.
-        """
-        meta_list = []
-        missing = []
-        for feat_name in self.metadata_features:
-            if feat_name in meta_grp:
-                vals = meta_grp[feat_name][:]
-                # Handle byte strings from HDF5
-                if vals.dtype.kind == 'S':
-                    vals = vals.astype(float)
-                meta_list.append(vals.astype(np.float32))
-            else:
-                missing.append(feat_name)
+        """Load and normalise metadata features from H5 group using MetadataStandardizer."""
+        missing = [f for f in self.metadata_features if f not in meta_grp]
         if missing:
             raise RuntimeError(f"Missing required metadata features in H5 file: {missing}")
-        metadata = np.stack(meta_list, axis=1)  # (n_samples, num_features)
-        # Replace NaN with 0 for missing values
-        metadata = np.nan_to_num(metadata, nan=0.0)
-        return metadata
+
+        data = {}
+        for feat_name in self.metadata_features:
+            vals = meta_grp[feat_name][:]
+            if vals.dtype.kind == 'S':
+                vals = vals.astype(float)
+            data[feat_name] = vals.astype(np.float32)
+
+        standardizer = MetadataStandardizer(fields=self.metadata_features)
+        return standardizer.transform(data)  # (n_samples, num_features), NaNs → 0
 
     def __len__(self):
         return len(self.flux)

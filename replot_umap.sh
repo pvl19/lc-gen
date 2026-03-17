@@ -6,8 +6,8 @@
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-DATA_FILE="output/simple_rnn/umap_plots/umap_age_baseline_v17_real_final_mean_bprp-4.0_data.npz"
-OUTPUT="output/simple_rnn/umap_plots/umap_replot_v17_bprp0_1_2_v3.png"
+DATA_FILE="output/simple_rnn/umap_plots/umap_age_model_multiscale_bprp-4.0_data.npz"
+OUTPUT="output/simple_rnn/umap_plots/umap_replot_model_bprp0_1_2.png"
 
 # For labeling purposes (these don't filter, just add to plot title/text)
 N_SAMPLES="500"            # Number of samples (leave empty if unknown)

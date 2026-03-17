@@ -1,66 +1,93 @@
 #!/bin/bash
-# K-fold cross-validation for age prediction from latent space + BPRP0
-# Each star gets a prediction from a model that never saw it during training
+# K-fold cross-validation for age prediction from latent space + BPRP0.
+# Each star gets a prediction from a model that never saw it during training.
 #
-# Usage: ./kfold_age_inference.sh [model_path] [version] [pooling_mode] [use_metadata] [use_conv] [conv_type] [require_prot] [h5_path]
-# Example: ./kfold_age_inference.sh output/slurm/46126529-lcgen-baseline-flux-only/baseline_flux_only.pt v1 mean false false unet false data/timeseries_x.h5
-# Example: ./kfold_age_inference.sh output/simple_rnn/models/baseline_metadata.pt v2 mean true false unet false data/timeseries_x.h5
-# Example: ./kfold_age_inference.sh output/simple_rnn/models/baseline_metadata_xchannels.pt v3 mean true true unet false data/timeseries_x.h5
-# Example (fair comparison with gyro): ./kfold_age_inference.sh output/simple_rnn/models/baseline.pt v4 mean false false unet true data/timeseries_x.h5
-# Example (baseline_v17 model): ./kfold_age_inference.sh output/simple_rnn/models/baseline_v17_real_final.pt v17 multiscale false false unet true data/timeseries.h5
+# Usage:
+#   ./kfold_age_inference.sh [model_path] [version] [pooling_mode] [star_aggregation] \
+#                            [use_metadata] [use_conv] [conv_type] [require_prot] [h5_path] \
+#                            [save_latents] [load_latents]
 #
-# Pooling modes:
-#   mean       - Mean pooling over valid timesteps (128 dims for hidden_size=64 bi)
-#   multiscale - Multi-scale features: mean, max, std, quartiles, chunks (1536 dims)
-#   final      - Final hidden state only (128 dims)
+# Latents cache workflow (run model once, compare all aggregation methods cheaply):
+#
+#   # Step 1 — run model once, save cache (computes both per-sector AND cross-sector latents):
+#   ./kfold_age_inference.sh output/performance_tests/baseline_long/model.pt v1 multiscale \
+#       cross_sector false false unet true data/timeseries_x.h5 \
+#       output/latents_cache/baseline_long_multiscale.npz ""
+#
+#   # Step 2 — compare aggregation methods by loading from cache (no model required):
+#   ./kfold_age_inference.sh "" v1 multiscale latent_mean   ... "" output/latents_cache/baseline_long_multiscale.npz
+#   ./kfold_age_inference.sh "" v1 multiscale latent_median ... "" output/latents_cache/baseline_long_multiscale.npz
+#   ./kfold_age_inference.sh "" v1 multiscale latent_max    ... "" output/latents_cache/baseline_long_multiscale.npz
+#   ./kfold_age_inference.sh "" v1 multiscale cross_sector  ... "" output/latents_cache/baseline_long_multiscale.npz
+#   ./kfold_age_inference.sh "" v1 multiscale predict_mean  ... "" output/latents_cache/baseline_long_multiscale.npz
+#
+# Star aggregation modes (--star_aggregation):
+#   none          Legacy: one sample per sector, kfold splits by sector.
+#                 WARNING: multi-sector stars can appear in both train and test (leakage).
+#   predict_mean  Per-sector predictions; kfold splits by *star*; final metrics average
+#                 predictions per star. Per-sector CSV also saved for uncertainty analysis.
+#   latent_mean   Sector latents are mean-pooled per star before kfold. No leakage.
+#   latent_median Sector latents are median-pooled per star before kfold. No leakage.
+#   latent_max    Element-wise max across sector latents per star. No leakage.
+#   latent_mean_std  [mean ∥ std] concatenated per star (2× latent dim). No leakage.
+#                 Note: single-sector stars get std=0; may introduce confound.
+#   cross_sector  Hidden states concatenated across all sectors of a star before
+#                 multiscale pooling → one latent per star. No leakage.
+#
+# Pooling modes (applied per sector before any star aggregation):
+#   mean        - Mean pooling over valid timesteps (128 dims for hidden_size=64 bi)
+#   multiscale  - Multi-scale temporal features: mean, std, max, min, quartiles (1536 dims)
+#   final       - Final hidden state only (128 dims)
 
 MODEL_PATH=${1:-"output/performance_tests/cf_final/model.pt"}
 VERSION=${2:-"default"}
 POOLING_MODE=${3:-"multiscale"}
-USE_METADATA=${4:-"false"}
-USE_CONV=${5:-"false"}
-CONV_TYPE=${6:-"unet"}
-REQUIRE_PROT=${7:-"true"}
-H5_PATH=${8:-"data/timeseries_x.h5"}
+STAR_AGGREGATION=${4:-"cross_sector"}
+USE_METADATA=${5:-"true"}
+USE_CONV=${6:-"false"}
+CONV_TYPE=${7:-"unet"}
+REQUIRE_PROT=${8:-"false"}
+H5_PATH=${9:-"data/timeseries_x.h5"}
+SAVE_LATENTS=${10:-""}   # e.g. output/latents_cache/baseline_long_multiscale.npz
+LOAD_LATENTS=${11:-""}   # e.g. output/latents_cache/baseline_long_multiscale.npz
 
-# Select the correct pickle file based on h5 file
-# timeseries.h5 -> star_sector_lc_formatted.pickle
-# timeseries_x.h5 -> star_sector_lc_formatted_with_extra_channels.pickle
-if [[ "${H5_PATH}" == *"timeseries_x"* ]]; then
-    PICKLE_PATH="data/star_sector_lc_formatted_with_extra_channels.pickle"
-else
-    PICKLE_PATH="data/star_sector_lc_formatted.pickle"
-fi
-
-OUTPUT_DIR="output/age_predictor/performance_tests/cf-final-${POOLING_MODE}"
+OUTPUT_DIR="output/age_predictor_tests/cf-final-${POOLING_MODE}-${STAR_AGGREGATION}"
 
 echo "Running k-fold age inference:"
-echo "  Model: ${MODEL_PATH}"
-echo "  H5 file: ${H5_PATH}"
-echo "  Pickle file: ${PICKLE_PATH}"
-echo "  Version: ${VERSION}"
-echo "  Pooling mode: ${POOLING_MODE}"
-echo "  Use metadata: ${USE_METADATA}"
-echo "  Use conv channels: ${USE_CONV}"
-echo "  Conv encoder type: ${CONV_TYPE}"
-echo "  Require Prot: ${REQUIRE_PROT}"
-echo "  Output directory: ${OUTPUT_DIR}"
+echo "  Model:            ${MODEL_PATH:-'(from cache)'}"
+echo "  H5 file:          ${H5_PATH}"
+echo "  Version:          ${VERSION}"
+echo "  Pooling mode:     ${POOLING_MODE}"
+echo "  Star aggregation: ${STAR_AGGREGATION}"
+echo "  Use metadata:     ${USE_METADATA}"
+echo "  Use conv:         ${USE_CONV} (${CONV_TYPE})"
+echo "  Require Prot:     ${REQUIRE_PROT}"
+echo "  Save latents:     ${SAVE_LATENTS:-'(no)'}"
+echo "  Load latents:     ${LOAD_LATENTS:-'(no)'}"
+echo "  Output:           ${OUTPUT_DIR}"
 
-# Build command with conditional flags
-CMD="python scripts/kfold_age_inference.py \
-  --model_path ${MODEL_PATH} \
-  --h5_path ${H5_PATH} \
-  --pickle_path ${PICKLE_PATH} \
-  --age_csv data/TIC_cf_data.csv \
+# When loading from cache the model_path is unused; omit it to avoid confusion
+if [ -n "${LOAD_LATENTS}" ]; then
+  CMD="python scripts/kfold_age_inference.py \
+    --load_latents ${LOAD_LATENTS}"
+else
+  CMD="python scripts/kfold_age_inference.py \
+    --model_path ${MODEL_PATH} \
+    --h5_path ${H5_PATH} \
+    --hidden_size 64 \
+    --direction bi \
+    --mode parallel \
+    --use_flow \
+    --max_length 16384 \
+    --pooling_mode ${POOLING_MODE} \
+    --stratify_by_age \
+    --n_age_bins 20"
+fi
+
+CMD="${CMD} \
+  --age_csv data/phot_all.csv \
   --output_dir ${OUTPUT_DIR} \
-  --hidden_size 64 \
-  --direction bi \
-  --mode parallel \
-  --use_flow \
-  --max_length 16384 \
-  --pooling_mode ${POOLING_MODE} \
-  --stratify_by_age \
-  --n_age_bins 20 \
+  --star_aggregation ${STAR_AGGREGATION} \
   --n_folds 10 \
   --hidden_dims 128 64 32 \
   --dropout 0.2 \
@@ -69,20 +96,20 @@ CMD="python scripts/kfold_age_inference.py \
   --batch_size 64 \
   --seed 42"
 
-# Add metadata flag if requested
+if [ -n "${SAVE_LATENTS}" ]; then
+  CMD="${CMD} --save_latents ${SAVE_LATENTS}"
+fi
+
 if [ "${USE_METADATA}" = "true" ]; then
   CMD="${CMD} --use_metadata"
 fi
 
-# Add conv channels flags if requested
 if [ "${USE_CONV}" = "true" ]; then
   CMD="${CMD} --use_conv_channels --conv_encoder_type ${CONV_TYPE}"
 fi
 
-# Add require_prot flag if requested (for fair comparison with gyro baseline)
 if [ "${REQUIRE_PROT}" = "true" ]; then
   CMD="${CMD} --require_prot"
 fi
 
-# Execute command
 eval $CMD

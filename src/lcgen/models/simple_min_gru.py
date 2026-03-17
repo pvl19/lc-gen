@@ -18,6 +18,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from lcgen.models.MetadataAgePredictor import MetadataEncoder
+
 try:
     import zuko
 except Exception:
@@ -120,10 +122,9 @@ class BiDirectionalMinGRU(nn.Module):
         direction: str = "bi",
         mode: str = "sequential",
         use_flow: bool = False,
-        num_meta_features: int = 8,
+        num_meta_features: int = 13,
         use_conv_channels: bool = False,
         conv_config: dict = None,
-        meta_hidden_dims: list = None,
         meta_dropout: float = 0.1,
     ):
         super().__init__()
@@ -143,26 +144,19 @@ class BiDirectionalMinGRU(nn.Module):
             nn.Linear(num_time_enc_dims, num_time_enc_dims),
         )
 
-        # Stellar metadata encoder: projects static stellar properties to a learned
-        # representation that is broadcast to every RNN timestep as additional context.
-        # Architecture mirrors MetadataEncoder (MetadataAgePredictor) + one extra layer.
+        # Stellar metadata encoder: shared MetadataEncoder from MetadataAgePredictor.
+        # Projects static stellar properties to a learned embedding broadcast to every
+        # RNN timestep as additional context. 3 hidden layers × 128 dims, output 32 dims.
         self.num_meta_features = num_meta_features
-        if meta_hidden_dims is None:
-            meta_hidden_dims = [64, 64, 64]  # 3 hidden layers → 4 linear layers total
         if num_meta_features > 0:
             meta_emb_dim = 32
-            layers = []
-            prev = num_meta_features
-            for h in meta_hidden_dims:
-                layers.extend([
-                    nn.Linear(prev, h),
-                    nn.LayerNorm(h),
-                    nn.GELU(),
-                    nn.Dropout(meta_dropout),
-                ])
-                prev = h
-            layers.append(nn.Linear(prev, meta_emb_dim))
-            self.meta_encoder = nn.Sequential(*layers)
+            self.meta_encoder = MetadataEncoder(
+                input_dim=num_meta_features,
+                latent_dim=meta_emb_dim,
+                hidden_dims=[128, 128, 128],
+                dropout=meta_dropout,
+                use_mask=False,
+            )
         else:
             meta_emb_dim = 0
             self.meta_encoder = None
