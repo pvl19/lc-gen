@@ -3,3 +3,4 @@ tmp/*
 */__pycache__/*
 src/lcgen/models/__pycache__/*
 output/ps_acf_predictor/*
+exop_hosts/lc_data.pickle

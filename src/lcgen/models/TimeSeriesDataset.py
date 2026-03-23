@@ -224,21 +224,15 @@ class TimeSeriesDataset(Dataset):
         return mask
 
     def __getitem__(self, idx):
-        flux = self.flux[idx]
-        flux_err = self.flux_err[idx]
-        time = self.time[idx]
-        L = len(flux)
-        actual_length = self.lengths[idx]
+        actual_length = int(self.lengths[idx])
 
-        # Generate a fresh random mask for this sample
-        mask = self._generate_block_mask(L)
+        # Truncate to actual length — padding is handled dynamically in collate_fn
+        flux = self.flux[idx][:actual_length]
+        flux_err = self.flux_err[idx][:actual_length]
+        time = self.time[idx][:actual_length]
 
-        # Create padding mask: 1 for real data, 0 for padding
-        padding_mask = np.zeros(L, dtype=np.float32)
-        padding_mask[:actual_length] = 1.0
-
-        # Combine random mask with padding mask (both must be 1 for position to be valid)
-        combined_mask = mask * padding_mask
+        # Generate block mask over actual data only (all positions real, no padding mask needed)
+        mask = self._generate_block_mask(actual_length)
 
         # Get metadata if available
         if self.use_metadata and self.metadata is not None:
@@ -257,7 +251,7 @@ class TimeSeriesDataset(Dataset):
             f_stat = np.zeros(0, dtype=np.float32)
             acf = np.zeros(0, dtype=np.float32)
 
-        return [flux, flux_err, time, combined_mask, meta, power, f_stat, acf]
+        return [flux, flux_err, time, mask, actual_length, meta, power, f_stat, acf]
     
     def apply_block_mask(self, min_size, max_size, mask_portion):
         """
@@ -315,28 +309,39 @@ class TimeSeriesDataset(Dataset):
         self.mask = mask
 
 def collate_fn(batch):
-    """Collate list of samples into batched tensors.
+    """Collate list of samples into batched tensors with dynamic padding.
 
-    Each item in batch is [flux, flux_err, time, mask, metadata, power, f_stat, acf]
-    where flux/flux_err/time/mask are 1D numpy arrays of length L,
+    Each item in batch is [flux, flux_err, time, mask, actual_length, metadata, power, f_stat, acf]
+    where flux/flux_err/time/mask are 1D numpy arrays of varying length (actual_length),
     metadata is a 1D array of stellar features,
     and power/f_stat/acf are 1D arrays of frequency-domain features.
 
+    Sequences are padded with zeros to the longest sequence in the batch.
+    Padded positions have mask=0, so they are excluded from the loss automatically.
+
     Return a tuple of torch.FloatTensors: (flux, flux_err, time, mask, metadata, conv_data)
-    with shapes (B, L) for time series, (B, num_meta_features) for metadata,
+    with shapes (B, L_max) for time series, (B, num_meta_features) for metadata,
     and conv_data is a dict with power/f_stat/acf of shape (B, freq_length) or None.
     """
-    fluxes = np.stack([b[0] for b in batch], axis=0).astype(np.float32)
-    flux_errs = np.stack([b[1] for b in batch], axis=0).astype(np.float32)
-    times = np.stack([b[2] for b in batch], axis=0).astype(np.float32)
-    masks = np.stack([b[3] for b in batch], axis=0).astype(np.float32)
-    metadata = np.stack([b[4] for b in batch], axis=0).astype(np.float32)
+    lengths = np.array([b[4] for b in batch], dtype=np.int32)
+    batch_max_len = int(lengths.max())
+
+    def pad(arr):
+        out = np.zeros(batch_max_len, dtype=np.float32)
+        out[:len(arr)] = arr
+        return out
+
+    fluxes    = np.stack([pad(b[0]) for b in batch])
+    flux_errs = np.stack([pad(b[1]) for b in batch])
+    times     = np.stack([pad(b[2]) for b in batch])
+    masks     = np.stack([pad(b[3]) for b in batch])  # block mask, zero-padded → padding positions get mask=0
+    metadata  = np.stack([b[5] for b in batch]).astype(np.float32)
 
     # Check if conv data is present (non-empty arrays)
-    if len(batch[0][5]) > 0:
-        power = np.stack([b[5] for b in batch], axis=0).astype(np.float32)
-        f_stat = np.stack([b[6] for b in batch], axis=0).astype(np.float32)
-        acf = np.stack([b[7] for b in batch], axis=0).astype(np.float32)
+    if len(batch[0][6]) > 0:
+        power  = np.stack([b[6] for b in batch]).astype(np.float32)
+        f_stat = np.stack([b[7] for b in batch]).astype(np.float32)
+        acf    = np.stack([b[8] for b in batch]).astype(np.float32)
         conv_data = {
             'power': torch.from_numpy(power),
             'f_stat': torch.from_numpy(f_stat),

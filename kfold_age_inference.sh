@@ -42,16 +42,16 @@
 MODEL_PATH=${1:-"output/performance_tests/cf_final/model.pt"}
 VERSION=${2:-"default"}
 POOLING_MODE=${3:-"multiscale"}
-STAR_AGGREGATION=${4:-"cross_sector"}
+STAR_AGGREGATION=${4:-"latent_median"}
 USE_METADATA=${5:-"true"}
 USE_CONV=${6:-"false"}
 CONV_TYPE=${7:-"unet"}
 REQUIRE_PROT=${8:-"false"}
 H5_PATH=${9:-"data/timeseries_x.h5"}
 SAVE_LATENTS=${10:-""}   # e.g. output/latents_cache/baseline_long_multiscale.npz
-LOAD_LATENTS=${11:-""}   # e.g. output/latents_cache/baseline_long_multiscale.npz
+LOAD_LATENTS=${11:-"output/latents_cache/cf_final_multiscale.npz"}   # e.g. output/latents_cache/baseline_long_multiscale.npz
 
-OUTPUT_DIR="output/age_predictor_tests/cf-final-${POOLING_MODE}-${STAR_AGGREGATION}"
+OUTPUT_DIR="output/age_predictor_tests/cf-final-nf-${POOLING_MODE}-${STAR_AGGREGATION}"
 
 echo "Running k-fold age inference:"
 echo "  Model:            ${MODEL_PATH:-'(from cache)'}"
@@ -78,7 +78,7 @@ else
     --direction bi \
     --mode parallel \
     --use_flow \
-    --max_length 16384 \
+    --max_length 8192 \
     --pooling_mode ${POOLING_MODE} \
     --stratify_by_age \
     --n_age_bins 20"
@@ -89,11 +89,14 @@ CMD="${CMD} \
   --output_dir ${OUTPUT_DIR} \
   --star_aggregation ${STAR_AGGREGATION} \
   --n_folds 10 \
-  --hidden_dims 128 64 32 \
+  --hidden_dims 128 64 8 \
   --dropout 0.2 \
   --lr 1e-3 \
   --n_epochs 100 \
   --batch_size 64 \
+  --flow_transforms 13 \
+  --flow_hidden_dims 128 128 \
+  --n_flow_samples 1000
   --seed 42"
 
 if [ -n "${SAVE_LATENTS}" ]; then

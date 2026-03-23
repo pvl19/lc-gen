@@ -439,16 +439,18 @@ def load_ages(h5_path: str, csv_path: str, sample_indices: np.ndarray = None):
     # Load phot_all.csv and build lookup dicts keyed by GaiaDR3_ID string
     df = pd.read_csv(csv_path)
     df['GaiaDR3_ID'] = df['GaiaDR3_ID'].astype(str)
-    id_to_age   = dict(zip(df['GaiaDR3_ID'], df['age_Myr']))
-    id_to_bprp0 = dict(zip(df['GaiaDR3_ID'], df['BPRP0']))
+    id_to_age       = dict(zip(df['GaiaDR3_ID'], df['age_Myr']))
+    id_to_bprp0     = dict(zip(df['GaiaDR3_ID'], df['BPRP0']))
+    id_to_bprp0_err = dict(zip(df['GaiaDR3_ID'], df['BPRP0_err']))
 
-    ages  = np.array([id_to_age.get(gid, np.nan)   for gid in gaia_ids], dtype=float)
-    bprp0 = np.array([id_to_bprp0.get(gid, np.nan) for gid in gaia_ids], dtype=float)
+    ages      = np.array([id_to_age.get(gid, np.nan)       for gid in gaia_ids], dtype=float)
+    bprp0     = np.array([id_to_bprp0.get(gid, np.nan)     for gid in gaia_ids], dtype=float)
+    bprp0_err = np.array([id_to_bprp0_err.get(gid, np.nan) for gid in gaia_ids], dtype=float)
 
     n_with_age = np.sum(~np.isnan(ages))
     print(f'Loaded ages for {n_with_age}/{len(ages)} light curves ({100*n_with_age/len(ages):.1f}%)')
 
-    return ages, bprp0, gaia_ids, tic_ids, sectors
+    return ages, bprp0, bprp0_err, gaia_ids, tic_ids, sectors
 
 
 def plot_umap(latent_vectors: np.ndarray, ages: np.ndarray, output_path: str,
