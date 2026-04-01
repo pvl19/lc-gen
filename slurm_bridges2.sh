@@ -95,7 +95,7 @@ time -p singularity exec --nv --bind /ocean,$LOCAL,$HOME \
     --output_dir output \
     --random_seed 19 \
     --direction bi \
-    --max_length 16384 \
+    --max_length 32768 \
     --num_samples 8192 \
     --batch_size 128 \
     --hidden_size 64 \
