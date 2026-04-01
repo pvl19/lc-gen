@@ -442,15 +442,19 @@ def load_ages(h5_path: str, csv_path: str, sample_indices: np.ndarray = None):
     id_to_age       = dict(zip(df['GaiaDR3_ID'], df['age_Myr']))
     id_to_bprp0     = dict(zip(df['GaiaDR3_ID'], df['BPRP0']))
     id_to_bprp0_err = dict(zip(df['GaiaDR3_ID'], df['BPRP0_err']))
+    id_to_mg        = dict(zip(df['GaiaDR3_ID'], df['MG_quick']))    if 'MG_quick'      in df.columns else {}
+    id_to_mem_prob  = dict(zip(df['GaiaDR3_ID'], df['mem_prob_val'])) if 'mem_prob_val' in df.columns else {}
 
-    ages      = np.array([id_to_age.get(gid, np.nan)       for gid in gaia_ids], dtype=float)
-    bprp0     = np.array([id_to_bprp0.get(gid, np.nan)     for gid in gaia_ids], dtype=float)
+    ages      = np.array([id_to_age.get(gid, np.nan)      for gid in gaia_ids], dtype=float)
+    bprp0     = np.array([id_to_bprp0.get(gid, np.nan)    for gid in gaia_ids], dtype=float)
     bprp0_err = np.array([id_to_bprp0_err.get(gid, np.nan) for gid in gaia_ids], dtype=float)
+    mg        = np.array([id_to_mg.get(gid, np.nan)       for gid in gaia_ids], dtype=float)
+    mem_prob  = np.array([id_to_mem_prob.get(gid, np.nan) for gid in gaia_ids], dtype=float)
 
     n_with_age = np.sum(~np.isnan(ages))
     print(f'Loaded ages for {n_with_age}/{len(ages)} light curves ({100*n_with_age/len(ages):.1f}%)')
 
-    return ages, bprp0, bprp0_err, gaia_ids, tic_ids, sectors
+    return ages, bprp0, bprp0_err, mg, mem_prob, gaia_ids, tic_ids, sectors
 
 
 def plot_umap(latent_vectors: np.ndarray, ages: np.ndarray, output_path: str,

@@ -33,6 +33,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 
 try:
@@ -58,131 +59,209 @@ P_OUTLIER     = 0.05                   # outlier fraction per star
 # ---------------------------------------------------------------------------
 
 class AgePredictor(nn.Module):
-    """Neural Likelihood Estimation: MLP compressor + NSF modelling p(z | log10_age, BPRP0).
+    """Neural Likelihood Estimation via NSF:
+    models p(z_pca | log10_age, BPRP0, log10(BPRP0_err), log10(MG_quick)).
 
-    Architecture (Neural Likelihood Estimation, NLE):
-      - MLP encoder: latent_dim → hidden_dims → hidden_dims[-1]  (compressed z)
-      - NSF flow:    p(z | log10_age, bprp0_norm)  (2-D context)
+    No learned encoder — the input z is a fixed PCA projection of the autoencoder latent,
+    fit per fold on training data only (no leakage, no collapse).
 
-    Training: flow is conditioned on the *true* (log10_age, bprp0_norm) and trained
-    to reconstruct the compressed latent z.  An outlier mixture model with fixed
-    weights (P_CLUSTER_MEM=0.9, P_OUTLIER=0.05) is applied following ChronoFlow.
+    Training: flow conditioned on (log10_age, bprp0, log10(bprp0_err), log10(mg)), trained
+    to assign high likelihood to the observed PCA-compressed latent z.
 
-    Inference: the likelihood p(z | age_g, bprp0) is evaluated on a dense age grid
-    and multiplied by a uniform log-age prior to obtain a discrete posterior, from
-    which median/mean/MAP/p16/p84 are extracted.
+    Inference: likelihood evaluated over a dense age grid; posterior = likelihood × uniform prior.
     """
 
-    def __init__(self, latent_dim: int, hidden_dims: list = [128, 64, 8], dropout: float = 0.2,
-                 flow_transforms: int = 4, flow_hidden_features: list = None):
+    def __init__(self, pca_dim: int, flow_transforms: int = 8,
+                 flow_hidden_features: list = None, use_mg: bool = False):
         super().__init__()
         if zuko is None:
             raise ImportError("zuko is required for the flow head. Install with: pip install zuko")
         if flow_hidden_features is None:
             flow_hidden_features = [64, 64]
 
-        layers = []
-        prev_dim = latent_dim
-        for hidden_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-            ])
-            prev_dim = hidden_dim
-        self.encoder = nn.Sequential(*layers)
-        self.z_dim = hidden_dims[-1]
-
-        # NSF: features = compressed z dim, context = (log10_age, bprp0_norm, bprp0_err_norm)
+        self.pca_dim = pca_dim
+        self.use_mg  = use_mg
+        context_dim  = 4 if use_mg else 3
         self.flow = zuko.flows.NSF(
-            features=self.z_dim,
-            context=3,
+            features=pca_dim,
+            context=context_dim,
+            transforms=flow_transforms,
+            hidden_features=flow_hidden_features,
+        )
+
+    def _nll_with_outlier(self, log_prob_flow: torch.Tensor, z: torch.Tensor,
+                          mem_prob: torch.Tensor = None) -> torch.Tensor:
+        # Per-sample membership probability; fall back to constant for NaN entries
+        if mem_prob is None:
+            p_mem = P_CLUSTER_MEM
+        else:
+            p_mem = torch.where(torch.isnan(mem_prob), torch.full_like(mem_prob, P_CLUSTER_MEM), mem_prob)
+        nf_weight    = p_mem * (1.0 - P_OUTLIER)
+        ln_p_outlier = (
+            -0.5 * z.pow(2).sum(dim=-1)
+            - 0.5 * self.pca_dim * np.log(2.0 * np.pi)
+        )
+        ln_p_combined = torch.logsumexp(
+            torch.stack([
+                torch.log(nf_weight)       + log_prob_flow,
+                torch.log(1.0 - nf_weight) + ln_p_outlier,
+            ], dim=0), dim=0
+        )
+        return -ln_p_combined.mean()
+
+    def forward(self, z: torch.Tensor, log_age: torch.Tensor,
+                bprp0: torch.Tensor, log_bprp0_err: torch.Tensor,
+                log_mg: torch.Tensor = None, mem_prob: torch.Tensor = None) -> torch.Tensor:
+        parts = [log_age, bprp0, log_bprp0_err]
+        if self.use_mg:
+            parts.append(log_mg)
+        context = torch.stack(parts, dim=1)
+        return self._nll_with_outlier(self.flow(context).log_prob(z), z, mem_prob)
+
+    def predict_stats(self, z: torch.Tensor, bprp0: torch.Tensor,
+                      log_bprp0_err: torch.Tensor, log_mg: torch.Tensor,
+                      loga_grid: torch.Tensor) -> dict:
+        """Grid-based posterior: p(age | z, bprp0) ∝ p(z | age, bprp0) · p(age)."""
+        B, D = z.shape
+        G    = loga_grid.shape[0]
+
+        z_exp     = z.unsqueeze(1).expand(B, G, D).reshape(B * G, D)
+        bprp0_exp = bprp0.unsqueeze(1).expand(B, G).reshape(B * G)
+        berr_exp  = log_bprp0_err.unsqueeze(1).expand(B, G).reshape(B * G)
+        loga_exp  = loga_grid.unsqueeze(0).expand(B, G).reshape(B * G)
+        parts     = [loga_exp, bprp0_exp, berr_exp]
+        if self.use_mg:
+            parts.append(log_mg.unsqueeze(1).expand(B, G).reshape(B * G))
+        context   = torch.stack(parts, dim=1)
+
+        log_lik   = self.flow(context).log_prob(z_exp).reshape(B, G)
+        log_post  = log_lik - torch.logsumexp(log_lik, dim=1, keepdim=True)
+        posterior = log_post.exp()
+
+        map_idx = posterior.argmax(dim=1)
+        map_est = loga_grid[map_idx]
+        mean    = (posterior * loga_grid.unsqueeze(0)).sum(dim=1)
+        cdf     = posterior.cumsum(dim=1)
+
+        def pct(p: float) -> torch.Tensor:
+            return loga_grid[(cdf >= p).float().argmax(dim=1)]
+
+        return {
+            'median': pct(0.5),
+            'mean':   mean,
+            'map':    map_est,
+            'p16':    pct(0.16),
+            'p84':    pct(0.84),
+        }
+
+
+class AgePredictorMLP(nn.Module):
+    """NLE with a learned MLP encoder to compress the autoencoder latent.
+
+    Architecture:
+        latent (input_dim) → MLP encoder → bottleneck (bottleneck_dim, LayerNorm)
+                                                   ↓
+                NSF flow: p(bottleneck | log10_age, bprp0, log10(bprp0_err), log10(mg))
+
+    Collapse prevention: an auxiliary linear head predicts log10_age from the bottleneck
+    with an L1 loss scaled by aux_loss_weight. This gives the encoder a direct age gradient
+    so it cannot ignore age-relevant dimensions.
+    """
+
+    def __init__(self, input_dim: int, bottleneck_dim: int,
+                 mlp_hidden: list = None,
+                 flow_transforms: int = 8,
+                 flow_hidden_features: list = None,
+                 aux_loss_weight: float = 1.0,
+                 use_mg: bool = False):
+        super().__init__()
+        if zuko is None:
+            raise ImportError("zuko is required for the flow head. Install with: pip install zuko")
+        if mlp_hidden is None:
+            mlp_hidden = [256, 128]
+        if flow_hidden_features is None:
+            flow_hidden_features = [64, 64]
+
+        self.bottleneck_dim  = bottleneck_dim
+        self.aux_loss_weight = aux_loss_weight
+        self.use_mg          = use_mg
+        context_dim          = 4 if use_mg else 3
+
+        # MLP encoder
+        layers = []
+        prev = input_dim
+        for h in mlp_hidden:
+            layers += [nn.Linear(prev, h), nn.ReLU()]
+            prev = h
+        layers += [nn.Linear(prev, bottleneck_dim), nn.LayerNorm(bottleneck_dim)]
+        self.encoder = nn.Sequential(*layers)
+
+        # Auxiliary age head (linear, trained with L1 loss)
+        self.aux_age_head = nn.Linear(bottleneck_dim, 1)
+
+        # NSF flow
+        self.flow = zuko.flows.NSF(
+            features=bottleneck_dim,
+            context=context_dim,
             transforms=flow_transforms,
             hidden_features=flow_hidden_features,
         )
 
     def _nll_with_outlier(self, log_prob_flow: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        """Outlier mixture loss following ChronoFlow convention.
-
-        Mixture: nf_weight * p_flow(z) + (1 - nf_weight) * p_outlier(z)
-        Outlier distribution: isotropic standard normal over z (integrates to 1).
-        """
-        nf_weight = P_CLUSTER_MEM * (1.0 - P_OUTLIER)   # 0.855, constant
+        nf_weight    = P_CLUSTER_MEM * (1.0 - P_OUTLIER)
         ln_p_outlier = (
             -0.5 * z.pow(2).sum(dim=-1)
-            - 0.5 * self.z_dim * np.log(2.0 * np.pi)
+            - 0.5 * self.bottleneck_dim * np.log(2.0 * np.pi)
         )
-        ln_p_cond_weighted = nf_weight * log_prob_flow
-        ln_p_out           = np.log(1.0 - nf_weight) + ln_p_outlier
         ln_p_combined = torch.logsumexp(
-            torch.stack([ln_p_cond_weighted, ln_p_out], dim=0), dim=0
+            torch.stack([
+                np.log(nf_weight)       + log_prob_flow,
+                np.log(1.0 - nf_weight) + ln_p_outlier,
+            ], dim=0), dim=0
         )
         return -ln_p_combined.mean()
 
-    def forward(self, latent: torch.Tensor, log_age: torch.Tensor,
-                bprp0_norm: torch.Tensor, bprp0_err_norm: torch.Tensor) -> torch.Tensor:
-        """Compute NLL training loss.
+    def forward(self, x: torch.Tensor, log_age: torch.Tensor,
+                bprp0: torch.Tensor, log_bprp0_err: torch.Tensor,
+                log_mg: torch.Tensor = None, mem_prob: torch.Tensor = None) -> torch.Tensor:
+        """NLL + auxiliary age loss."""
+        z     = self.encoder(x)
+        parts = [log_age, bprp0, log_bprp0_err]
+        if self.use_mg:
+            parts.append(log_mg)
+        context = torch.stack(parts, dim=1)
+        nll     = self._nll_with_outlier(self.flow(context).log_prob(z), z, mem_prob)
+        aux     = torch.mean(torch.abs(self.aux_age_head(z).squeeze(1) - log_age))
+        return nll + self.aux_loss_weight * aux
 
-        Args:
-            latent:        (B, latent_dim)  normalised latent vectors
-            log_age:       (B,)             log10(age/Myr) — used as flow context
-            bprp0_norm:    (B,)             normalised BPRP0 — used as flow context
-            bprp0_err_norm:(B,)             normalised BPRP0_err — used as flow context
-        Returns:
-            scalar NLL loss (with outlier model)
-        """
-        z       = self.encoder(latent)                                          # (B, z_dim)
-        context = torch.stack([log_age, bprp0_norm, bprp0_err_norm], dim=1)    # (B, 3)
-        dist    = self.flow(context)
-        return self._nll_with_outlier(dist.log_prob(z), z)
-
-    def predict_stats(self, latent: torch.Tensor, bprp0_norm: torch.Tensor,
-                      bprp0_err_norm: torch.Tensor, loga_grid: torch.Tensor) -> dict:
-        """Grid-based posterior inference: p(age | z, bprp0) ∝ p(z | age, bprp0) · p(age).
-
-        Evaluates the flow likelihood over the full age grid in a single batched
-        forward pass, applies a uniform log-age prior (flat → cancels in normalisation),
-        and extracts summary statistics from the discrete posterior.
-
-        Args:
-            latent:        (B, latent_dim)
-            bprp0_norm:    (B,)
-            bprp0_err_norm:(B,)
-            loga_grid:     (G,) log10(age/Myr) evaluation grid
-        Returns:
-            dict of (B,) tensors: median, mean, map, p16, p84 in log10(age/Myr)
-        """
-        z = self.encoder(latent)   # (B, z_dim)
+    def predict_stats(self, x: torch.Tensor, bprp0: torch.Tensor,
+                      log_bprp0_err: torch.Tensor, log_mg: torch.Tensor,
+                      loga_grid: torch.Tensor) -> dict:
+        """Grid-based posterior (same interface as AgePredictor.predict_stats)."""
+        z = self.encoder(x)
         B, D = z.shape
         G    = loga_grid.shape[0]
 
-        # Expand to (B*G, ...) for a single batched flow evaluation
-        z_exp         = z.unsqueeze(1).expand(B, G, D).reshape(B * G, D)
-        bprp0_exp     = bprp0_norm.unsqueeze(1).expand(B, G).reshape(B * G)
-        bprp0_err_exp = bprp0_err_norm.unsqueeze(1).expand(B, G).reshape(B * G)
-        loga_exp      = loga_grid.unsqueeze(0).expand(B, G).reshape(B * G)
-        context       = torch.stack([loga_exp, bprp0_exp, bprp0_err_exp], dim=1)  # (B*G, 3)
+        z_exp     = z.unsqueeze(1).expand(B, G, D).reshape(B * G, D)
+        bprp0_exp = bprp0.unsqueeze(1).expand(B, G).reshape(B * G)
+        berr_exp  = log_bprp0_err.unsqueeze(1).expand(B, G).reshape(B * G)
+        loga_exp  = loga_grid.unsqueeze(0).expand(B, G).reshape(B * G)
+        parts     = [loga_exp, bprp0_exp, berr_exp]
+        if self.use_mg:
+            parts.append(log_mg.unsqueeze(1).expand(B, G).reshape(B * G))
+        context   = torch.stack(parts, dim=1)
 
-        log_lik = self.flow(context).log_prob(z_exp).reshape(B, G)  # (B, G)
-
-        # Uniform prior in log-age is constant → cancels; normalise directly
+        log_lik   = self.flow(context).log_prob(z_exp).reshape(B, G)
         log_post  = log_lik - torch.logsumexp(log_lik, dim=1, keepdim=True)
-        posterior = log_post.exp()                                   # (B, G)
+        posterior = log_post.exp()
 
-        # MAP
         map_idx = posterior.argmax(dim=1)
         map_est = loga_grid[map_idx]
-
-        # Mean
-        mean = (posterior * loga_grid.unsqueeze(0)).sum(dim=1)
-
-        # CDF-based percentiles
-        cdf = posterior.cumsum(dim=1)
+        mean    = (posterior * loga_grid.unsqueeze(0)).sum(dim=1)
+        cdf     = posterior.cumsum(dim=1)
 
         def pct(p: float) -> torch.Tensor:
-            idx = (cdf >= p).float().argmax(dim=1)
-            return loga_grid[idx]
+            return loga_grid[(cdf >= p).float().argmax(dim=1)]
 
         return {
             'median': pct(0.5),
@@ -402,9 +481,9 @@ def load_data_fresh(model_path: str, h5_path: str, csv_path: str,
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # -- Step 1: load full metadata to build the valid-sample mask ----------
-    all_ages, all_bprp0, all_bprp0_err, all_gaia_ids, _, _ = load_ages(h5_path, csv_path, sample_indices=None)
+    all_ages, all_bprp0, all_bprp0_err, all_mg, all_mem_prob, all_gaia_ids, _, _ = load_ages(h5_path, csv_path, sample_indices=None)
 
-    valid_mask = ~np.isnan(all_ages) & ~np.isnan(all_bprp0) & ~np.isnan(all_bprp0_err)
+    valid_mask = ~np.isnan(all_ages) & ~np.isnan(all_bprp0) & ~np.isnan(all_bprp0_err) & ~np.isnan(all_mg)
     if bprp0_min is not None:
         valid_mask &= (all_bprp0 >= bprp0_min)
     if bprp0_max is not None:
@@ -438,14 +517,17 @@ def load_data_fresh(model_path: str, h5_path: str, csv_path: str,
 
     # -- Step 3: load metadata for selected samples -------------------------
     # Done before extraction so tic_ids are available for star-grouped processing.
-    ages, bprp0, bprp0_err, gaia_ids, tic_ids, sectors = load_ages(h5_path, csv_path, sample_indices)
+    ages, bprp0, bprp0_err, mg, mem_prob, gaia_ids, tic_ids, sectors = load_ages(h5_path, csv_path, sample_indices)
 
     # Defensive validity filter (load_ages returns sorted order matching sorted sample_indices)
-    final_ok        = ~np.isnan(ages) & ~np.isnan(bprp0) & ~np.isnan(bprp0_err)
+    # mem_prob may be NaN for non-cluster stars — that is valid, do not filter on it
+    final_ok        = ~np.isnan(ages) & ~np.isnan(bprp0) & ~np.isnan(bprp0_err) & ~np.isnan(mg)
     sorted_indices  = np.sort(sample_indices)[final_ok]
     ages      = ages[final_ok]
     bprp0     = bprp0[final_ok]
     bprp0_err = bprp0_err[final_ok]
+    mg        = mg[final_ok]
+    mem_prob  = mem_prob[final_ok]
     gaia_ids  = gaia_ids[final_ok]
     tic_ids   = tic_ids[final_ok]
     sectors   = sectors[final_ok]
@@ -477,7 +559,7 @@ def load_data_fresh(model_path: str, h5_path: str, csv_path: str,
     print(f'Age range: {ages.min():.1f} – {ages.max():.1f} Myr')
     print(f'Unique stars: {len(np.unique(tic_ids))}')
 
-    return latent_vectors, cross_sector_latents, cross_sector_tic_ids, ages, bprp0, bprp0_err, gaia_ids, tic_ids, sectors
+    return latent_vectors, cross_sector_latents, cross_sector_tic_ids, ages, bprp0, bprp0_err, mg, mem_prob, gaia_ids, tic_ids, sectors
 
 
 # ---------------------------------------------------------------------------
@@ -545,8 +627,11 @@ def load_latents_cache(cache_path: str):
 # Star-level aggregation helpers
 # ---------------------------------------------------------------------------
 
-def aggregate_by_star(latent_vectors, ages, bprp0, bprp0_err, tic_ids, method: str):
+def aggregate_by_star(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids, gaia_ids, method: str):
     """Reduce per-sector arrays to one row per unique star.
+
+    Groups by GaiaID (not TIC ID) as the primary key, since occasional cases
+    exist where multiple TIC IDs map to the same Gaia source.
 
     Args:
         method: one of 'latent_mean', 'latent_median', 'latent_max',
@@ -563,16 +648,20 @@ def aggregate_by_star(latent_vectors, ages, bprp0, bprp0_err, tic_ids, method: s
         star_ages:       (n_stars,)
         star_bprp0:      (n_stars,)
         star_bprp0_err:  (n_stars,)
-        unique_tic_ids:  (n_stars,)
+        star_mg:         (n_stars,)
+        star_mem_prob:   (n_stars,)
+        unique_gaia_ids: (n_stars,)
     """
-    unique_tics  = np.unique(tic_ids)
-    star_latents  = []
-    star_ages     = []
-    star_bprp0    = []
+    unique_gids    = np.unique(gaia_ids)
+    star_latents   = []
+    star_ages      = []
+    star_bprp0     = []
     star_bprp0_err = []
+    star_mg        = []
+    star_mem_prob  = []
 
-    for tic in unique_tics:
-        mask = tic_ids == tic
+    for gid in unique_gids:
+        mask = gaia_ids == gid
         sectors_latents = latent_vectors[mask]  # (n_sectors, D)
         if method == 'latent_mean':
             star_latents.append(sectors_latents.mean(axis=0))
@@ -589,10 +678,13 @@ def aggregate_by_star(latent_vectors, ages, bprp0, bprp0_err, tic_ids, method: s
         star_ages.append(ages[mask][0])
         star_bprp0.append(bprp0[mask][0])
         star_bprp0_err.append(bprp0_err[mask][0])
+        star_mg.append(mg[mask][0])
+        star_mem_prob.append(mem_prob[mask][0])
 
     star_latents = np.stack(star_latents)
-    print(f'{method}: reduced to {len(unique_tics)} stars | latent dim: {star_latents.shape[1]}')
-    return star_latents, np.array(star_ages), np.array(star_bprp0), np.array(star_bprp0_err), unique_tics
+    print(f'{method}: reduced to {len(unique_gids)} stars | latent dim: {star_latents.shape[1]}')
+    return (star_latents, np.array(star_ages), np.array(star_bprp0), np.array(star_bprp0_err),
+            np.array(star_mg), np.array(star_mem_prob), unique_gids)
 
 
 def extract_cross_sector_latents(model, h5_path: str, device: torch.device,
@@ -688,78 +780,154 @@ def extract_cross_sector_latents(model, h5_path: str, device: torch.device,
 
 
 # ---------------------------------------------------------------------------
+# LR scheduler
+# ---------------------------------------------------------------------------
+
+class CombinedLRScheduler:
+    """Exponential decay multiplied by cosine annealing (mirrors ChronoFlow notebook).
+
+    lr = initial_lr * decay_rate^epoch * 0.5 * (1 + cos(π * epoch / T_max))
+
+    decay_rate controls how aggressively the lr falls over training.
+    A value of 10**(-3 / n_epochs) reduces the base lr by 1000x over the full run.
+    T_max is the cosine period; setting it to n_epochs gives one full cosine cycle.
+    """
+    def __init__(self, optimizer, n_epochs: int, initial_lr: float,
+                 decay_rate: float = None):
+        self.optimizer    = optimizer
+        self.T_max        = n_epochs
+        self.initial_lr   = initial_lr
+        self.decay_rate   = decay_rate if decay_rate is not None else 10 ** (-3.0 / n_epochs)
+        self.current_epoch = 0
+
+    def step(self):
+        exp_factor    = self.decay_rate ** self.current_epoch
+        cos_factor    = 0.5 * (1.0 + np.cos(np.pi * self.current_epoch / self.T_max))
+        new_lr        = self.initial_lr * exp_factor * cos_factor
+        for pg in self.optimizer.param_groups:
+            pg['lr'] = new_lr
+        self.current_epoch += 1
+
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
-def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train,
-                      X_val, bprp0_val, bprp0_err_val,
-                      hidden_dims, dropout, lr, weight_decay, n_epochs, batch_size, device,
-                      flow_transforms=4, flow_hidden_features=None, loga_grid=None):
-    """Train one fold NLE model, return validation posterior stats and best model state.
+def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, mem_prob_train,
+                      X_val, y_val, bprp0_val, bprp0_err_val, mg_val, mem_prob_val,
+                      pca_dim, lr, weight_decay, n_epochs, batch_size, device,
+                      flow_transforms=8, flow_hidden_features=None, loga_grid=None,
+                      encoder_type='pca', mlp_encoder_hidden=None, aux_loss_weight=1.0,
+                      use_mg=False, lr_decay_rate=None):
+    """Train one fold NLE model.
 
-    X_train/X_val:            (N, latent_dim) normalised latent vectors
-    y_train:                  (N,) log10(age/Myr) — used as flow context at training time
-    bprp0_train/val:          (N,) normalised BPRP0 — used as flow context
-    bprp0_err_train/val:      (N,) normalised BPRP0_err — used as flow context
-    loga_grid:                (G,) torch.Tensor age grid for posterior inference
+    encoder_type='pca': PCA fit on training fold only (no leakage, no collapse).
+    encoder_type='mlp': Jointly-trained MLP encoder with auxiliary age L1 loss to
+                        prevent collapse. No PCA step; raw z-scored latents used.
+
+    Returns:
+        val_stats, best_loss, best_state, fold_pca, train_losses, val_losses
+        (fold_pca is None when encoder_type='mlp')
     """
     if loga_grid is None:
         loga_grid = torch.tensor(LOGA_GRID, dtype=torch.float32, device=device)
 
+    fold_pca = None
+
+    if encoder_type == 'pca':
+        fold_pca  = PCA(n_components=pca_dim, whiten=True)
+        Z_train   = fold_pca.fit_transform(X_train).astype(np.float32)
+        Z_val     = fold_pca.transform(X_val).astype(np.float32)
+        var_expl  = fold_pca.explained_variance_ratio_.sum()
+        print(f'    PCA {pca_dim}D: {100*var_expl:.1f}% variance explained')
+        model = AgePredictor(pca_dim, flow_transforms=flow_transforms,
+                             flow_hidden_features=flow_hidden_features,
+                             use_mg=use_mg).to(device)
+    else:  # mlp
+        Z_train = X_train.astype(np.float32)
+        Z_val   = X_val.astype(np.float32)
+        input_dim = Z_train.shape[1]
+        print(f'    MLP encoder {input_dim}D → {pca_dim}D bottleneck')
+        model = AgePredictorMLP(
+            input_dim=input_dim,
+            bottleneck_dim=pca_dim,
+            mlp_hidden=mlp_encoder_hidden,
+            flow_transforms=flow_transforms,
+            flow_hidden_features=flow_hidden_features,
+            aux_loss_weight=aux_loss_weight,
+            use_mg=use_mg,
+        ).to(device)
+
     train_dataset = TensorDataset(
-        torch.tensor(X_train,         dtype=torch.float32, device=device),
+        torch.tensor(Z_train,         dtype=torch.float32, device=device),
         torch.tensor(y_train,         dtype=torch.float32, device=device),
         torch.tensor(bprp0_train,     dtype=torch.float32, device=device),
         torch.tensor(bprp0_err_train, dtype=torch.float32, device=device),
+        torch.tensor(mg_train,        dtype=torch.float32, device=device),
+        torch.tensor(mem_prob_train,  dtype=torch.float32, device=device),
     )
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-    model = AgePredictor(X_train.shape[1], hidden_dims, dropout,
-                         flow_transforms=flow_transforms,
-                         flow_hidden_features=flow_hidden_features).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+    scheduler = CombinedLRScheduler(optimizer, n_epochs=n_epochs, initial_lr=lr,
+                                    decay_rate=lr_decay_rate)
     best_loss  = float('inf')
     best_state = None
+
+    Z_val_t        = torch.tensor(Z_val,         dtype=torch.float32, device=device)
+    bprp0_val_t    = torch.tensor(bprp0_val,     dtype=torch.float32, device=device)
+    berr_val_t     = torch.tensor(bprp0_err_val, dtype=torch.float32, device=device)
+    mg_val_t       = torch.tensor(mg_val,        dtype=torch.float32, device=device)
+    mem_prob_val_t = torch.tensor(mem_prob_val,  dtype=torch.float32, device=device)
+    y_val_t        = torch.tensor(y_val,         dtype=torch.float32, device=device)
+
+    train_losses = []
+    val_losses   = []
 
     for _ in range(n_epochs):
         model.train()
         epoch_loss = 0.0
-        for X_b, y_b, bprp0_b, bprp0_err_b in train_loader:
+        for Z_b, y_b, bprp0_b, bprp0_err_b, mg_b, mem_prob_b in train_loader:
             optimizer.zero_grad()
-            loss = model(X_b, y_b, bprp0_b, bprp0_err_b)   # NLE: p(z | age, bprp0, bprp0_err)
+            loss = model(Z_b, y_b, bprp0_b, bprp0_err_b, mg_b, mem_prob_b)
             loss.backward()
             optimizer.step()
-            epoch_loss += loss.item() * len(X_b)
-        epoch_loss /= len(X_train)
-        if epoch_loss < best_loss:
-            best_loss  = epoch_loss
+            epoch_loss += loss.item() * len(Z_b)
+        epoch_loss /= len(Z_train)
+        train_losses.append(epoch_loss)
+
+        model.eval()
+        with torch.no_grad():
+            val_nll = model(Z_val_t, y_val_t, bprp0_val_t, berr_val_t, mg_val_t, mem_prob_val_t).item()
+        val_losses.append(val_nll)
+        model.train()
+
+        if val_nll < best_loss:
+            best_loss  = val_nll
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         scheduler.step()
 
     model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
     model.eval()
     with torch.no_grad():
-        X_val_t         = torch.tensor(X_val,         dtype=torch.float32, device=device)
-        bprp0_val_t     = torch.tensor(bprp0_val,     dtype=torch.float32, device=device)
-        bprp0_err_val_t = torch.tensor(bprp0_err_val, dtype=torch.float32, device=device)
-        loga_grid_d     = loga_grid.to(device)
-        stats     = model.predict_stats(X_val_t, bprp0_val_t, bprp0_err_val_t, loga_grid_d)
+        stats     = model.predict_stats(Z_val_t, bprp0_val_t, berr_val_t, mg_val_t, loga_grid.to(device))
         val_stats = {k: v.cpu().numpy() for k, v in stats.items()}
 
-    return val_stats, best_loss, best_state
+    return val_stats, best_loss, best_state, fold_pca, train_losses, val_losses
 
 
 # ---------------------------------------------------------------------------
 # K-fold cross-validation
 # ---------------------------------------------------------------------------
 
-def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, tic_ids,
-                 n_folds=10, hidden_dims=[128, 64, 8], dropout=0.2,
+def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
+                 n_folds=10, pca_dim=32,
                  lr=1e-3, weight_decay=1e-4, n_epochs=100, batch_size=64,
                  device=None, seed=42, save_models_dir=None,
                  star_level_split=False,
-                 flow_transforms=4, flow_hidden_features=None, loga_grid_size=None):
+                 flow_transforms=8, flow_hidden_features=None, loga_grid_size=None,
+                 encoder_type='pca', mlp_encoder_hidden=None, aux_loss_weight=1.0,
+                 use_mg=False, lr_decay_rate=None):
     """Run k-fold cross-validation.
 
     Args:
@@ -787,9 +955,11 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, tic_ids,
     X_norm = (X - X_mean) / X_std
 
     # bprp0: passed raw (~0–4 scale, matches log10_age range)
-    # bprp0_err: log10 transform only (raw values are small; log10 brings to ~-2–0 scale)
+    # bprp0_err: log10 transform only
+    # mg: log10 transform only
     bprp0_norm     = bprp0
     bprp0_err_norm = np.log10(np.clip(bprp0_err, 1e-10, None))
+    mg_norm        = np.log10(np.clip(mg,        1e-10, None))
 
     norm_params = {
         'X_mean': X_mean, 'X_std': X_std,
@@ -845,15 +1015,25 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, tic_ids,
         bprp0_val          = bprp0_norm[val_idx]
         bprp0_err_train    = bprp0_err_norm[train_idx]
         bprp0_err_val      = bprp0_err_norm[val_idx]
+        mg_train           = mg_norm[train_idx]
+        mg_val             = mg_norm[val_idx]
+        mem_prob_train     = mem_prob[train_idx]
+        mem_prob_val_fold  = mem_prob[val_idx]
 
-        val_stats, train_loss, model_state = train_single_fold(
-            X_train, y_train, bprp0_train, bprp0_err_train,
-            X_val, bprp0_val, bprp0_err_val,
-            hidden_dims, dropout, lr, weight_decay, n_epochs, batch_size, device,
+        val_stats, train_loss, model_state, fold_pca, train_losses, val_losses = train_single_fold(
+            X_train, y_train, bprp0_train, bprp0_err_train, mg_train, mem_prob_train,
+            X_val, y[val_idx], bprp0_val, bprp0_err_val, mg_val, mem_prob_val_fold,
+            pca_dim, lr, weight_decay, n_epochs, batch_size, device,
             flow_transforms=flow_transforms, flow_hidden_features=flow_hidden_features,
             loga_grid=loga_grid_t,
+            encoder_type=encoder_type, mlp_encoder_hidden=mlp_encoder_hidden,
+            aux_loss_weight=aux_loss_weight, use_mg=use_mg,
+            lr_decay_rate=lr_decay_rate,
         )
-        fold_models.append(model_state)
+        fold_models.append({
+            'state_dict': model_state, 'pca': fold_pca,
+            'train_losses': train_losses, 'val_losses': val_losses,
+        })
 
         for k in stat_keys:
             all_stats[k][val_idx] = val_stats[k]
@@ -863,21 +1043,32 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, tic_ids,
         val_pred_log = val_stats['median']
         val_mae  = np.mean(np.abs(val_pred_log - y[val_idx]))  # dex
         val_corr = np.corrcoef(val_pred_log, y[val_idx])[0, 1]
-        print(f'  Fold {fold + 1}/{n_folds}: train_loss={train_loss:.4f}  '
+        print(f'  Fold {fold + 1}/{n_folds}: best_val_nll={train_loss:.4f}  '
               f'val_MAE={val_mae:.3f} dex  val_r={val_corr:.3f}')
 
     if save_models_dir is not None:
         save_dir = Path(save_models_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
         torch.save({
-            'fold_models': fold_models,
+            'fold_models': fold_models,   # list of {'state_dict': ..., 'pca': sklearn.PCA, 'train_losses': ..., 'val_losses': ...}
             'normalization_params': norm_params,
-            'hidden_dims': hidden_dims,
-            'dropout': dropout,
+            'pca_dim': pca_dim,
             'n_folds': n_folds,
             'seed': seed,
         }, save_dir / 'kfold_models.pt')
         print(f'Saved {n_folds} fold models to {save_dir / "kfold_models.pt"}')
+
+        import json
+        loss_curves = {
+            f'fold_{f}': {
+                'train_nll': fold_models[f]['train_losses'],
+                'val_nll':   fold_models[f]['val_losses'],
+            }
+            for f in range(n_folds)
+        }
+        with open(save_dir / 'training_curves.json', 'w') as fp:
+            json.dump(loss_curves, fp)
+        print(f'Saved training curves to {save_dir / "training_curves.json"}')
 
     all_predictions = all_stats['median']  # log10(age/Myr), used as primary prediction
     return all_predictions, all_stats, ages, tic_ids, fold_of_sample, fold_losses, norm_params
@@ -1047,14 +1238,28 @@ def main():
     parser.add_argument('--seed',       type=int,   default=42)
 
     # Age predictor training
-    parser.add_argument('--hidden_dims',          type=int,   nargs='+', default=[128, 64, 32])
-    parser.add_argument('--dropout',              type=float, default=0.2)
+    parser.add_argument('--encoder_type',         type=str,   default='pca',
+                        choices=['pca', 'mlp'],
+                        help='Compression method: pca (fixed, per-fold) or mlp (learned, '
+                             'jointly trained with auxiliary age loss). Default: pca')
+    parser.add_argument('--pca_dim',              type=int,   default=32,
+                        help='Bottleneck dimensionality for both pca and mlp encoders (default: 32)')
+    parser.add_argument('--mlp_encoder_hidden',   type=int,   nargs='+', default=[256, 128],
+                        help='Hidden layer sizes for the MLP encoder (mlp mode only, default: 256 128)')
+    parser.add_argument('--aux_loss_weight',      type=float, default=1.0,
+                        help='Weight for the auxiliary age L1 loss in mlp mode (default: 1.0)')
+    parser.add_argument('--use_mg',               action='store_true', default=False,
+                        help='Include log10(MG_quick) as a 4th flow context variable (default: off)')
     parser.add_argument('--lr',                   type=float, default=1e-3)
+    parser.add_argument('--lr_decay_rate',        type=float, default=None,
+                        help='Exponential decay rate per epoch for the LR scheduler. '
+                             'Default: 10^(-3/n_epochs), which drops LR by 1000x over training. '
+                             'Use e.g. 0.99 for a much shallower decay.')
     parser.add_argument('--weight_decay',         type=float, default=1e-4)
     parser.add_argument('--n_epochs',             type=int,   default=100)
     parser.add_argument('--batch_size',           type=int,   default=64)
-    parser.add_argument('--flow_transforms',      type=int,   default=4,
-                        help='Number of NSF transforms in the flow head (default: 4)')
+    parser.add_argument('--flow_transforms',      type=int,   default=8,
+                        help='Number of NSF transforms in the flow head (default: 8)')
     parser.add_argument('--flow_hidden_dims',     type=int,   nargs='+', default=[64, 64],
                         help='Hidden layer sizes inside each flow transform (default: 64 64)')
     parser.add_argument('--loga_grid_size',       type=int,   default=LOGA_GRID_DEFAULT_SIZE,
@@ -1095,16 +1300,20 @@ def main():
         print(f'\n=== Loading latents from cache: {args.load_latents} ===')
         (latent_vectors, ages, bprp0, gaia_ids, tic_ids, sectors,
          cached_cross_sector_latents, cached_cross_sector_tic_ids) = load_latents_cache(args.load_latents)
-        # bprp0_err is not stored in the cache — load from CSV using gaia_ids
+        # bprp0_err and mg are not stored in the cache — load from CSV using gaia_ids
         _df = pd.read_csv(args.age_csv)
         _df['GaiaDR3_ID'] = _df['GaiaDR3_ID'].astype(str)
         _id_to_bprp0_err = dict(zip(_df['GaiaDR3_ID'], _df['BPRP0_err']))
+        _id_to_mg        = dict(zip(_df['GaiaDR3_ID'], _df['MG_quick']))
+        _id_to_mem_prob  = dict(zip(_df['GaiaDR3_ID'], _df['mem_prob_val'])) if 'mem_prob_val' in _df.columns else {}
         bprp0_err = np.array([_id_to_bprp0_err.get(g, np.nan) for g in gaia_ids], dtype=float)
+        mg        = np.array([_id_to_mg.get(g, np.nan)        for g in gaia_ids], dtype=float)
+        mem_prob  = np.array([_id_to_mem_prob.get(g, np.nan)  for g in gaia_ids], dtype=float)
     else:
         if args.model_path is None:
             parser.error('--model_path is required unless --load_latents is set.')
         (latent_vectors, cached_cross_sector_latents, cached_cross_sector_tic_ids,
-         ages, bprp0, bprp0_err, gaia_ids, tic_ids, sectors) = load_data_fresh(
+         ages, bprp0, bprp0_err, mg, mem_prob, gaia_ids, tic_ids, sectors) = load_data_fresh(
             model_path=args.model_path,
             h5_path=args.h5_path,
             csv_path=args.age_csv,
@@ -1139,38 +1348,46 @@ def main():
     star_level_split = False  # whether run_kfold_cv should split by unique TIC
 
     if agg == 'none':
-        # Legacy: per-sector, kfold by sample (may have leakage)
         kfold_latents   = latent_vectors
         kfold_ages      = ages
         kfold_bprp0     = bprp0
         kfold_bprp0_err = bprp0_err
+        kfold_mg        = mg
+        kfold_mem_prob  = mem_prob
         kfold_tics      = tic_ids
 
     elif agg == 'predict_mean':
-        # Per-sector latents + star-level kfold split; average preds per star after
         kfold_latents   = latent_vectors
         kfold_ages      = ages
         kfold_bprp0     = bprp0
         kfold_bprp0_err = bprp0_err
+        kfold_mg        = mg
+        kfold_mem_prob  = mem_prob
         kfold_tics      = tic_ids
         star_level_split = True
 
     elif agg in ('latent_mean', 'latent_median', 'latent_max', 'latent_mean_std'):
         print(f'\n=== Aggregating latents ({agg}) ===')
-        kfold_latents, kfold_ages, kfold_bprp0, kfold_bprp0_err, kfold_tics = aggregate_by_star(
-            latent_vectors, ages, bprp0, bprp0_err, tic_ids, method=agg
+        kfold_latents, kfold_ages, kfold_bprp0, kfold_bprp0_err, kfold_mg, kfold_mem_prob, kfold_tics = aggregate_by_star(
+            latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids, gaia_ids, method=agg
         )
 
     elif agg == 'cross_sector':
         print('\n=== Cross-sector hidden-state pooling ===')
         kfold_latents = cached_cross_sector_latents
-        kfold_tics    = cached_cross_sector_tic_ids
-        tic_to_age       = {t: ages[tic_ids == t][0]      for t in np.unique(tic_ids)}
-        tic_to_bprp0     = {t: bprp0[tic_ids == t][0]     for t in np.unique(tic_ids)}
-        tic_to_bprp0_err = {t: bprp0_err[tic_ids == t][0] for t in np.unique(tic_ids)}
-        kfold_ages      = np.array([tic_to_age[t]       for t in kfold_tics])
-        kfold_bprp0     = np.array([tic_to_bprp0[t]     for t in kfold_tics])
-        kfold_bprp0_err = np.array([tic_to_bprp0_err[t] for t in kfold_tics])
+        # Cache stores TIC IDs; bridge to Gaia IDs for consistent star-level keying
+        tic_to_gaia   = dict(zip(tic_ids, gaia_ids))
+        kfold_tics    = np.array([tic_to_gaia[t] for t in cached_cross_sector_tic_ids])
+        gaia_to_age       = {g: ages[gaia_ids == g][0]      for g in np.unique(gaia_ids)}
+        gaia_to_bprp0     = {g: bprp0[gaia_ids == g][0]     for g in np.unique(gaia_ids)}
+        gaia_to_bprp0_err = {g: bprp0_err[gaia_ids == g][0] for g in np.unique(gaia_ids)}
+        gaia_to_mg        = {g: mg[gaia_ids == g][0]        for g in np.unique(gaia_ids)}
+        gaia_to_mem_prob  = {g: mem_prob[gaia_ids == g][0]  for g in np.unique(gaia_ids)}
+        kfold_ages      = np.array([gaia_to_age[g]       for g in kfold_tics])
+        kfold_bprp0     = np.array([gaia_to_bprp0[g]     for g in kfold_tics])
+        kfold_bprp0_err = np.array([gaia_to_bprp0_err[g] for g in kfold_tics])
+        kfold_mg        = np.array([gaia_to_mg[g]        for g in kfold_tics])
+        kfold_mem_prob  = np.array([gaia_to_mem_prob[g]  for g in kfold_tics])
 
     else:
         raise ValueError(f'Unknown star_aggregation: {agg}')
@@ -1182,10 +1399,11 @@ def main():
         ages=kfold_ages,
         bprp0=kfold_bprp0,
         bprp0_err=kfold_bprp0_err,
+        mg=kfold_mg,
+        mem_prob=kfold_mem_prob,
         tic_ids=kfold_tics,
         n_folds=args.n_folds,
-        hidden_dims=args.hidden_dims,
-        dropout=args.dropout,
+        pca_dim=args.pca_dim,
         lr=args.lr,
         weight_decay=args.weight_decay,
         n_epochs=args.n_epochs,
@@ -1197,6 +1415,11 @@ def main():
         flow_transforms=args.flow_transforms,
         flow_hidden_features=args.flow_hidden_dims,
         loga_grid_size=args.loga_grid_size,
+        encoder_type=args.encoder_type,
+        mlp_encoder_hidden=args.mlp_encoder_hidden,
+        aux_loss_weight=args.aux_loss_weight,
+        use_mg=args.use_mg,
+        lr_decay_rate=args.lr_decay_rate,
     )
 
     # ── Step 4: for predict_mean, save per-sector CSV then average per star ─
@@ -1219,6 +1442,8 @@ def main():
         true_ages       = np.array([true_ages[result_tics == t][0]             for t in unique_tics])
         kfold_bprp0     = np.array([kfold_bprp0[result_tics == t][0]           for t in unique_tics])
         kfold_bprp0_err = np.array([kfold_bprp0_err[result_tics == t][0]       for t in unique_tics])
+        kfold_mg        = np.array([kfold_mg[result_tics == t][0]              for t in unique_tics])
+        kfold_mem_prob  = np.array([kfold_mem_prob[result_tics == t][0]        for t in unique_tics])
         fold_assignments = np.array([fold_assignments[result_tics == t][0]     for t in unique_tics])
         result_tics     = unique_tics
         print(f'Averaged to {len(unique_tics)} unique stars')

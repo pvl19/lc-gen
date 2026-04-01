@@ -1,0 +1,23 @@
+{
+  "load_latents": "output/latents_cache/cf_final_multiscale.npz",
+  "age_csv": "data/phot_all.csv",
+  "output_dir": "output/age_predictor/full_nle-v1",
+  "star_aggregation": "latent_max",
+  "pca_dim": 4,
+  "val_frac": 0.1,
+  "lr": 0.001,
+  "lr_decay_rate": 0.97,
+  "weight_decay": 0.0001,
+  "n_epochs": 100,
+  "batch_size": 64,
+  "flow_transforms": 12,
+  "flow_hidden_dims": [
+    64,
+    164
+  ],
+  "loga_grid_size": 1000,
+  "seed": 42,
+  "use_mg": false,
+  "n_train": 2245,
+  "n_val": 249
+}

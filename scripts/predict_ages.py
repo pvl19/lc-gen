@@ -1,615 +1,401 @@
-#!/usr/bin/env python
+"""Run age inference on unlabeled stars using a trained full NLE model.
+
+Extracts latents from an H5 file using the autoencoder. Stars are grouped so
+all sectors for a star are processed together (no duplicated forward passes).
+H5 data is read lazily per batch — peak RAM is ~batch_size sectors at a time,
+not the full dataset.
+
+Strict filtering: entries missing GaiaDR3_ID, BPRP0, e_BPRP0, tic, or with
+zero sequence length are skipped — no NaN substitution or default values.
+
+Usage (first time — extract latents from autoencoder):
+    python scripts/predict_ages.py \\
+        --nle_model  output/full_nle/full_nle_model.pt \\
+        --ae_model   output/performance_tests/cf_final/model.pt \\
+        --h5_path    exop_hosts/lc_data.h5 \\
+        --output_dir output/exop_host_ages \\
+        --save_latents output/exop_host_ages/latents.npz
+
+Usage (subsequent runs — skip autoencoder):
+    python scripts/predict_ages.py \\
+        --nle_model    output/full_nle/full_nle_model.pt \\
+        --load_latents output/exop_host_ages/latents.npz \\
+        --output_dir   output/exop_host_ages
 """
-Standalone inference script for predicting stellar ages using saved k-fold models.
-
-Loads pre-trained MLP models from kfold_age_inference.py or kfold_gyro_baseline.py
-and predicts ages on new data without retraining.
-
-Usage:
-    # Predict using latent space model
-    python scripts/predict_ages.py \
-        --model_file output/age_predictor/kfold/kfold_models.pt \
-        --rnn_model output/simple_rnn/models/baseline_v15_masking_real_60e.pt \
-        --h5_path data/timeseries.h5 \
-        --pickle_path data/star_sector_lc_formatted.pickle \
-        --age_csv data/TIC_cf_data.csv \
-        --output_csv output/age_predictor/predictions_v1.csv
-    
-    # Predict using gyro baseline model
-    python scripts/predict_ages.py \
-        --model_file output/age_predictor/gyro_baseline/gyro_kfold_models.pt \
-        --age_csv data/TIC_cf_data.csv \
-        --output_csv output/age_predictor/gyro_predictions_v1.csv \
-        --model_type gyro
-"""
-
 import argparse
-import json
-import pickle
+import sys
 from pathlib import Path
 
 import h5py
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
-from tqdm import tqdm
+
+sys.path.insert(0, str(Path(__file__).parent))
+from kfold_age_inference import AgePredictor, PRIOR_LOGA_MYR, LOGA_GRID_DEFAULT_SIZE
 
 
-# =============================================================================
-# Model Definitions (must match training)
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Strict metadata loading + filtering
+# ---------------------------------------------------------------------------
 
-class AgePredictor(nn.Module):
-    """MLP for age prediction from latent space + BPRP0."""
-    
-    def __init__(self, input_dim: int, hidden_dims: list = [128, 64, 32], dropout: float = 0.2):
-        super().__init__()
-        
-        layers = []
-        prev_dim = input_dim
-        for h_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, h_dim),
-                nn.LayerNorm(h_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-            ])
-            prev_dim = h_dim
-        layers.append(nn.Linear(prev_dim, 1))
-        
-        self.mlp = nn.Sequential(*layers)
-    
-    def forward(self, x):
-        return self.mlp(x)
+def load_and_filter_h5_metadata(h5_path: str):
+    """Read metadata from H5 and apply strict filtering.
 
+    Skips any entry with:
+      - empty GaiaDR3_ID string
+      - tic == 0
+      - length == 0  (no actual data)
+      - NaN BPRP0 or e_BPRP0
+      - e_BPRP0 <= 0
 
-class GyroAgePredictor(nn.Module):
-    """MLP for age prediction from BPRP0 + log(Prot)."""
-    
-    def __init__(self, input_dim: int = 2, hidden_dims: list = [128, 64, 32], dropout: float = 0.2):
-        super().__init__()
-        
-        layers = []
-        prev_dim = input_dim
-        for h_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, h_dim),
-                nn.LayerNorm(h_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-            ])
-            prev_dim = h_dim
-        layers.append(nn.Linear(prev_dim, 1))
-        
-        self.mlp = nn.Sequential(*layers)
-    
-    def forward(self, x):
-        return self.mlp(x)
+    Returns valid_indices (H5 row indices) and the filtered metadata arrays.
+    No NaN substitution or default values are applied.
+    """
+    with h5py.File(h5_path, 'r') as f:
+        gaia_ids  = np.array([g.decode('utf-8').strip() for g in f['metadata']['GaiaDR3_ID'][:]])
+        tic_ids   = f['metadata']['tic'][:]
+        sectors   = f['metadata']['sector'][:]
+        bprp0     = f['metadata']['BPRP0'][:].astype(float)
+        bprp0_err = f['metadata']['e_BPRP0'][:].astype(float)
+        lengths   = f['length'][:]
 
-
-# =============================================================================
-# Latent Space Extraction (for latent model only)
-# =============================================================================
-
-def load_rnn_model(model_path, hidden_size, direction, mode, use_flow, device):
-    """Load pre-trained BiDirectionalMinGRU model."""
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
-    
-    from lcgen.models.simple_rnn import BiDirectionalMinGRU
-    
-    model = BiDirectionalMinGRU(
-        input_size=3,  # flux, flux_err, dt
-        hidden_size=hidden_size,
-        mode=mode,
-        direction=direction,
-        use_flow_head=use_flow,
+    mask = (
+        np.array([len(g) > 0 for g in gaia_ids])  # non-empty Gaia ID
+        & (tic_ids > 0)                             # valid TIC
+        & (lengths > 0)                             # has actual data
+        & (~np.isnan(bprp0))                        # valid colour
+        & (~np.isnan(bprp0_err))                    # valid colour error
+        & (bprp0_err > 0)                           # positive colour error
     )
-    
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-    else:
-        model.load_state_dict(checkpoint)
-    
-    model.to(device)
+
+    n_total = len(mask)
+    n_valid = int(mask.sum())
+    print(f'  {n_valid} / {n_total} entries pass strict filter ({n_total - n_valid} skipped)')
+
+    valid_indices = np.where(mask)[0]
+    return (
+        valid_indices,
+        gaia_ids[valid_indices],
+        tic_ids[valid_indices],
+        sectors[valid_indices],
+        bprp0[valid_indices],
+        bprp0_err[valid_indices],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Memory-safe latent extraction (star-grouped, lazy H5 reads)
+# ---------------------------------------------------------------------------
+
+def extract_latents_by_star_lazy(ae_model_path, h5_path, valid_indices,
+                                  tic_ids, hidden_size, direction, mode,
+                                  max_length, pooling_mode, device,
+                                  batch_size=32):
+    """Extract per-sector latents grouped by star, with lazy H5 reads.
+
+    Mirrors kfold_age_inference.extract_latents_by_star but avoids the upfront
+    load of the full dataset. Only `length` is read at startup (~80 KB); flux /
+    flux_err / time are fetched from the open H5 file per batch (~batch_size
+    sectors at a time, e.g. 32 × 8192 × 3 × 4 B ≈ 3 MB peak).
+
+    Stars are kept whole across batches so all sectors for a given star are
+    processed in a single forward pass — no duplicated effort.
+
+    Returns:
+        per_sector_latents: (N, D) array, same order as valid_indices
+    """
+    from plot_umap_latent import load_model, compute_multiscale_features
+
+    print(f'Loading autoencoder: {ae_model_path}')
+    model = load_model(
+        ae_model_path, device,
+        hidden_size=hidden_size, direction=direction, mode=mode,
+        use_flow=True, num_meta_features=0,
+    )
     model.eval()
-    return model
 
+    N = len(valid_indices)
 
-def extract_latent_vectors(rnn_model, h5_path, pickle_path, max_length, 
-                           pooling_mode, batch_size, device, tic_ids_needed=None):
-    """Extract latent vectors for specified TIC IDs.
-    
-    Args:
-        rnn_model: loaded BiDirectionalMinGRU
-        h5_path: path to H5 file with time series
-        pickle_path: path to pickle with TIC ID mapping
-        max_length: max sequence length
-        pooling_mode: 'mean', 'final', or 'multiscale'
-        batch_size: batch size for extraction
-        device: torch device
-        tic_ids_needed: array of TIC IDs to extract (if None, extract all)
-    
-    Returns:
-        latent_vectors: (N, D) array
-        tic_ids: (N,) array of TIC IDs
-    """
-    # Load pickle to get TIC ID mapping
-    with open(pickle_path, 'rb') as f:
-        pickle_data = pickle.load(f)
-    
-    # Build index -> TIC ID mapping
-    if isinstance(pickle_data, dict) and 'tic_id' in pickle_data:
-        all_tic_ids = np.array(pickle_data['tic_id'])
-    else:
-        all_tic_ids = np.array([item['tic_id'] for item in pickle_data])
-    
-    # Load H5 file
-    h5f = h5py.File(h5_path, 'r')
-    flux = h5f['flux'][:]
-    flux_err = h5f['flux_err'][:]
-    time = h5f['time'][:]
-    length = h5f['length'][:]
-    
-    # Determine which indices to extract
-    if tic_ids_needed is not None:
-        tic_set = set(tic_ids_needed)
-        indices = [i for i, tid in enumerate(all_tic_ids) if tid in tic_set]
-    else:
-        indices = list(range(len(all_tic_ids)))
-    
-    latent_list = []
-    tic_list = []
-    
-    for batch_start in tqdm(range(0, len(indices), batch_size), desc="Extracting latent vectors"):
-        batch_indices = indices[batch_start:batch_start + batch_size]
-        
-        batch_flux = []
-        batch_flux_err = []
-        batch_time = []
-        batch_lengths = []
-        
-        for idx in batch_indices:
-            L = min(int(length[idx]), max_length)
-            batch_flux.append(flux[idx, :L])
-            batch_flux_err.append(flux_err[idx, :L])
-            batch_time.append(time[idx, :L])
-            batch_lengths.append(L)
-        
-        # Pad to max length in batch
-        max_len = max(batch_lengths)
-        B = len(batch_indices)
-        
-        flux_padded = np.zeros((B, max_len), dtype=np.float32)
-        flux_err_padded = np.zeros((B, max_len), dtype=np.float32)
-        time_padded = np.zeros((B, max_len), dtype=np.float32)
-        mask = np.zeros((B, max_len), dtype=np.float32)
-        
-        for i, L in enumerate(batch_lengths):
-            flux_padded[i, :L] = batch_flux[i]
-            flux_err_padded[i, :L] = batch_flux_err[i]
-            time_padded[i, :L] = batch_time[i]
-            mask[i, :L] = 1.0
-        
-        # Compute dt
-        dt_padded = np.zeros_like(time_padded)
-        dt_padded[:, 1:] = np.diff(time_padded, axis=1)
-        
-        # Create input tensor
-        x = np.stack([flux_padded, flux_err_padded, dt_padded], axis=-1)
-        x_t = torch.tensor(x, dtype=torch.float32, device=device)
-        mask_t = torch.tensor(mask, dtype=torch.float32, device=device)
-        
-        # Forward pass
-        with torch.no_grad():
-            if hasattr(rnn_model, 'use_flow_head') and rnn_model.use_flow_head:
-                hidden, _ = rnn_model(x_t, mask_t)
-            else:
-                hidden = rnn_model(x_t, mask_t)
-        
-        # Apply pooling
-        if pooling_mode == 'mean':
-            # Mean pooling over valid timesteps
-            mask_exp = mask_t.unsqueeze(-1)
-            latent = (hidden * mask_exp).sum(dim=1) / (mask_exp.sum(dim=1) + 1e-8)
-        elif pooling_mode == 'final':
-            # Get final hidden state for each sequence
-            batch_latent = []
-            for i, L in enumerate(batch_lengths):
-                batch_latent.append(hidden[i, L-1, :])
-            latent = torch.stack(batch_latent, dim=0)
-        elif pooling_mode == 'multiscale':
-            latent = compute_multiscale_features(hidden, mask_t)
-        else:
-            raise ValueError(f"Unknown pooling_mode: {pooling_mode}")
-        
-        latent_list.append(latent.cpu().numpy())
-        tic_list.extend([all_tic_ids[idx] for idx in batch_indices])
-    
-    h5f.close()
-    
-    latent_vectors = np.concatenate(latent_list, axis=0)
-    tic_ids = np.array(tic_list)
-    
-    return latent_vectors, tic_ids
+    # Read only lengths upfront — tiny (~80 KB for 20k entries)
+    with h5py.File(h5_path, 'r') as f:
+        all_lengths = f['length'][valid_indices]  # shape (N,), dtype int32
 
+    actual_max = min(max_length, 16384)
 
-def compute_multiscale_features(hidden, mask):
-    """Compute multi-scale features from hidden states."""
-    B, T, D = hidden.shape
-    mask_exp = mask.unsqueeze(-1)
-    valid_counts = mask_exp.sum(dim=1, keepdim=True) + 1e-8
-    
-    features = []
-    
-    # Global mean
-    global_mean = (hidden * mask_exp).sum(dim=1) / valid_counts.squeeze(1)
-    features.append(global_mean)
-    
-    # Global max
-    hidden_masked = hidden.clone()
-    hidden_masked[mask == 0] = -1e9
-    global_max, _ = hidden_masked.max(dim=1)
-    features.append(global_max)
-    
-    # Global std
-    mean_exp = global_mean.unsqueeze(1)
-    sq_diff = ((hidden - mean_exp) ** 2) * mask_exp
-    global_std = torch.sqrt(sq_diff.sum(dim=1) / valid_counts.squeeze(1) + 1e-8)
-    features.append(global_std)
-    
-    # First/last quartile means
-    for start_frac, end_frac in [(0.0, 0.25), (0.75, 1.0)]:
-        chunk_feats = []
-        for i in range(B):
-            L = int(mask[i].sum().item())
-            if L > 0:
-                s = int(start_frac * L)
-                e = max(s + 1, int(end_frac * L))
-                chunk_feats.append(hidden[i, s:e, :].mean(dim=0))
-            else:
-                chunk_feats.append(torch.zeros(D, device=hidden.device))
-        features.append(torch.stack(chunk_feats, dim=0))
-    
-    # Temporal chunks (4 chunks)
-    for n_chunks in [4]:
-        chunk_means = []
-        for c in range(n_chunks):
-            chunk_feats = []
-            for i in range(B):
-                L = int(mask[i].sum().item())
-                if L > 0:
-                    s = int(c * L / n_chunks)
-                    e = int((c + 1) * L / n_chunks)
-                    if e > s:
-                        chunk_feats.append(hidden[i, s:e, :].mean(dim=0))
-                    else:
-                        chunk_feats.append(hidden[i, s, :])
+    # Map each local position (0..N-1) to its TIC; group positions by TIC
+    unique_tics = np.unique(tic_ids)
+    tic_to_pos  = {t: np.where(tic_ids == t)[0] for t in unique_tics}
+
+    per_sector_latents = [None] * N
+
+    def _run_buffer(star_buffer, h5_file):
+        """Forward pass for a list of (local_positions, tic) pairs.
+
+        Reads H5 lazily for only the rows in this batch.
+        """
+        all_local_pos = np.concatenate([pos for pos, _ in star_buffer])
+        star_sizes    = [len(pos) for pos, _ in star_buffer]
+
+        # Map local positions → original H5 row indices; sort for efficient H5 read
+        h5_idxs    = valid_indices[all_local_pos]
+        sort_order = np.argsort(h5_idxs)
+        sorted_h5  = h5_idxs[sort_order]
+        restore    = np.argsort(sort_order)
+
+        flux_s     = h5_file['flux'][sorted_h5, :actual_max]
+        flux_err_s = h5_file['flux_err'][sorted_h5, :actual_max]
+        time_s     = h5_file['time'][sorted_h5, :actual_max]
+        lens_s     = np.minimum(all_lengths[all_local_pos[sort_order]], actual_max)
+
+        # Restore original (star-grouped) order
+        flux_b     = torch.tensor(flux_s[restore],     dtype=torch.float32, device=device)
+        flux_err_b = torch.tensor(flux_err_s[restore], dtype=torch.float32, device=device)
+        time_b     = torch.tensor(time_s[restore],     dtype=torch.float32, device=device)
+        lens_b     = lens_s[restore]
+
+        B, L = flux_b.shape
+        mask_t = torch.zeros(B, L, device=device)
+        for j, vlen in enumerate(lens_b):
+            mask_t[j, :int(vlen)] = 1.0
+
+        x_in = torch.stack([flux_b, flux_err_b], dim=-1)
+        t_in = time_b.unsqueeze(-1)
+
+        out   = model(x_in, t_in, mask=mask_t, metadata=None,
+                      conv_data=None, return_states=True)
+        h_fwd = out.get('h_fwd_tensor')  # (B, L, H) or None
+        h_bwd = out.get('h_bwd_tensor')  # (B, L, H) or None
+
+        h_fwd_split = torch.split(h_fwd, star_sizes, dim=0) if h_fwd is not None else [None] * len(star_buffer)
+        h_bwd_split = torch.split(h_bwd, star_sizes, dim=0) if h_bwd is not None else [None] * len(star_buffer)
+
+        offset = 0
+        for (pos, _), hf, hb in zip(star_buffer, h_fwd_split, h_bwd_split):
+            for j in range(len(pos)):
+                vlen = int(lens_b[offset + j])
+                if hf is not None and hb is not None:
+                    h = torch.cat([hf[j, :vlen, :], hb[j, :vlen, :]], dim=-1)
+                elif hf is not None:
+                    h = hf[j, :vlen, :]
                 else:
-                    chunk_feats.append(torch.zeros(D, device=hidden.device))
-            chunk_means.append(torch.stack(chunk_feats, dim=0))
-        features.extend(chunk_means)
-    
-    return torch.cat(features, dim=-1)
+                    h = hb[j, :vlen, :]
 
+                if pooling_mode == 'multiscale':
+                    latent = compute_multiscale_features(h, n_segments=4)
+                elif pooling_mode == 'mean':
+                    latent = h.mean(dim=0)
+                elif pooling_mode == 'final':
+                    latent = h[-1, :]
+                else:
+                    raise ValueError(f'Unknown pooling_mode: {pooling_mode}')
 
-# =============================================================================
-# Prediction Functions
-# =============================================================================
+                per_sector_latents[pos[j]] = latent.cpu().numpy()
+            offset += len(pos)
 
-def predict_with_latent_model(checkpoint, latent_vectors, bprp0, device, ensemble='mean'):
-    """Predict ages using loaded latent space k-fold models.
-    
-    Args:
-        checkpoint: loaded checkpoint dict with fold_models and normalization_params
-        latent_vectors: (N, D) latent representations
-        bprp0: (N,) BPRP0 values
-        device: torch device
-        ensemble: 'mean' to average predictions, 'median' for median
-    
-    Returns:
-        predictions: (N,) predicted ages in Myr
-        predictions_std: (N,) std of predictions across folds
-    """
-    fold_models = checkpoint['fold_models']
-    norm_params = checkpoint['normalization_params']
-    hidden_dims = checkpoint['hidden_dims']
-    dropout = checkpoint.get('dropout', 0.2)
-    
-    # Prepare features
-    bprp0_mean = norm_params['bprp0_mean']
-    bprp0_std = norm_params['bprp0_std']
-    bprp0_normalized = (bprp0 - bprp0_mean) / (bprp0_std + 1e-8)
-    
-    X = np.concatenate([latent_vectors, bprp0_normalized[:, None]], axis=1)
-    X_normalized = (X - norm_params['X_mean']) / norm_params['X_std']
-    
-    X_t = torch.tensor(X_normalized, dtype=torch.float32, device=device)
-    
-    # Create model
-    input_dim = norm_params['input_dim']
-    model = AgePredictor(input_dim, hidden_dims, dropout).to(device)
-    
-    # Predict with each fold
-    fold_predictions = []
-    for fold_state in fold_models:
-        model.load_state_dict({k: v.to(device) for k, v in fold_state.items()})
-        model.eval()
-        
+        del flux_b, flux_err_b, time_b, h_fwd, h_bwd, out, mask_t
+
+    print(f'Extracting latents for {len(unique_tics)} stars '
+          f'({N} sectors total, pooling={pooling_mode}, batch_size~{batch_size})...')
+
+    stars_done    = 0
+    star_buffer   = []
+    buffered_secs = 0
+
+    with h5py.File(h5_path, 'r') as h5_file:
         with torch.no_grad():
-            pred_log = model(X_t).cpu().numpy().squeeze()
-        fold_predictions.append(pred_log)
-    
-    fold_predictions = np.array(fold_predictions)  # (n_folds, N)
-    
-    # Ensemble
-    if ensemble == 'mean':
-        ensemble_log = fold_predictions.mean(axis=0)
-    else:
-        ensemble_log = np.median(fold_predictions, axis=0)
-    
-    predictions = 10 ** ensemble_log
-    predictions_std = (10 ** fold_predictions).std(axis=0)
-    
-    return predictions, predictions_std
+            for tic in unique_tics:
+                pos = tic_to_pos[tic]
+                star_buffer.append((pos, tic))
+                buffered_secs += len(pos)
+
+                if buffered_secs >= batch_size:
+                    _run_buffer(star_buffer, h5_file)
+                    stars_done   += len(star_buffer)
+                    star_buffer   = []
+                    buffered_secs = 0
+                    if stars_done % 500 < batch_size:
+                        print(f'  {stars_done}/{len(unique_tics)} stars processed')
+
+            if star_buffer:
+                _run_buffer(star_buffer, h5_file)
+
+    return np.stack(per_sector_latents)
 
 
-def predict_with_gyro_model(checkpoint, bprp0, prot, device, ensemble='mean'):
-    """Predict ages using loaded gyro k-fold models.
-    
-    Args:
-        checkpoint: loaded checkpoint dict
-        bprp0: (N,) BPRP0 values
-        prot: (N,) rotation periods in days
-        device: torch device
-        ensemble: 'mean' or 'median'
-    
-    Returns:
-        predictions: (N,) predicted ages in Myr
-        predictions_std: (N,) std across folds
-    """
-    fold_models = checkpoint['fold_models']
-    norm_params = checkpoint['normalization_params']
-    hidden_dims = checkpoint['hidden_dims']
-    dropout = checkpoint.get('dropout', 0.2)
-    
-    # Prepare features
-    log_prot = np.log10(prot)
-    X = np.column_stack([bprp0, log_prot])
-    X_normalized = (X - norm_params['X_mean']) / norm_params['X_std']
-    
-    X_t = torch.tensor(X_normalized, dtype=torch.float32, device=device)
-    
-    # Create model
-    input_dim = norm_params['input_dim']
-    model = GyroAgePredictor(input_dim, hidden_dims, dropout).to(device)
-    
-    # Predict with each fold
-    fold_predictions = []
-    for fold_state in fold_models:
-        model.load_state_dict({k: v.to(device) for k, v in fold_state.items()})
-        model.eval()
-        
-        with torch.no_grad():
-            pred_log = model(X_t).cpu().numpy().squeeze()
-        fold_predictions.append(pred_log)
-    
-    fold_predictions = np.array(fold_predictions)
-    
-    if ensemble == 'mean':
-        ensemble_log = fold_predictions.mean(axis=0)
-    else:
-        ensemble_log = np.median(fold_predictions, axis=0)
-    
-    predictions = 10 ** ensemble_log
-    predictions_std = (10 ** fold_predictions).std(axis=0)
-    
-    return predictions, predictions_std
+# ---------------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------------
+
+def aggregate_latent_max_by_gaia(latents, gaia_ids, bprp0, bprp0_err):
+    """Element-wise max across sectors per Gaia ID."""
+    unique_gids    = np.unique(gaia_ids)
+    star_latents   = []
+    star_bprp0     = []
+    star_bprp0_err = []
+    for gid in unique_gids:
+        mask = gaia_ids == gid
+        star_latents.append(latents[mask].max(axis=0))
+        star_bprp0.append(float(bprp0[mask][0]))
+        star_bprp0_err.append(float(bprp0_err[mask][0]))
+    return (np.array(star_latents),
+            np.array(star_bprp0),
+            np.array(star_bprp0_err),
+            unique_gids)
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # Main
-# =============================================================================
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Predict stellar ages using saved k-fold models',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Latent space model prediction
-  python scripts/predict_ages.py \\
-      --model_file output/age_predictor/kfold/kfold_models.pt \\
-      --rnn_model output/simple_rnn/models/baseline_v15_masking_real_60e.pt \\
-      --age_csv data/TIC_cf_data.csv \\
-      --output_csv predictions.csv
-
-  # Gyro baseline prediction  
-  python scripts/predict_ages.py \\
-      --model_file output/age_predictor/gyro_baseline/gyro_kfold_models.pt \\
-      --age_csv data/TIC_cf_data.csv \\
-      --output_csv gyro_predictions.csv \\
-      --model_type gyro
-        """
-    )
-    
-    # Required arguments
-    parser.add_argument('--model_file', type=str, required=True,
-                        help='Path to saved k-fold models (.pt file)')
-    parser.add_argument('--age_csv', type=str, required=True,
-                        help='Path to CSV with TIC_ID, BPRP0, Prot, age_Myr')
-    parser.add_argument('--output_csv', type=str, required=True,
-                        help='Output CSV path for predictions')
-    
-    # Model type
-    parser.add_argument('--model_type', type=str, default='latent',
-                        choices=['latent', 'gyro'],
-                        help='Type of model: latent (RNN latent space) or gyro (BPRP0+Prot)')
-    
-    # For latent model only
-    parser.add_argument('--rnn_model', type=str, default=None,
-                        help='Path to pre-trained RNN model (required for latent type)')
-    parser.add_argument('--h5_path', type=str, default='data/timeseries.h5',
-                        help='Path to H5 file with time series')
-    parser.add_argument('--pickle_path', type=str, default='data/star_sector_lc_formatted.pickle',
-                        help='Path to pickle file with TIC ID mapping')
-    parser.add_argument('--hidden_size', type=int, default=64,
-                        help='RNN hidden size')
-    parser.add_argument('--direction', type=str, default='bi',
-                        choices=['forward', 'backward', 'bi'])
-    parser.add_argument('--mode', type=str, default='parallel',
-                        choices=['sequential', 'parallel'])
-    parser.add_argument('--use_flow', action='store_true',
-                        help='Whether RNN uses flow head')
-    parser.add_argument('--max_length', type=int, default=2048,
-                        help='Max sequence length')
-    parser.add_argument('--pooling_mode', type=str, default='mean',
-                        choices=['mean', 'multiscale', 'final'])
-    
-    # Filtering options
-    parser.add_argument('--bprp0_min', type=float, default=None,
-                        help='Min BPRP0 cut')
-    parser.add_argument('--bprp0_max', type=float, default=None,
-                        help='Max BPRP0 cut')
-    parser.add_argument('--require_age', action='store_true',
-                        help='Only predict for stars with known ages (for validation)')
-    
-    # Ensemble options
-    parser.add_argument('--ensemble', type=str, default='mean',
-                        choices=['mean', 'median'],
-                        help='How to combine fold predictions')
-    
-    # Processing
-    parser.add_argument('--batch_size', type=int, default=32,
-                        help='Batch size for latent extraction')
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--nle_model',    required=True,
+                        help='Path to full_nle_model.pt')
+    parser.add_argument('--ae_model',     default=None,
+                        help='Autoencoder model.pt (not needed if --load_latents given)')
+    parser.add_argument('--h5_path',      default='exop_hosts/lc_data.h5',
+                        help='H5 file with light curves (not needed if --load_latents given)')
+    parser.add_argument('--output_dir',   default='output/exop_host_ages')
+    parser.add_argument('--load_latents', default=None,
+                        help='Load pre-extracted per-sector latents from .npz')
+    parser.add_argument('--save_latents', default=None,
+                        help='Save per-sector latents to .npz for future reuse')
+    # Autoencoder architecture — must match the model used to build the latents cache
+    parser.add_argument('--hidden_size',  type=int, default=64)
+    parser.add_argument('--direction',    default='bi')
+    parser.add_argument('--mode',         default='parallel')
+    parser.add_argument('--max_length',   type=int, default=8192)
+    parser.add_argument('--pooling_mode', default='multiscale')
+    parser.add_argument('--batch_size',   type=int, default=32,
+                        help='Target number of sectors per AE forward pass')
+    parser.add_argument('--loga_grid_size', type=int, default=LOGA_GRID_DEFAULT_SIZE)
+    parser.add_argument('--nle_batch_size', type=int, default=256,
+                        help='Batch size for NLE posterior evaluation')
     args = parser.parse_args()
-    
-    # Validation
-    if args.model_type == 'latent' and args.rnn_model is None:
-        parser.error("--rnn_model is required for latent model type")
-    
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Using device: {device}')
-    
-    # Load saved k-fold models
-    print(f"\nLoading saved models from {args.model_file}")
-    checkpoint = torch.load(args.model_file, map_location=device, weights_only=False)
-    n_folds = checkpoint['n_folds']
-    print(f"  Loaded {n_folds} fold models")
-    
-    # Load data CSV
-    print(f"\nLoading data from {args.age_csv}")
-    df = pd.read_csv(args.age_csv)
-    
-    # Apply filters
-    valid_mask = ~df['BPRP0'].isna()
-    
-    if args.model_type == 'gyro':
-        valid_mask &= ~df['Prot'].isna() & (df['Prot'] > 0)
-    
-    if args.bprp0_min is not None:
-        valid_mask &= (df['BPRP0'] >= args.bprp0_min)
-    if args.bprp0_max is not None:
-        valid_mask &= (df['BPRP0'] <= args.bprp0_max)
-    
-    if args.require_age:
-        valid_mask &= ~df['age_Myr'].isna()
-    
-    df_valid = df[valid_mask].copy()
-    print(f"  {len(df_valid)} valid samples after filtering")
-    
-    # Extract data
-    tic_ids = df_valid['TIC_ID'].values
-    bprp0 = df_valid['BPRP0'].values
-    
-    if args.model_type == 'latent':
-        # Load RNN and extract latent vectors
-        print(f"\nLoading RNN model from {args.rnn_model}")
-        rnn_model = load_rnn_model(
-            args.rnn_model, args.hidden_size, args.direction,
-            args.mode, args.use_flow, device
+    print(f'Device: {device}')
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Load NLE model ──────────────────────────────────────────────────────
+    print(f'\n=== Loading NLE model: {args.nle_model} ===')
+    ckpt = torch.load(args.nle_model, map_location='cpu', weights_only=False)
+    pca              = ckpt['pca']
+    norm_params      = ckpt['normalization_params']
+    pca_dim          = ckpt['pca_dim']
+    use_mg           = ckpt.get('use_mg', False)
+    flow_transforms  = ckpt.get('flow_transforms', 12)
+    flow_hidden_dims = ckpt.get('flow_hidden_dims', [64, 164])
+
+    nle = AgePredictor(
+        pca_dim=pca_dim,
+        flow_transforms=flow_transforms,
+        flow_hidden_features=flow_hidden_dims,
+        use_mg=use_mg,
+    ).to(device)
+    nle.load_state_dict(ckpt['state_dict'])
+    nle.eval()
+    print(f'  pca_dim={pca_dim}  flow_transforms={flow_transforms}  use_mg={use_mg}')
+
+    # ── Get per-sector latents ──────────────────────────────────────────────
+    if args.load_latents:
+        print(f'\n=== Loading latents: {args.load_latents} ===')
+        npz       = np.load(args.load_latents, allow_pickle=True)
+        latents   = npz['latents']
+        gaia_ids  = npz['gaia_ids'].astype(str)
+        bprp0     = npz['bprp0'].astype(float)
+        bprp0_err = npz['bprp0_err'].astype(float)
+        print(f'  {len(gaia_ids)} entries  ({len(np.unique(gaia_ids))} unique Gaia IDs)')
+    else:
+        if args.ae_model is None:
+            raise ValueError('--ae_model is required unless --load_latents is given')
+
+        print(f'\n=== Loading H5 metadata: {args.h5_path} ===')
+        valid_indices, gaia_ids, tic_ids, sectors, bprp0, bprp0_err = \
+            load_and_filter_h5_metadata(args.h5_path)
+
+        print(f'\n=== Extracting latents (lazy H5, batch_size={args.batch_size}) ===')
+        latents = extract_latents_by_star_lazy(
+            args.ae_model, args.h5_path, valid_indices, tic_ids,
+            args.hidden_size, args.direction, args.mode,
+            args.max_length, args.pooling_mode, device,
+            batch_size=args.batch_size,
         )
-        
-        print(f"\nExtracting latent vectors...")
-        latent_vectors, extracted_tics = extract_latent_vectors(
-            rnn_model, args.h5_path, args.pickle_path, args.max_length,
-            args.pooling_mode, args.batch_size, device, tic_ids_needed=tic_ids
-        )
-        
-        # Match TIC IDs (some might be missing from H5)
-        extracted_set = set(extracted_tics)
-        keep_mask = np.array([tid in extracted_set for tid in tic_ids])
-        
-        if keep_mask.sum() < len(tic_ids):
-            print(f"  Warning: {len(tic_ids) - keep_mask.sum()} TIC IDs not found in H5 file")
-            df_valid = df_valid[keep_mask]
-            tic_ids = tic_ids[keep_mask]
-            bprp0 = bprp0[keep_mask]
-        
-        # Reorder latent vectors to match df order
-        tic_to_idx = {tid: i for i, tid in enumerate(extracted_tics)}
-        order = [tic_to_idx[tid] for tid in tic_ids]
-        latent_vectors = latent_vectors[order]
-        
-        print(f"  Latent shape: {latent_vectors.shape}")
-        
-        # Predict
-        print(f"\nPredicting ages with {n_folds}-fold ensemble ({args.ensemble})...")
-        predictions, pred_std = predict_with_latent_model(
-            checkpoint, latent_vectors, bprp0, device, args.ensemble
-        )
-    
-    else:  # gyro
-        prot = df_valid['Prot'].values
-        
-        print(f"\nPredicting ages with {n_folds}-fold ensemble ({args.ensemble})...")
-        predictions, pred_std = predict_with_gyro_model(
-            checkpoint, bprp0, prot, device, args.ensemble
-        )
-    
-    # Build output dataframe
-    output_df = pd.DataFrame({
-        'TIC_ID': tic_ids,
-        'predicted_age_myr': predictions,
-        'prediction_std_myr': pred_std,
-        'bprp0': bprp0,
+        print(f'  Extracted {latents.shape[0]} latents, dim={latents.shape[1]}')
+
+        if args.save_latents:
+            Path(args.save_latents).parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                args.save_latents,
+                latents=latents, gaia_ids=gaia_ids,
+                bprp0=bprp0,     bprp0_err=bprp0_err,
+            )
+            print(f'Saved latents → {args.save_latents}')
+
+    # ── Aggregate per-sector → one latent per star (latent_max) ────────────
+    print('\n=== Aggregating by Gaia ID (latent_max) ===')
+    star_latents, star_bprp0, star_bprp0_err, star_gaia_ids = aggregate_latent_max_by_gaia(
+        latents, gaia_ids, bprp0, bprp0_err,
+    )
+    print(f'  {len(star_gaia_ids)} unique stars')
+
+    # ── Normalise → PCA ─────────────────────────────────────────────────────
+    X_norm = (star_latents - norm_params['mean']) / (norm_params['std'] + 1e-8)
+    X_pca  = pca.transform(X_norm).astype(np.float32)
+
+    log_bprp0_err = np.log10(np.clip(star_bprp0_err, 1e-10, None)).astype(np.float32)
+    log_mg_dummy  = np.zeros(len(star_gaia_ids), dtype=np.float32)
+
+    loga_grid = torch.tensor(
+        np.linspace(PRIOR_LOGA_MYR[0], PRIOR_LOGA_MYR[1], args.loga_grid_size),
+        dtype=torch.float32, device=device,
+    )
+
+    # ── Posterior inference in batches ──────────────────────────────────────
+    print('\n=== Running age inference ===')
+    stat_keys = ('median', 'mean', 'map', 'p16', 'p84')
+    all_stats = {k: [] for k in stat_keys}
+
+    n = len(star_gaia_ids)
+    for start in range(0, n, args.nle_batch_size):
+        end  = min(start + args.nle_batch_size, n)
+        z_t  = torch.tensor(X_pca[start:end],                             device=device)
+        b_t  = torch.tensor(star_bprp0[start:end].astype(np.float32),    device=device)
+        be_t = torch.tensor(log_bprp0_err[start:end],                    device=device)
+        mg_t = torch.tensor(log_mg_dummy[start:end],                     device=device)
+
+        with torch.no_grad():
+            stats = nle.predict_stats(z_t, b_t, be_t, mg_t, loga_grid)
+
+        for k in stat_keys:
+            all_stats[k].append(stats[k].cpu().numpy())
+
+        if (start // args.nle_batch_size) % 20 == 0:
+            print(f'  {end}/{n}')
+
+    for k in stat_keys:
+        all_stats[k] = np.concatenate(all_stats[k])
+
+    # ── Save ─────────────────────────────────────────────────────────────────
+    results = pd.DataFrame({
+        'gaia_id':     star_gaia_ids,
+        'bprp0':       star_bprp0,
+        'pred_median': all_stats['median'],   # log10(age/Myr)
+        'pred_mean':   all_stats['mean'],
+        'pred_map':    all_stats['map'],
+        'pred_p16':    all_stats['p16'],
+        'pred_p84':    all_stats['p84'],
     })
-    
-    if args.model_type == 'gyro':
-        output_df['prot_days'] = df_valid['Prot'].values
-    
-    # Add true age if available
-    if 'age_Myr' in df_valid.columns:
-        true_ages = df_valid['age_Myr'].values
-        output_df['true_age_myr'] = true_ages
-        
-        # Compute metrics for stars with known ages
-        known_mask = ~np.isnan(true_ages)
-        if known_mask.sum() > 0:
-            mae = np.mean(np.abs(predictions[known_mask] - true_ages[known_mask]))
-            corr = np.corrcoef(predictions[known_mask], true_ages[known_mask])[0, 1]
-            log_scatter = np.std(np.log10(predictions[known_mask]) - np.log10(true_ages[known_mask]))
-            
-            print(f"\n=== Validation Metrics ({known_mask.sum()} stars with known ages) ===")
-            print(f"MAE: {mae:.1f} Myr")
-            print(f"Log scatter: {log_scatter:.3f} dex")
-            print(f"Correlation: {corr:.3f}")
-    
-    # Save
-    output_path = Path(args.output_csv)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_df.to_csv(output_path, index=False)
-    print(f"\nSaved {len(output_df)} predictions to {output_path}")
-    
-    # Summary stats
-    print(f"\nPrediction Summary:")
-    print(f"  Min age: {predictions.min():.1f} Myr")
-    print(f"  Max age: {predictions.max():.1f} Myr")
-    print(f"  Median age: {np.median(predictions):.1f} Myr")
-    print(f"  Mean ensemble std: {pred_std.mean():.1f} Myr")
+    out_csv = output_dir / 'age_predictions.csv'
+    results.to_csv(out_csv, index=False)
+
+    print(f'\nSaved {len(results)} predictions → {out_csv}')
+    print(f'  pred_median: mean={all_stats["median"].mean():.2f}  '
+          f'std={all_stats["median"].std():.2f} dex  (log10 age/Myr)')
+    print('Done.')
 
 
 if __name__ == '__main__':

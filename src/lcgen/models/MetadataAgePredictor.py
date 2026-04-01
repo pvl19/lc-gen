@@ -25,12 +25,12 @@ DEFAULT_METADATA_FIELDS = [
     'sector',
     'camera',
     'ccd',
-    'dr3_parallax_zpt_corrected',
+    'parallax',
     'parallax_error',
-    'G_0',
-    'e_G_0',
+    'G0',
+    'G0_err',
     'BPRP0',
-    'e_BPRP0',
+    'BPRP0_err',
     'mean_flux',
     'std_flux',
 ]
@@ -396,20 +396,20 @@ class MetadataStandardizer:
 
     Normalization rules:
         - sector: divide by 100
-        - cadence_s, Tmag, dr3_parallax_zpt_corrected, parallax_error,
-          G_0, e_G_0, e_BPRP0, mean_flux, std_flux: log10 transform
-        - BPRP0: raw (no transformation)
+        - cadence_s, Tmag, parallax, parallax_error,
+          G0, G0_err, BPRP0_err, mean_flux, std_flux: log10 transform
+        - BPRP0, camera, ccd: raw (no transformation)
     """
 
     # Fields that get log10 transformed
     LOG10_FIELDS = {
         'cadence_s',
         'Tmag',
-        'dr3_parallax_zpt_corrected',
+        'parallax',
         'parallax_error',
-        'G_0',
-        'e_G_0',
-        'e_BPRP0',
+        'G0',
+        'G0_err',
+        'BPRP0_err',
         'mean_flux',
         'std_flux',
     }

@@ -42,7 +42,7 @@
 MODEL_PATH=${1:-"output/performance_tests/cf_final/model.pt"}
 VERSION=${2:-"default"}
 POOLING_MODE=${3:-"multiscale"}
-STAR_AGGREGATION=${4:-"latent_median"}
+STAR_AGGREGATION=${4:-"latent_max"}
 USE_METADATA=${5:-"true"}
 USE_CONV=${6:-"false"}
 CONV_TYPE=${7:-"unet"}
@@ -50,8 +50,10 @@ REQUIRE_PROT=${8:-"false"}
 H5_PATH=${9:-"data/timeseries_x.h5"}
 SAVE_LATENTS=${10:-""}   # e.g. output/latents_cache/baseline_long_multiscale.npz
 LOAD_LATENTS=${11:-"output/latents_cache/cf_final_multiscale.npz"}   # e.g. output/latents_cache/baseline_long_multiscale.npz
+ENCODER_TYPE=${12:-"pca"}   # pca or mlp
+USE_MG=${13:-"false"}       # true to include log10(MG_quick) as 4th flow context variable
 
-OUTPUT_DIR="output/age_predictor_tests/cf-final-nf-${POOLING_MODE}-${STAR_AGGREGATION}"
+OUTPUT_DIR="output/age_predictor_tests/cf-final-nf-pca4-v19-${POOLING_MODE}-${STAR_AGGREGATION}-${ENCODER_TYPE}"
 
 echo "Running k-fold age inference:"
 echo "  Model:            ${MODEL_PATH:-'(from cache)'}"
@@ -59,6 +61,8 @@ echo "  H5 file:          ${H5_PATH}"
 echo "  Version:          ${VERSION}"
 echo "  Pooling mode:     ${POOLING_MODE}"
 echo "  Star aggregation: ${STAR_AGGREGATION}"
+echo "  Encoder type:     ${ENCODER_TYPE}"
+echo "  Use MG:           ${USE_MG}"
 echo "  Use metadata:     ${USE_METADATA}"
 echo "  Use conv:         ${USE_CONV} (${CONV_TYPE})"
 echo "  Require Prot:     ${REQUIRE_PROT}"
@@ -88,15 +92,16 @@ CMD="${CMD} \
   --age_csv data/phot_all.csv \
   --output_dir ${OUTPUT_DIR} \
   --star_aggregation ${STAR_AGGREGATION} \
-  --n_folds 10 \
-  --hidden_dims 128 64 8 \
-  --dropout 0.2 \
+  --n_folds 5 \
+  --encoder_type ${ENCODER_TYPE} \
+  --pca_dim 4 \
   --lr 1e-3 \
+  --lr_decay_rate 0.97 \
   --n_epochs 100 \
   --batch_size 64 \
-  --flow_transforms 13 \
-  --flow_hidden_dims 128 128 \
-  --n_flow_samples 1000
+  --flow_transforms 12 \
+  --flow_hidden_dims 64 164 \
+  --loga_grid_size 1000 \
   --seed 42"
 
 if [ -n "${SAVE_LATENTS}" ]; then
@@ -113,6 +118,10 @@ fi
 
 if [ "${REQUIRE_PROT}" = "true" ]; then
   CMD="${CMD} --require_prot"
+fi
+
+if [ "${USE_MG}" = "true" ]; then
+  CMD="${CMD} --use_mg"
 fi
 
 eval $CMD

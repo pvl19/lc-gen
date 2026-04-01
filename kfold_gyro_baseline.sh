@@ -1,22 +1,28 @@
 #!/bin/bash
-# K-fold gyrochronology baseline: predict age from BPRP0 + Prot only
+# Gyrochronology NLE baseline: p(log10(Prot) | log10_age, BPRP0, log10(BPRP0_err))
+# Mirrors kfold_age_inference.sh but uses Prot as the 1D likelihood variable.
 #
 # Usage: ./kfold_gyro_baseline.sh [version]
-# Example: ./kfold_gyro_baseline.sh v1
 
-VERSION=${1:-"default"}
-OUTPUT_DIR="output/age_predictor/gyro_baseline_init_slurm_comp"
+VERSION=${1:-"v1"}
+LOAD_LATENTS=${2:-"output/latents_cache/cf_final_multiscale.npz"}
+OUTPUT_DIR="output/age_predictor_tests/gyro-nle-${VERSION}"
 
-echo "Running gyro baseline k-fold with version: ${VERSION}"
-echo "Output directory: ${OUTPUT_DIR}"
+echo "Running gyro NLE baseline:"
+echo "  Version:      ${VERSION}"
+echo "  Load latents: ${LOAD_LATENTS:-'(no filter)'}"
+echo "  Output:       ${OUTPUT_DIR}"
 
 python scripts/kfold_gyro_baseline.py \
-  --age_csv data/TIC_cf_data.csv \
+  --age_csv data/phot_all.csv \
   --output_dir "${OUTPUT_DIR}" \
-  --hidden_dims 128 64 32 \
-  --dropout 0.2 \
+  --flow_transforms 8 \
+  --flow_hidden_dims 64 64 \
   --lr 1e-3 \
+  --lr_decay_rate 0.97 \
   --n_epochs 100 \
   --batch_size 64 \
-  --n_folds 10 \
-  --seed 42
+  --n_folds 5 \
+  --loga_grid_size 1000 \
+  --seed 42 \
+  ${LOAD_LATENTS:+--load_latents "${LOAD_LATENTS}"}

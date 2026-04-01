@@ -4,3 +4,7 @@ tmp/*
 src/lcgen/models/__pycache__/*
 output/ps_acf_predictor/*
 exop_hosts/lc_data.pickle
+exop_hosts/lc_data.h5
+final_pretrain/*
+# output/age_predictor/*
+# output/age_predictor_tests/*

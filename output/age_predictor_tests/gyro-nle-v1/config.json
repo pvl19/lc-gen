@@ -1,0 +1,28 @@
+{
+  "age_csv": "data/phot_all.csv",
+  "output_dir": "output/age_predictor_tests/gyro-nle-v1",
+  "bprp0_min": null,
+  "bprp0_max": null,
+  "flow_transforms": 8,
+  "flow_hidden_dims": [
+    64,
+    64
+  ],
+  "loga_grid_size": 1000,
+  "lr": 0.001,
+  "lr_decay_rate": 0.97,
+  "weight_decay": 0.0001,
+  "n_epochs": 100,
+  "batch_size": 64,
+  "n_folds": 5,
+  "seed": 42,
+  "load_latents": "output/latents_cache/cf_final_multiscale.npz",
+  "n_samples": 2494,
+  "fold_losses": [
+    0.08928751200437546,
+    0.14580687880516052,
+    0.10447058826684952,
+    0.16555728018283844,
+    0.08187641948461533
+  ]
+}
