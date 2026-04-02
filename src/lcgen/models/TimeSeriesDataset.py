@@ -24,6 +24,103 @@ from lcgen.models.MetadataAgePredictor import DEFAULT_METADATA_FIELDS, MetadataS
 METADATA_FEATURES = DEFAULT_METADATA_FIELDS
 
 
+class LazyH5Dataset(Dataset):
+    """Memory-efficient dataset that reads flux/flux_err/time from HDF5 on demand.
+
+    Metadata (small 1D arrays) is loaded eagerly at init. Flux arrays are read
+    per-sample from disk, making this suitable for large datasets and multi-GPU
+    DDP training where loading all data into RAM per process would be infeasible.
+
+    Designed to work with DataLoader num_workers > 0: each worker process opens
+    its own h5 file handle on first access.
+    """
+
+    def __init__(self, h5path, random_seed, min_size, max_size, mask_portion,
+                 num_samples=None, use_metadata=False, metadata_features=None):
+        self.h5path = str(h5path)
+        self.min_size = min_size
+        self.max_size = max_size
+        self.mask_portion = mask_portion
+        self.rng = np.random.default_rng(random_seed)
+        self.use_metadata = use_metadata
+        self.metadata_features = metadata_features or METADATA_FEATURES
+        self.num_meta_features = len(self.metadata_features)
+        self._h5 = None  # opened lazily per worker process
+
+        with h5py.File(self.h5path, 'r') as f:
+            n_total = int(f.attrs['n_samples'])
+            lengths = f['length'][:].astype(np.int32)
+
+            if use_metadata:
+                meta_grp = f['metadata']
+                missing = [fld for fld in self.metadata_features if fld not in meta_grp]
+                if missing:
+                    raise RuntimeError(f'Missing metadata features in {h5path}: {missing}')
+                raw = {fld: meta_grp[fld][:].astype(np.float32) for fld in self.metadata_features}
+                standardizer = MetadataStandardizer(fields=self.metadata_features)
+                metadata = standardizer.transform(raw)
+            else:
+                metadata = None
+
+        # Subsample if requested
+        if num_samples is not None and num_samples < n_total:
+            rng = np.random.default_rng(random_seed)
+            idx = rng.choice(n_total, num_samples, replace=False)
+            idx.sort()
+        else:
+            idx = np.arange(n_total)
+
+        self.indices = idx
+        self.lengths = lengths[idx]
+        self.metadata = metadata[idx] if metadata is not None else None
+
+    def _get_h5(self):
+        """Return an open h5py file handle, opening lazily on first access per worker."""
+        if self._h5 is None:
+            self._h5 = h5py.File(self.h5path, 'r')
+        return self._h5
+
+    def __len__(self):
+        return len(self.indices)
+
+    def _generate_block_mask(self, L):
+        if self.mask_portion <= 0:
+            return np.ones(L, dtype=np.float32)
+        mask = np.ones(L, dtype=np.float32)
+        total_mask_size = int(L * self.mask_portion)
+        if total_mask_size == 0:
+            return mask
+        masked_so_far = 0
+        while masked_so_far < total_mask_size:
+            log_size = self.rng.uniform(np.log10(self.min_size), np.log10(self.max_size))
+            block_size = int(round(10 ** log_size))
+            block_size = max(self.min_size, min(block_size, self.max_size))
+            if masked_so_far + block_size > total_mask_size:
+                block_size = total_mask_size - masked_so_far
+            if block_size <= 0:
+                break
+            max_start = L - block_size
+            if max_start < 0:
+                break
+            start_idx = self.rng.integers(0, max_start + 1)
+            mask[start_idx:start_idx + block_size] = 0.0
+            masked_so_far += block_size
+        return mask
+
+    def __getitem__(self, idx):
+        h5_idx = int(self.indices[idx])
+        L = int(self.lengths[idx])
+        h5 = self._get_h5()
+        flux     = h5['flux'][h5_idx, :L].astype(np.float32)
+        flux_err = h5['flux_err'][h5_idx, :L].astype(np.float32)
+        time     = h5['time'][h5_idx, :L].astype(np.float32)
+        mask = self._generate_block_mask(L)
+        meta = self.metadata[idx] if (self.use_metadata and self.metadata is not None) \
+               else np.zeros(self.num_meta_features, dtype=np.float32)
+        empty = np.zeros(0, dtype=np.float32)
+        return [flux, flux_err, time, mask, L, meta, empty, empty, empty]
+
+
 class TimeSeriesDataset(Dataset):
     def __init__(self, h5path, random_seed, min_size, max_size, mask_portion, max_length=16384, num_samples=None, mock_sinusoid=False, mock_noise=0.1, use_metadata=False, metadata_features=None, use_conv_channels=False):
         self.min_size = min_size

@@ -6,6 +6,7 @@ a checkpoint. It supports the optional zuko flow if available; otherwise it
 falls back to Gaussian negative-log-likelihood (or MSE for simplicity).
 """
 import argparse
+import os
 from pathlib import Path
 import h5py
 import numpy as np
@@ -14,8 +15,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import torch.optim as optim
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from torch.optim.lr_scheduler import OneCycleLR
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, random_split, ConcatDataset
 import datetime
 
 import sys
@@ -26,7 +30,30 @@ from lcgen.models.simple_min_gru import SimpleMinGRU, BiDirectionalMinGRU
 from lcgen.utils.trunc_data import extract_data
 from lcgen.utils.loss import recon_loss, bounded_horizon_future_nll
 from lcgen.utils.run_log import log_run_args
-from lcgen.models.TimeSeriesDataset import TimeSeriesDataset, collate_fn
+from lcgen.models.TimeSeriesDataset import TimeSeriesDataset, LazyH5Dataset, collate_fn
+
+
+def setup_ddp():
+    """Initialize DDP process group if running under torchrun, else return rank=0."""
+    if 'LOCAL_RANK' not in os.environ:
+        return 0, 1, torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    local_rank = int(os.environ['LOCAL_RANK'])
+    dist.init_process_group(backend='nccl')
+    torch.cuda.set_device(local_rank)
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.device(f'cuda:{local_rank}')
+    return rank, world_size, device
+
+
+def cleanup_ddp():
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def worker_init_fn(worker_id):
+    """Reseed each DataLoader worker so block masks are not correlated across workers."""
+    np.random.seed(np.random.get_state()[1][0] + worker_id)
 
 def validate(model, val_loader, device, args):
     """Compute validation loss without updating model parameters.
@@ -135,37 +162,67 @@ def _save_rolling_checkpoint(
 
 
 def train(args):
-    if args.device == 'auto':
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    rank, world_size, device = setup_ddp()
+    is_main = (rank == 0)
+    ddp_active = (world_size > 1)
+
+    if is_main:
+        print(f"World size: {world_size}")
+        print(f"Using device: {device}")
+        print(f"CUDA available: {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            print(f"CUDA device: {torch.cuda.get_device_name(device.index)}")
+            print(f"CUDA memory: {torch.cuda.get_device_properties(device.index).total_memory / 1e9:.1f} GB")
+
+    # Build dataset — one LazyH5Dataset per input file, concatenated
+    seed_offset = rank  # different mask seeds per rank
+    datasets = [
+        LazyH5Dataset(
+            path, args.random_seed + seed_offset,
+            args.min_size, args.max_size, args.mask_portion,
+            num_samples=args.num_samples,
+            use_metadata=args.use_metadata,
+            metadata_features=None,
+        )
+        for path in args.input
+    ]
+    ds = ConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
+    num_meta_features = datasets[0].num_meta_features if args.use_metadata else 0
+
+    if is_main:
+        print(f'Total samples: {len(ds)} across {len(datasets)} file(s)')
+
+    # Split into train / val
+    val_size = int(len(ds) * args.val_split) if args.val_split > 0 else 0
+    train_size = len(ds) - val_size
+    if val_size > 0:
+        train_ds, val_ds = random_split(ds, [train_size, val_size],
+                                        generator=torch.Generator().manual_seed(args.random_seed))
+        if is_main:
+            print(f'Split: {train_size} train, {val_size} val')
     else:
-        device = torch.device(args.device)
+        train_ds, val_ds = ds, None
+        if is_main:
+            print('No validation split - using all data for training')
 
-    # Print CUDA diagnostics
-    print(f"Using device: {device}")
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        print(f"CUDA device: {torch.cuda.get_device_name(0)}")
-        print(f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-
-    ds = TimeSeriesDataset(args.input, args.random_seed, args.min_size, args.max_size, args.mask_portion, args.max_length, args.num_samples, args.mock_sinusoid, args.mock_noise, use_metadata=args.use_metadata, use_conv_channels=args.use_conv_channels)
-    print('Shape of TimeSeriesDataset:', ds.flux.shape)
-
-    # Split dataset into train and validation sets
-    if args.val_split > 0:
-        val_size = int(len(ds) * args.val_split)
-        train_size = len(ds) - val_size
-        train_ds, val_ds = random_split(ds, [train_size, val_size], generator=torch.Generator().manual_seed(args.random_seed))
-        print(f'Split dataset: {train_size} train samples, {val_size} validation samples')
-
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
-        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True)
+    # Samplers — DDP uses DistributedSampler; single-GPU uses default shuffle
+    if ddp_active:
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
+        val_sampler   = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False) \
+                        if val_ds is not None else None
+        shuffle_train = False
     else:
-        train_loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
-        val_loader = None
-        print('No validation split - using all data for training')
+        train_sampler = None
+        val_sampler   = None
+        shuffle_train = True
 
-    # Determine number of metadata features from dataset
-    num_meta_features = ds.num_meta_features if args.use_metadata else 0
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=shuffle_train,
+                              sampler=train_sampler, collate_fn=collate_fn,
+                              num_workers=4, pin_memory=True, worker_init_fn=worker_init_fn)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                            sampler=val_sampler, collate_fn=collate_fn,
+                            num_workers=4, pin_memory=True, worker_init_fn=worker_init_fn) \
+                 if val_ds is not None else None
 
     # Convolutional channel configuration
     conv_config = None
@@ -193,13 +250,18 @@ def train(args):
             }
             print(f"Using UNET conv encoder (slower but richer multi-scale features)")
 
-    model = BiDirectionalMinGRU(hidden_size=args.hidden_size, direction=args.direction, mode=args.mode, use_flow=args.use_flow, num_meta_features=num_meta_features, use_conv_channels=args.use_conv_channels, conv_config=conv_config).to(device)
-    # Ensure the post-LN time scaling parameter is trainable (unfrozen) so it
-    # can be fine-tuned during training. This prints its requires_grad status
-    # for transparency when the user launches training.
-    if hasattr(model, 'time_scale'):
-        print('time_scale present; requires_grad =', model.time_scale.requires_grad)
-        if hasattr(model, 'flow') and model.flow is not None:
+    raw_model = BiDirectionalMinGRU(hidden_size=args.hidden_size, direction=args.direction, mode=args.mode, use_flow=args.use_flow, num_meta_features=num_meta_features, use_conv_channels=args.use_conv_channels, conv_config=conv_config).to(device)
+
+    if ddp_active:
+        model = DDP(raw_model, device_ids=[device.index])
+        model._set_static_graph()
+    else:
+        model = raw_model
+
+    if is_main:
+        if hasattr(raw_model, 'time_scale'):
+            print('time_scale present; requires_grad =', raw_model.time_scale.requires_grad)
+        if hasattr(raw_model, 'flow') and raw_model.flow is not None:
             print('Flow head enabled and present on model; using zuko-based flow head.')
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0)
@@ -220,7 +282,7 @@ def train(args):
 
         # Load checkpoint
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        raw_model.load_state_dict(checkpoint['model_state_dict'])
         print(f"✓ Loaded model state from checkpoint")
 
         # Load optimizer state if available
@@ -294,6 +356,8 @@ def train(args):
 
     import time as time_module
     for epoch in range(start_epoch, args.epochs):
+        if ddp_active:
+            train_sampler.set_epoch(epoch)
         epoch_start = time_module.time()
         model.train()
         total_loss = 0.0
@@ -371,8 +435,14 @@ def train(args):
             n += 1
 
         avg = total_loss / max(1, n)
+        # All-reduce training loss across ranks so rank 0 logs the global average
+        if ddp_active:
+            t = torch.tensor(avg, device=device)
+            dist.all_reduce(t, op=dist.ReduceOp.AVG)
+            avg = t.item()
         epoch_time = time_module.time() - epoch_start
-        train_epoch_losses.append(avg)
+        if is_main:
+            train_epoch_losses.append(avg)
 
         # Compute training time breakdown
         time_train_total = time_data_load + time_forward + time_loss + time_backward + time_optimizer
@@ -394,113 +464,118 @@ def train(args):
         if val_loader is not None:
             val_start = time_module.time()
             val_loss = validate(model, val_loader, device, args)
+            if ddp_active:
+                t = torch.tensor(val_loss, device=device)
+                dist.all_reduce(t, op=dist.ReduceOp.AVG)
+                val_loss = t.item()
             time_val = time_module.time() - val_start
-            val_epoch_losses.append(val_loss)
-            print(f'Epoch {epoch+1}/{args.epochs} - Train Loss: {avg:.6f} - Val Loss: {val_loss:.6f} - Time: {epoch_time:.1f}s')
-            print(f'  Timing breakdown: Data={time_data_load:.1f}s Forward={time_forward:.1f}s Loss={time_loss:.1f}s Backward={time_backward:.1f}s Optimizer={time_optimizer:.1f}s Val={time_val:.1f}s')
+            if is_main:
+                val_epoch_losses.append(val_loss)
+                print(f'Epoch {epoch+1}/{args.epochs} - Train Loss: {avg:.6f} - Val Loss: {val_loss:.6f} - Time: {epoch_time:.1f}s')
+                print(f'  Timing breakdown: Data={time_data_load:.1f}s Forward={time_forward:.1f}s Loss={time_loss:.1f}s Backward={time_backward:.1f}s Optimizer={time_optimizer:.1f}s Val={time_val:.1f}s')
 
-            # Early stopping check
-            if args.patience > 0:
-                # Check if validation loss improved
-                if val_loss < (best_val_loss - args.min_delta):
-                    best_val_loss = val_loss
-                    epochs_without_improvement = 0
-                    # Save best model state
-                    best_model_state = {
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'epoch': epoch + 1
-                    }
-                    print(f'  → New best validation loss: {best_val_loss:.6f}')
-                else:
-                    epochs_without_improvement += 1
-                    print(f'  → No improvement for {epochs_without_improvement} epoch(s) (best: {best_val_loss:.6f})')
+                # Early stopping check
+                if args.patience > 0:
+                    if val_loss < (best_val_loss - args.min_delta):
+                        best_val_loss = val_loss
+                        epochs_without_improvement = 0
+                        best_model_state = {
+                            'model_state_dict': raw_model.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'epoch': epoch + 1
+                        }
+                        print(f'  → New best validation loss: {best_val_loss:.6f}')
+                    else:
+                        epochs_without_improvement += 1
+                        print(f'  → No improvement for {epochs_without_improvement} epoch(s) (best: {best_val_loss:.6f})')
 
-                    # Check if we should stop
-                    if epochs_without_improvement >= args.patience:
-                        print(f'\nEarly stopping triggered after {epoch+1} epochs (patience={args.patience})')
-                        print(f'Best validation loss: {best_val_loss:.6f} at epoch {epoch+1-args.patience}')
-                        stopped_early = True
-                        # Save checkpoint before breaking so progress is not lost
-                        _save_rolling_checkpoint(
-                            model, optimizer, epoch + 1,
-                            previous_train_losses, train_epoch_losses,
-                            previous_val_losses, val_epoch_losses,
-                            k_stats_per_epoch, output_path, persistent_dir,
-                        )
-                        break
+                        if epochs_without_improvement >= args.patience:
+                            print(f'\nEarly stopping triggered after {epoch+1} epochs (patience={args.patience})')
+                            print(f'Best validation loss: {best_val_loss:.6f} at epoch {epoch+1-args.patience}')
+                            stopped_early = True
+                            _save_rolling_checkpoint(
+                                raw_model, optimizer, epoch + 1,
+                                previous_train_losses, train_epoch_losses,
+                                previous_val_losses, val_epoch_losses,
+                                k_stats_per_epoch, output_path, persistent_dir,
+                            )
+            # Broadcast early-stop decision from rank 0 to all ranks
+            if ddp_active and args.patience > 0:
+                stop_flag = torch.tensor(int(stopped_early), device=device)
+                dist.broadcast(stop_flag, src=0)
+                stopped_early = bool(stop_flag.item())
+            if stopped_early:
+                break
         else:
-            print(f'Epoch {epoch+1}/{args.epochs} - Loss: {avg:.6f} - Time: {epoch_time:.1f}s')
-            print(f'  Timing breakdown: Data={time_data_load:.1f}s Forward={time_forward:.1f}s Loss={time_loss:.1f}s Backward={time_backward:.1f}s Optimizer={time_optimizer:.1f}s')
+            if is_main:
+                print(f'Epoch {epoch+1}/{args.epochs} - Loss: {avg:.6f} - Time: {epoch_time:.1f}s')
+                print(f'  Timing breakdown: Data={time_data_load:.1f}s Forward={time_forward:.1f}s Loss={time_loss:.1f}s Backward={time_backward:.1f}s Optimizer={time_optimizer:.1f}s')
 
-        # ---- Per-epoch rolling checkpoint ----
-        if not stopped_early and args.save_every > 0 and (epoch + 1) % args.save_every == 0:
+        # ---- Per-epoch rolling checkpoint (rank 0 only) ----
+        if is_main and not stopped_early and args.save_every > 0 and (epoch + 1) % args.save_every == 0:
             _save_rolling_checkpoint(
-                model, optimizer, epoch + 1,
+                raw_model, optimizer, epoch + 1,
                 previous_train_losses, train_epoch_losses,
                 previous_val_losses, val_epoch_losses,
                 k_stats_per_epoch, output_path, persistent_dir,
             )
 
-    # Restore best model if early stopping was used
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state['model_state_dict'])
-        optimizer.load_state_dict(best_model_state['optimizer_state_dict'])
-        best_epoch = best_model_state['epoch']
-        print(f'\nRestored best model from epoch {best_epoch}')
+    if is_main:
+        # Restore best model if early stopping was used
+        if best_model_state is not None:
+            raw_model.load_state_dict(best_model_state['model_state_dict'])
+            optimizer.load_state_dict(best_model_state['optimizer_state_dict'])
+            best_epoch = best_model_state['epoch']
+            print(f'\nRestored best model from epoch {best_epoch}')
 
-    # Concatenate losses with previous training session
-    all_train_losses = previous_train_losses + train_epoch_losses
-    all_val_losses = previous_val_losses + val_epoch_losses
+        # Concatenate losses with previous training session
+        all_train_losses = previous_train_losses + train_epoch_losses
+        all_val_losses = previous_val_losses + val_epoch_losses
 
-    # Save final/best model with optimizer state for potential resumption
-    model_path = output_path / args.output_name
-    checkpoint_dict = {
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'epoch': len(all_train_losses),
-        'num_meta_features': model.num_meta_features,
-    }
-    torch.save(checkpoint_dict, model_path)
-    if stopped_early:
-        print(f'Saved best model (epoch {best_epoch}) to {model_path}')
-    else:
-        print(f'Saved final model (epoch {len(all_train_losses)}) to {model_path}')
-
-    # Save epoch-level losses (concatenated with previous losses)
-    try:
-        losses_path = output_path / 'losses_per_epoch.npz'
-        save_dict = {
-            'train_loss': np.array(all_train_losses, dtype=np.float32),
+        # Save final/best model with optimizer state for potential resumption
+        model_path = output_path / args.output_name
+        checkpoint_dict = {
+            'model_state_dict': raw_model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'epoch': len(all_train_losses),
+            'num_meta_features': raw_model.num_meta_features,
         }
-        if val_loader is not None and len(all_val_losses) > 0:
-            save_dict['val_loss'] = np.array(all_val_losses, dtype=np.float32)
-
-        # Add k-value statistics if available
-        if k_stats_per_epoch:
-            save_dict['k_mean'] = np.array([s['mean'] for s in k_stats_per_epoch], dtype=np.float32)
-            save_dict['k_min'] = np.array([s['min'] for s in k_stats_per_epoch], dtype=np.int32)
-            save_dict['k_max'] = np.array([s['max'] for s in k_stats_per_epoch], dtype=np.int32)
-            save_dict['k_std'] = np.array([s['std'] for s in k_stats_per_epoch], dtype=np.float32)
-
-        # Add early stopping metadata
+        torch.save(checkpoint_dict, model_path)
         if stopped_early:
-            save_dict['stopped_early'] = True
-            save_dict['best_epoch'] = best_epoch if best_model_state else len(all_train_losses) - epochs_without_improvement
-            save_dict['best_val_loss'] = best_val_loss
+            print(f'Saved best model (epoch {best_epoch}) to {model_path}')
+        else:
+            print(f'Saved final model (epoch {len(all_train_losses)}) to {model_path}')
 
-        np.savez_compressed(losses_path, **save_dict)
-        print('Saved epoch losses to', losses_path)
-        if previous_train_losses:
-            print(f'  Combined {len(previous_train_losses)} previous + {len(train_epoch_losses)} new epochs = {len(all_train_losses)} total')
-    except Exception as e:
-        print('Warning: failed to save epoch losses:', e)
+    # Save epoch-level losses — rank 0 only
+    if is_main:
+        try:
+            losses_path = output_path / 'losses_per_epoch.npz'
+            save_dict = {'train_loss': np.array(all_train_losses, dtype=np.float32)}
+            if val_loader is not None and len(all_val_losses) > 0:
+                save_dict['val_loss'] = np.array(all_val_losses, dtype=np.float32)
+            if k_stats_per_epoch:
+                save_dict['k_mean'] = np.array([s['mean'] for s in k_stats_per_epoch], dtype=np.float32)
+                save_dict['k_min']  = np.array([s['min']  for s in k_stats_per_epoch], dtype=np.int32)
+                save_dict['k_max']  = np.array([s['max']  for s in k_stats_per_epoch], dtype=np.int32)
+                save_dict['k_std']  = np.array([s['std']  for s in k_stats_per_epoch], dtype=np.float32)
+            if stopped_early:
+                save_dict['stopped_early'] = True
+                save_dict['best_epoch'] = best_epoch if best_model_state else len(all_train_losses) - epochs_without_improvement
+                save_dict['best_val_loss'] = best_val_loss
+            np.savez_compressed(losses_path, **save_dict)
+            print('Saved epoch losses to', losses_path)
+            if previous_train_losses:
+                print(f'  Combined {len(previous_train_losses)} previous + {len(train_epoch_losses)} new epochs = {len(all_train_losses)} total')
+        except Exception as e:
+            print('Warning: failed to save epoch losses:', e)
+
+    cleanup_ddp()
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--input', type=str, default='data/timeseries.h5')
-    p.add_argument('--max_length', type=int, default=16384)
+    p.add_argument('--input', type=str, nargs='+', default=['data/timeseries_x.h5'],
+                   help='One or more HDF5 input files (e.g. --input file1.h5 file2.h5)')
     p.add_argument('--direction', type=str, default='forward', choices=['forward', 'backward', 'bi'])
     p.add_argument('--random_seed', type=int, default=19)
     p.add_argument('--num_samples', type=int, default=None)

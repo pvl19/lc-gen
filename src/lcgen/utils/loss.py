@@ -92,26 +92,15 @@ def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=
     flux = flux.to(device)
     flux_err = flux_err.to(device)
 
+    # Unwrap DDP so attribute access works correctly
+    model = model.module if hasattr(model, 'module') else model
+
     # Grab head and optional modules from model
     head = getattr(model, 'gauss_head', model)
     head_norm = getattr(model, 'head_norm', None)
     # time_scale expected to be a scalar nn.Parameter on the model; if absent
     # we simply won't scale the time slice.
     time_scale = getattr(model, 'time_scale', None)
-
-    # Compute metadata embedding if available (same as model.forward)
-    meta_encoder = getattr(model, 'meta_encoder', None)
-    meta_input_norm = getattr(model, 'meta_input_norm', None)
-    meta_emb_dim = getattr(model, 'meta_emb_dim', 0)
-    if meta_encoder is not None and metadata is not None:
-        # Apply input normalization if the model has it
-        if meta_input_norm is not None:
-            meta_normed = meta_input_norm(metadata)
-            meta_emb = meta_encoder(meta_normed)  # (B, meta_emb_dim)
-        else:
-            meta_emb = meta_encoder(metadata)  # (B, meta_emb_dim)
-    else:
-        meta_emb = None
 
     # Use fixed_k if provided, otherwise sample a k value based on spacing strategy
     if fixed_k is not None:
@@ -121,41 +110,25 @@ def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=
 
     per_k_mean = {}
 
-    # Symmetric bidirectional offset: predict targets at positions k to L-1-k
-    # Forward hidden at j-k (info up to j-k-1), backward hidden at j+k (info from j+k+1)
-    # This ensures neither direction sees any data within k steps of the target
-
     # Target positions: k to L-1-k (inclusive)
     n_targets = L - 2*k
 
     # Time encodings at target positions
     t_tgt = t_enc[:, k:L-k, :]        # (B, n_targets, Te)
 
-    # prepare inputs for head: concat along last dim. If the model is
-    # bidirectional and backward hidden states were provided, build the
-    # same fused input used in `model.forward` (src_f, src_b, t_tgt, meta_emb).
+    # Build head input: [hidden_states, time_enc] — matches model.forward exactly.
+    # Metadata is NOT included here; it already influences the hidden states via
+    # the RNN input path in model.forward. Adding it again would change the head
+    # input size relative to what head_norm and the flow were initialized for.
     if getattr(model, 'direction', None) == 'bi' and h_bwd is not None:
-        # Forward hidden at positions 0 to L-2k-1 (predicting k to L-1-k)
-        src_f = h_fwd[:, :n_targets, :]
-        # Backward hidden at positions 2k to L-1 (info from 2k+1 to L)
-        src_b = h_bwd[:, 2*k:, :]
-        if meta_emb is not None:
-            # Expand metadata embedding to match n_targets
-            meta_exp = meta_emb.unsqueeze(1).expand(-1, n_targets, -1)  # (B, n_targets, meta_emb_dim)
-            inputs_k = torch.cat([src_f, src_b, t_tgt, meta_exp], dim=-1)   # (B, n_targets, 2H+Te+M)
-            flat_in = inputs_k.view(-1, 2 * H + Te + meta_emb_dim)
-        else:
-            inputs_k = torch.cat([src_f, src_b, t_tgt], dim=-1)   # (B, n_targets, 2H+Te)
-            flat_in = inputs_k.view(-1, 2 * H + Te)
+        src_f = h_fwd[:, :n_targets, :]       # (B, n_targets, H)
+        src_b = h_bwd[:, 2*k:, :]             # (B, n_targets, H)
+        inputs_k = torch.cat([src_f, src_b, t_tgt], dim=-1)   # (B, n_targets, 2H+Te)
+        flat_in = inputs_k.view(-1, 2 * H + Te)
     else:
-        h_src = h_fwd[:, :n_targets, :]        # (B, n_targets, H)
-        if meta_emb is not None:
-            meta_exp = meta_emb.unsqueeze(1).expand(-1, n_targets, -1)
-            inputs_k = torch.cat([h_src, t_tgt, meta_exp], dim=-1)   # (B, n_targets, H+Te+M)
-            flat_in = inputs_k.view(-1, H + Te + meta_emb_dim)
-        else:
-            inputs_k = torch.cat([h_src, t_tgt], dim=-1)   # (B, n_targets, H+Te)
-            flat_in = inputs_k.view(-1, H + Te)           # (B*n_targets, H+Te)
+        h_src = h_fwd[:, :n_targets, :]       # (B, n_targets, H)
+        inputs_k = torch.cat([h_src, t_tgt], dim=-1)          # (B, n_targets, H+Te)
+        flat_in = inputs_k.view(-1, H + Te)
 
     # Apply head normalization and the same time-conditioning used in
     # `model.forward` before calling the head so training/inference match.

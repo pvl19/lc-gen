@@ -400,9 +400,6 @@ class BiDirectionalMinGRU(nn.Module):
             x_parts.append(conv_emb_seq)
         x = torch.cat(x_parts, dim=-1)  # (B, L, 2 + Te + meta_emb_dim + conv_emb_dim)
 
-        seq_prediction = []
-
-
         # ---- Store backward hidden states (mask-gated updates) ----
 
         if self.direction in ['bi', 'backward']:
@@ -448,81 +445,56 @@ class BiDirectionalMinGRU(nn.Module):
                     inp_fwd = self.forward_input_proj(xi_fwd)
                     h_fwd = self.forward_cell.step(inp_fwd, h_fwd)
 
-        for ti in range(L):
-            # Use closest hidden states available from unmasked data at this index
-            time_enc_t = t_enc[:, ti, :]
+        out = {'reconstructed': None}
+        if not return_states:
+            # Reconstruction pass: compute per-timestep predictions for visualization.
+            seq_prediction = []
+            for ti in range(L):
+                time_enc_t = t_enc[:, ti, :]
+                if self.direction == 'forward':
+                    h_bi = torch.cat([h_fwd_tensor[:, ti, :], time_enc_t], dim=1)
+                elif self.direction == 'backward':
+                    h_bi = torch.cat([h_bwd_tensor[:, ti, :], time_enc_t], dim=1)
+                else:
+                    h_bi = torch.cat([h_fwd_tensor[:, ti, :], h_bwd_tensor[:, ti, :], time_enc_t], dim=1)
+                h_bi = self.head_norm(h_bi)
+                nt = self.num_time_enc_dims
+                if nt > 0:
+                    h_hidden = h_bi[:, :-nt]
+                    h_time = h_bi[:, -nt:] * self.time_scale
+                    h_bi = torch.cat([h_hidden, h_time], dim=1)
+                meas_err_t = x[:, ti, 1]
+                if self.flow is not None:
+                    ctx = torch.cat([h_bi, meas_err_t.unsqueeze(1)], dim=1)
+                    dist = self.flow(ctx)
+                    if flow_mode == 'sample':
+                        point_prediction = dist.sample().view(B, 1)
+                    elif flow_mode == 'mode':
+                        ctx_detached = ctx.detach()
+                        dist_opt = self.flow(ctx_detached)
+                        y_init = dist_opt.sample().clone().detach()
+                        y_opt = y_init.requires_grad_(True)
+                        optimizer = torch.optim.Adam([y_opt], lr=0.1)
+                        for _ in range(30):
+                            optimizer.zero_grad()
+                            dist_step = self.flow(ctx_detached)
+                            loss = -dist_step.log_prob(y_opt).sum()
+                            loss.backward()
+                            optimizer.step()
+                            with torch.no_grad():
+                                y_opt.clamp_(-10, 10)
+                        point_prediction = y_opt.detach().view(B, 1)
+                    else:  # 'mean'
+                        n_samples = 16
+                        s_acc = dist.sample()
+                        for _ in range(n_samples - 1):
+                            s_acc = s_acc + dist.sample()
+                        point_prediction = (s_acc / n_samples).view(B, 1)
+                else:
+                    point_prediction = self.gauss_head(h_bi)
+                seq_prediction.append(point_prediction)
+            out['reconstructed'] = torch.stack(seq_prediction, dim=1)  # (B, L, 1)
 
-            # Concatenate hidden states + time encoding for head input.
-            # Note: metadata and conv embeddings only affect the RNN hidden states,
-            # not the prediction head input directly.
-            if self.direction == 'forward':
-                h_bi = torch.cat([h_fwd_tensor[:, ti, :], time_enc_t], dim=1)
-            elif self.direction == 'backward':
-                h_bi = torch.cat([h_bwd_tensor[:, ti, :], time_enc_t], dim=1)
-            else:
-                h_bi = torch.cat([h_fwd_tensor[:, ti, :], h_bwd_tensor[:, ti, :], time_enc_t], dim=1)
-            # normalize fused vector so time and hidden parts have comparable scale
-            h_bi = self.head_norm(h_bi)
-            # Apply a learnable scalar to the time-encoding portion AFTER LayerNorm
-            # so the scalar is not normalized away by head_norm.
-            nt = self.num_time_enc_dims
-            if nt > 0:
-                # multiply only the final nt dimensions (the time encoding slice)
-                h_hidden = h_bi[:, :-nt]
-                h_time = h_bi[:, -nt:] * self.time_scale
-                h_bi = torch.cat([h_hidden, h_time], dim=1)
-            # measurement error at this timestep is present in the input
-            # `x` at index 1 before the time-enc dims were appended.
-            # Fetch it so we can condition the flow on the per-observation error.
-            meas_err_t = x[:, ti, 1]
-
-            # If a flow head is configured, condition on [h_bi, meas_err] and
-            # produce a point prediction based on flow_mode. Otherwise,
-            # use the Gaussian MLP head as a fallback for compatibility.
-            if self.flow is not None:
-                ctx = torch.cat([h_bi, meas_err_t.unsqueeze(1)], dim=1)
-                # zuko flow objects are callable and return a Distribution
-                dist = self.flow(ctx)
-
-                if flow_mode == 'sample':
-                    # Single random sample (stochastic)
-                    s = dist.sample()
-                    point_prediction = s.view(B, 1)
-                elif flow_mode == 'mode':
-                    # Gradient-based optimization to find the mode (MAP estimate)
-                    # We need to detach and rebuild the distribution to avoid graph issues
-                    ctx_detached = ctx.detach()
-                    dist_opt = self.flow(ctx_detached)
-                    # Initialize at a sample from the distribution (better than zero)
-                    y_init = dist_opt.sample().clone().detach()
-                    y_opt = y_init.requires_grad_(True)
-                    # Use Adam with smaller lr for more stable optimization
-                    optimizer = torch.optim.Adam([y_opt], lr=0.1)
-                    for _ in range(30):
-                        optimizer.zero_grad()
-                        # Rebuild distribution each step to get fresh graph
-                        dist_step = self.flow(ctx_detached)
-                        loss = -dist_step.log_prob(y_opt).sum()
-                        loss.backward()
-                        optimizer.step()
-                        # Clamp to reasonable range to prevent divergence
-                        with torch.no_grad():
-                            y_opt.clamp_(-10, 10)
-                    point_prediction = y_opt.detach().view(B, 1)
-                else:  # 'mean' (default)
-                    # Monte Carlo average of N samples to approximate the conditional mean
-                    n_samples = 16
-                    s_acc = dist.sample()
-                    for _ in range(n_samples - 1):
-                        s_acc = s_acc + dist.sample()
-                    s_mean = s_acc / n_samples
-                    point_prediction = s_mean.view(B, 1)
-            else:
-                point_prediction = self.gauss_head(h_bi)
-            seq_prediction.append(point_prediction)
-
-        seq_prediction = torch.stack(seq_prediction, dim=1)     # (B, L, 1)
-        out = {'reconstructed': seq_prediction}
         if return_states:
             # Provide forward hidden states and time encodings so training code can
             # compute multi-step losses based on the hidden states BEFORE each timestep.
