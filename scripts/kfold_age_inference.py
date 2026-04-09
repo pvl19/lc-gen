@@ -173,7 +173,9 @@ class AgePredictorMLP(nn.Module):
                  flow_transforms: int = 8,
                  flow_hidden_features: list = None,
                  aux_loss_weight: float = 1.0,
-                 use_mg: bool = False):
+                 use_mg: bool = False,
+                 dropout: float = 0.1,
+                 variance_reg_weight: float = 0.0):
         super().__init__()
         if zuko is None:
             raise ImportError("zuko is required for the flow head. Install with: pip install zuko")
@@ -182,16 +184,17 @@ class AgePredictorMLP(nn.Module):
         if flow_hidden_features is None:
             flow_hidden_features = [64, 64]
 
-        self.bottleneck_dim  = bottleneck_dim
-        self.aux_loss_weight = aux_loss_weight
-        self.use_mg          = use_mg
-        context_dim          = 4 if use_mg else 3
+        self.bottleneck_dim      = bottleneck_dim
+        self.aux_loss_weight     = aux_loss_weight
+        self.variance_reg_weight = variance_reg_weight
+        self.use_mg              = use_mg
+        context_dim              = 4 if use_mg else 3
 
         # MLP encoder
         layers = []
         prev = input_dim
         for h in mlp_hidden:
-            layers += [nn.Linear(prev, h), nn.ReLU()]
+            layers += [nn.Linear(prev, h), nn.ReLU(), nn.Dropout(dropout)]
             prev = h
         layers += [nn.Linear(prev, bottleneck_dim), nn.LayerNorm(bottleneck_dim)]
         self.encoder = nn.Sequential(*layers)
@@ -237,7 +240,12 @@ class AgePredictorMLP(nn.Module):
         context = torch.stack(parts, dim=1)
         nll     = self._nll_with_outlier(self.flow(context).log_prob(z), z, mem_prob)
         aux     = torch.mean(torch.abs(self.aux_age_head(z).squeeze(1) - log_age))
-        return nll + self.aux_loss_weight * aux
+        loss    = nll + self.aux_loss_weight * aux
+        if self.variance_reg_weight > 0:
+            std      = z.std(dim=0)
+            var_loss = torch.relu(1.0 - std).mean()
+            loss     = loss + self.variance_reg_weight * var_loss
+        return loss
 
     def predict_stats(self, x: torch.Tensor, bprp0: torch.Tensor,
                       log_bprp0_err: torch.Tensor, log_mg: torch.Tensor,
@@ -895,7 +903,8 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
                       pca_dim, lr, weight_decay, n_epochs, batch_size, device,
                       flow_transforms=8, flow_hidden_features=None, loga_grid=None,
                       encoder_type='pca', mlp_encoder_hidden=None, aux_loss_weight=1.0,
-                      use_mg=False, lr_decay_rate=None, global_pca=None):
+                      use_mg=False, lr_decay_rate=None, global_pca=None,
+                      dropout=0.1, variance_reg_weight=0.0):
     """Train one fold NLE model.
 
     encoder_type='pca': PCA fit on training fold only (no leakage, no collapse).
@@ -940,6 +949,8 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
             flow_hidden_features=flow_hidden_features,
             aux_loss_weight=aux_loss_weight,
             use_mg=use_mg,
+            dropout=dropout,
+            variance_reg_weight=variance_reg_weight,
         ).to(device)
 
     train_dataset = TensorDataset(
@@ -1012,7 +1023,8 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
                  star_level_split=False,
                  flow_transforms=8, flow_hidden_features=None, loga_grid_size=None,
                  encoder_type='pca', mlp_encoder_hidden=None, aux_loss_weight=1.0,
-                 use_mg=False, lr_decay_rate=None):
+                 use_mg=False, lr_decay_rate=None,
+                 dropout=0.1, variance_reg_weight=0.0):
     """Run k-fold cross-validation.
 
     Args:
@@ -1131,6 +1143,7 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
             aux_loss_weight=aux_loss_weight, use_mg=use_mg,
             lr_decay_rate=lr_decay_rate,
             global_pca=global_pca,
+            dropout=dropout, variance_reg_weight=variance_reg_weight,
         )
         fold_models.append({
             'state_dict': model_state, 'pca': fold_pca,
@@ -1353,6 +1366,10 @@ def main():
                         help='Hidden layer sizes for the MLP encoder (mlp mode only, default: 256 128)')
     parser.add_argument('--aux_loss_weight',      type=float, default=1.0,
                         help='Weight for the auxiliary age L1 loss in mlp mode (default: 1.0)')
+    parser.add_argument('--dropout',              type=float, default=0.1,
+                        help='Dropout rate in MLP encoder layers (mlp mode only, default: 0.1)')
+    parser.add_argument('--variance_reg_weight',  type=float, default=0.0,
+                        help='VICReg variance regularization weight on bottleneck (mlp mode only, default: 0.0)')
     parser.add_argument('--use_mg',               action='store_true', default=False,
                         help='Include log10(MG_quick) as a 4th flow context variable (default: off)')
     parser.add_argument('--lr',                   type=float, default=1e-3)
@@ -1531,6 +1548,8 @@ def main():
         aux_loss_weight=args.aux_loss_weight,
         use_mg=args.use_mg,
         lr_decay_rate=args.lr_decay_rate,
+        dropout=args.dropout,
+        variance_reg_weight=args.variance_reg_weight,
     )
 
     # ── Step 4: for predict_mean, save per-sector CSV then average per star ─

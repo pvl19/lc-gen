@@ -50,8 +50,10 @@ REQUIRE_PROT=${8:-"false"}
 H5_PATH=${9:-"final_pretrain/timeseries_pretrain.h5"}
 SAVE_LATENTS=${10:-""}   # e.g. output/latents_cache/baseline_long_multiscale.npz
 LOAD_LATENTS=${11:-"final_model/final_parallel_e10/latents.npz"}   # e.g. output/latents_cache/baseline_long_multiscale.npz
-ENCODER_TYPE=${12:-"pca"}   # pca or mlp
+ENCODER_TYPE=${12:-"mlp"}   # pca or mlp
 USE_MG=${13:-"false"}       # true to include log10(MG_quick) as 4th flow context variable
+DROPOUT=0.1
+VARIANCE_REG_WEIGHT=0.25
 
 # H5 files to use for global PCA + normalization (all stars, no age filter)
 PCA_H5_PATHS="final_pretrain/timeseries_pretrain.h5 final_pretrain/timeseries_exop_hosts.h5"
@@ -105,7 +107,9 @@ CMD="${CMD} \
   --flow_transforms 12 \
   --flow_hidden_dims 64 64 \
   --loga_grid_size 1000 \
-  --seed 42"
+  --seed 42 \
+  --dropout ${DROPOUT} \
+  --variance_reg_weight ${VARIANCE_REG_WEIGHT}"
 
 if [ -n "${SAVE_LATENTS}" ]; then
   CMD="${CMD} --save_latents ${SAVE_LATENTS}"
