@@ -5,7 +5,7 @@
 
 NW=4
 K=7
-MAX_FREQ=320
+MAX_FREQ=50
 FREQ_RES=0.02
 
 echo "=== Computing power spectra for pretrain H5 ==="

@@ -33,9 +33,9 @@ The interpolation and renormalization change the spectral shape, so the resultin
 
 **Fix:** Compute ACF from the original multi-taper power spectrum, then resample:
 ```
-power → ifft → ACF(0)=1 normalize → resample to 16K grid
+power → ifft → ACF(0)=1 normalize → resample to 2,500-point grid
 ```
-This preserves the Wiener-Khinchin relationship between the original power spectrum and autocorrelation.
+This preserves the Wiener-Khinchin relationship between the original power spectrum and autocorrelation. The ACF is resampled to match the output grid length (2,500 bins) using unitless linspace interpolation — the conv encoder treats it as a 1D feature vector, so physical lag units are not needed.
 
 ## Normalized vs raw flux
 
@@ -44,10 +44,10 @@ This preserves the Wiener-Khinchin relationship between the original power spect
 ## Assumptions
 
 - **NW=4, K=7:** Resolution ~0.30 c/d for a 27-day sector. Smooths features narrower than that. Appropriate for broad spectral features; may blur sharp rotation peaks in short sectors. NW=2, K=3 would give better resolution (~0.15 c/d) but noisier estimates.
-- **Max frequency 320 c/d:** Below TESS 2-min Nyquist (~360 c/d). Safe.
+- **Max frequency 50 c/d:** Covers all age-relevant signals: rotation (0.05–2 c/d), granulation/flicker (0.1–10 c/d). Everything above ~50 c/d is photon noise and instrumental artifacts for typical TESS targets. The original notebook used 320 c/d (TESS Nyquist ≈ 360), but 95%+ of bins above 50 c/d are pure noise that the conv encoder would have to learn to ignore.
+- **Output: 2,500 frequency bins** (50 c/d / 0.02 resolution). Reduced from the original 16,000 bins — 6× less storage (1.8 GB vs 11.5 GB total), faster I/O during training, with no loss of astrophysically useful information.
 - **FFT method with irregular sampling:** tapify handles this via interpolated DPSS tapers. Assumes gaps aren't too severe (TESS orbits are fine).
 - **Zero-padding to next power of 2:** Standard practice, increases frequency resolution.
-- **Output: 16,000 frequency bins** (320 c/d / 0.02 resolution). Matches original notebook.
 
 ## Files
 

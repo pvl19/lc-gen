@@ -26,7 +26,7 @@ from tapify import MultiTaper
 # ---------------------------------------------------------------------------
 
 def compute_multitaper(flux, time, length, nw=4, k=7,
-                       max_freq=320.0, freq_res=0.02):
+                       max_freq=50.0, freq_res=0.02):
     """Compute power spectrum, f-statistic, and ACF for one light curve.
 
     Returns
@@ -99,8 +99,8 @@ def main():
                         help='Time-bandwidth product for DPSS tapers (default: 4)')
     parser.add_argument('--k', type=int, default=7,
                         help='Number of Slepian tapers (default: 7)')
-    parser.add_argument('--max_freq', type=float, default=320.0,
-                        help='Maximum frequency in cycles/day (default: 320)')
+    parser.add_argument('--max_freq', type=float, default=50.0,
+                        help='Maximum frequency in cycles/day (default: 50)')
     parser.add_argument('--freq_res', type=float, default=0.02,
                         help='Frequency grid resolution in cycles/day (default: 0.02)')
     parser.add_argument('--max_samples', type=int, default=None,
