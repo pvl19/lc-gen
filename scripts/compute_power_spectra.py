@@ -127,20 +127,33 @@ def main():
     print(f'  Freq grid: 0–{args.max_freq} c/d, resolution {args.freq_res} c/d '
           f'→ {n_bins} bins')
     print(f'  H5 file: {args.h5_path}')
+    print(f'  Streaming to H5 (no large in-memory arrays)')
 
-    # Pre-allocate output arrays
-    all_power = np.zeros((n_samples, n_bins), dtype=np.float32)
-    all_fstat = np.zeros((n_samples, n_bins), dtype=np.float32)
-    all_acf = np.zeros((n_samples, n_bins), dtype=np.float32)
-    freq_grid = None
+    # Delete existing datasets if overwriting, then create empty ones
+    with h5py.File(args.h5_path, 'a') as f:
+        for name in ('power', 'f_stat', 'acf', 'freq'):
+            if name in f:
+                del f[name]
+        # Pre-allocate on-disk datasets — results written row-by-row
+        f.create_dataset('power', shape=(n_samples, n_bins), dtype=np.float32,
+                         chunks=(1, n_bins), compression='gzip', compression_opts=4)
+        f.create_dataset('f_stat', shape=(n_samples, n_bins), dtype=np.float32,
+                         chunks=(1, n_bins), compression='gzip', compression_opts=4)
+        f.create_dataset('acf', shape=(n_samples, n_bins), dtype=np.float32,
+                         chunks=(1, n_bins), compression='gzip', compression_opts=4)
 
     n_failed = 0
+    freq_grid = None
     t_start = timer.time()
 
-    with h5py.File(args.h5_path, 'r') as f:
+    # Stream: read one sample from flux/time, compute, write result immediately
+    with h5py.File(args.h5_path, 'a') as f:
         flux_ds = f['flux']
         time_ds = f['time']
         length_ds = f['length']
+        power_ds = f['power']
+        fstat_ds = f['f_stat']
+        acf_ds = f['acf']
 
         for i in range(n_samples):
             if i % 500 == 0:
@@ -159,31 +172,25 @@ def main():
                     max_freq=args.max_freq,
                     freq_res=args.freq_res,
                 )
-                all_power[i] = power
-                all_fstat[i] = fstat
-                all_acf[i] = acf
+                power_ds[i] = power
+                fstat_ds[i] = fstat
+                acf_ds[i] = acf
                 if freq_grid is None:
                     freq_grid = freq
             except Exception as e:
                 print(f'  WARNING: sample {i} failed: {e}')
                 n_failed += 1
 
+        # Write freq grid (small — 1D)
+        if freq_grid is not None:
+            f.create_dataset('freq', data=freq_grid, compression='gzip',
+                             compression_opts=4)
+
     elapsed = timer.time() - t_start
     print(f'\nDone: {n_samples - n_failed} succeeded, {n_failed} failed '
           f'({elapsed:.0f}s total)')
-
-    # Write back to H5
-    print(f'Writing datasets to {args.h5_path} ...')
-    with h5py.File(args.h5_path, 'a') as f:
-        for name, data in [('power', all_power), ('f_stat', all_fstat),
-                           ('acf', all_acf), ('freq', freq_grid)]:
-            if name in f:
-                del f[name]
-            f.create_dataset(name, data=data, compression='gzip',
-                             compression_opts=4)
-
-    print(f'Written: power {all_power.shape}, f_stat {all_fstat.shape}, '
-          f'acf {all_acf.shape}, freq {freq_grid.shape}')
+    print(f'Written to {args.h5_path}: power/f_stat/acf ({n_samples}, {n_bins}), '
+          f'freq ({n_bins},)')
 
 
 if __name__ == '__main__':
