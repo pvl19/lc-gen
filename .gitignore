@@ -1,10 +1,13 @@
 data/*
 tmp/*
-*/__pycache__/*
-src/lcgen/models/__pycache__/*
+__pycache__/
+*.pyc
 output/ps_acf_predictor/*
 exop_hosts/lc_data.pickle
 exop_hosts/lc_data.h5
 final_pretrain/*
+final_model/*
+checkpoints/*
+.DS_Store
 # output/age_predictor/*
 # output/age_predictor_tests/*
