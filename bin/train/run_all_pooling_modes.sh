@@ -18,17 +18,17 @@ echo "=============================================="
 # Run mean pooling
 echo ""
 echo ">>> Running MEAN pooling..."
-./kfold_age_inference.sh "${VERSION}" mean
+../../kfold_age_inference.sh "${VERSION}" mean
 
 # Run multiscale pooling
 echo ""
 echo ">>> Running MULTISCALE pooling..."
-./kfold_age_inference.sh "${VERSION}" multiscale
+../../kfold_age_inference.sh "${VERSION}" multiscale
 
 # Run final pooling
 echo ""
 echo ">>> Running FINAL pooling..."
-./kfold_age_inference.sh "${VERSION}" final
+../../kfold_age_inference.sh "${VERSION}" final
 
 echo ""
 echo "=============================================="
@@ -40,5 +40,5 @@ echo "  output/age_predictor/kfold_${VERSION}_multiscale/"
 echo "  output/age_predictor/kfold_${VERSION}_final/"
 echo ""
 echo "To compare results, run:"
-echo "  ./compare_pooling_modes.sh ${VERSION}"
+echo "  ../../bin/plot/compare_pooling_modes.sh ${VERSION}"
 echo "=============================================="
