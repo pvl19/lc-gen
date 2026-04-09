@@ -50,9 +50,9 @@ REQUIRE_PROT=${8:-"false"}
 H5_PATH=${9:-"final_pretrain/timeseries_pretrain.h5"}
 SAVE_LATENTS=${10:-""}   # e.g. output/latents_cache/baseline_long_multiscale.npz
 LOAD_LATENTS=${11:-"final_model/final_parallel_e10/latents.npz"}   # e.g. output/latents_cache/baseline_long_multiscale.npz
-ENCODER_TYPE=${12:-"mlp"}   # pca or mlp
+ENCODER_TYPE=${12:-"pca"}   # pca or mlp
 USE_MG=${13:-"false"}       # true to include log10(MG_quick) as 4th flow context variable
-MLP_ENCODER_HIDDEN="256 128"
+MLP_ENCODER_HIDDEN="128 64"
 AUX_LOSS_WEIGHT=1.0
 DROPOUT=0.1
 VARIANCE_REG_WEIGHT=0.25
@@ -60,7 +60,7 @@ VARIANCE_REG_WEIGHT=0.25
 # H5 files to use for global PCA + normalization (all stars, no age filter)
 PCA_H5_PATHS="final_pretrain/timeseries_pretrain.h5 final_pretrain/timeseries_exop_hosts.h5"
 
-OUTPUT_DIR="final_model/final_parallel_e10/nf-beta-pca32-${POOLING_MODE}-${STAR_AGGREGATION}-${ENCODER_TYPE}"
+OUTPUT_DIR="final_model/final_parallel_e10/nf-pca64-${POOLING_MODE}-${STAR_AGGREGATION}-${ENCODER_TYPE}"
 
 echo "Running k-fold age inference:"
 echo "  Model:            ${MODEL_PATH:-'(from cache)'}"
@@ -101,13 +101,13 @@ CMD="${CMD} \
   --star_aggregation ${STAR_AGGREGATION} \
   --n_folds 5 \
   --encoder_type ${ENCODER_TYPE} \
-  --pca_dim 32 \
+  --pca_dim 64 \
   --mlp_encoder_hidden ${MLP_ENCODER_HIDDEN} \
   --lr 1e-3 \
   --lr_decay_rate 0.97 \
-  --n_epochs 75 \
+  --n_epochs 200 \
   --batch_size 64 \
-  --flow_transforms 12 \
+  --flow_transforms 6 \
   --flow_hidden_dims 64 64 \
   --loga_grid_size 1000 \
   --seed 42 \
