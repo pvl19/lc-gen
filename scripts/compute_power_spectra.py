@@ -2,8 +2,8 @@
 """Compute multi-taper power spectra, f-statistics, and ACFs for H5 light curves.
 
 Reads flux/time/length from an HDF5 file, computes spectral features using
-tapify's MultiTaper estimator, and writes power/f_stat/acf/freq back into the
-same H5 file.  These arrays are consumed by the conv encoder branch of
+tapify's MultiTaper estimator, and writes power/f_stat/acf/freq to a separate
+output H5 file.  These arrays are consumed by the conv encoder branch of
 BiDirectionalMinGRU during pretraining.
 
 Fixes over the original proj_lc_ages notebook:
@@ -13,6 +13,7 @@ Fixes over the original proj_lc_ages notebook:
 """
 
 import argparse
+import os
 import sys
 import time as timer
 
@@ -95,6 +96,9 @@ def main():
                     'for all light curves in an HDF5 file.')
     parser.add_argument('--h5_path', type=str, required=True,
                         help='Path to HDF5 file with flux/time/length datasets')
+    parser.add_argument('--output_h5', type=str, default=None,
+                        help='Output H5 file for spectral data. Defaults to '
+                             '<h5_path stem>_spectra.h5 alongside the input file.')
     parser.add_argument('--nw', type=float, default=4.0,
                         help='Time-bandwidth product for DPSS tapers (default: 4)')
     parser.add_argument('--k', type=int, default=7,
@@ -106,17 +110,21 @@ def main():
     parser.add_argument('--max_samples', type=int, default=None,
                         help='Process only the first N samples (for debugging)')
     parser.add_argument('--overwrite', action='store_true',
-                        help='Overwrite existing power/f_stat/acf datasets')
+                        help='Overwrite existing output file')
     args = parser.parse_args()
 
-    # Open H5 file and check existing datasets
+    # Derive output path
+    if args.output_h5 is None:
+        stem = args.h5_path.rsplit('.h5', 1)[0]
+        args.output_h5 = stem + '_spectra.h5'
+
+    # Open source H5 (read-only) to get sample count
     with h5py.File(args.h5_path, 'r') as f:
         n_total = f['flux'].shape[0]
-        has_existing = 'power' in f and 'f_stat' in f and 'acf' in f
 
-    if has_existing and not args.overwrite:
-        print(f'Datasets power/f_stat/acf already exist in {args.h5_path}.')
-        print('Use --overwrite to replace them.')
+    if os.path.exists(args.output_h5) and not args.overwrite:
+        print(f'Output file {args.output_h5} already exists.')
+        print('Use --overwrite to replace it.')
         sys.exit(0)
 
     n_samples = min(n_total, args.max_samples) if args.max_samples else n_total
@@ -126,34 +134,36 @@ def main():
     print(f'  NW={args.nw}, K={args.k}')
     print(f'  Freq grid: 0–{args.max_freq} c/d, resolution {args.freq_res} c/d '
           f'→ {n_bins} bins')
-    print(f'  H5 file: {args.h5_path}')
-    print(f'  Streaming to H5 (no large in-memory arrays)')
+    print(f'  Input:  {args.h5_path}')
+    print(f'  Output: {args.output_h5}')
 
-    # Delete existing datasets if overwriting, then create empty ones
-    with h5py.File(args.h5_path, 'a') as f:
-        for name in ('power', 'f_stat', 'acf', 'freq'):
-            if name in f:
-                del f[name]
-        # Pre-allocate on-disk datasets — results written row-by-row
-        f.create_dataset('power', shape=(n_samples, n_bins), dtype=np.float32,
-                         chunks=(1, n_bins), compression='gzip', compression_opts=4)
-        f.create_dataset('f_stat', shape=(n_samples, n_bins), dtype=np.float32,
-                         chunks=(1, n_bins), compression='gzip', compression_opts=4)
-        f.create_dataset('acf', shape=(n_samples, n_bins), dtype=np.float32,
-                         chunks=(1, n_bins), compression='gzip', compression_opts=4)
+    # Write to a temp file first, then rename on success.
+    # If the process crashes, the temp file is left behind but the output
+    # file (and the source H5) are never in a corrupt state.
+    tmp_path = args.output_h5 + '.tmp'
+
+    # Create output H5 with pre-allocated datasets
+    with h5py.File(tmp_path, 'w') as out:
+        out.create_dataset('power', shape=(n_samples, n_bins), dtype=np.float32,
+                           chunks=(1, n_bins), compression='gzip', compression_opts=4)
+        out.create_dataset('f_stat', shape=(n_samples, n_bins), dtype=np.float32,
+                           chunks=(1, n_bins), compression='gzip', compression_opts=4)
+        out.create_dataset('acf', shape=(n_samples, n_bins), dtype=np.float32,
+                           chunks=(1, n_bins), compression='gzip', compression_opts=4)
 
     n_failed = 0
     freq_grid = None
     t_start = timer.time()
 
-    # Stream: read one sample from flux/time, compute, write result immediately
-    with h5py.File(args.h5_path, 'a') as f:
-        flux_ds = f['flux']
-        time_ds = f['time']
-        length_ds = f['length']
-        power_ds = f['power']
-        fstat_ds = f['f_stat']
-        acf_ds = f['acf']
+    # Stream: read from source, compute, write to output
+    with h5py.File(args.h5_path, 'r') as src, \
+         h5py.File(tmp_path, 'a') as out:
+        flux_ds = src['flux']
+        time_ds = src['time']
+        length_ds = src['length']
+        power_ds = out['power']
+        fstat_ds = out['f_stat']
+        acf_ds = out['acf']
 
         for i in range(n_samples):
             if i % 500 == 0:
@@ -183,13 +193,18 @@ def main():
 
         # Write freq grid (small — 1D)
         if freq_grid is not None:
-            f.create_dataset('freq', data=freq_grid, compression='gzip',
-                             compression_opts=4)
+            out.create_dataset('freq', data=freq_grid, compression='gzip',
+                               compression_opts=4)
+
+    # Atomic rename: only replaces output file after everything succeeded
+    if os.path.exists(args.output_h5):
+        os.remove(args.output_h5)
+    os.rename(tmp_path, args.output_h5)
 
     elapsed = timer.time() - t_start
     print(f'\nDone: {n_samples - n_failed} succeeded, {n_failed} failed '
           f'({elapsed:.0f}s total)')
-    print(f'Written to {args.h5_path}: power/f_stat/acf ({n_samples}, {n_bins}), '
+    print(f'Written: {args.output_h5} — power/f_stat/acf ({n_samples}, {n_bins}), '
           f'freq ({n_bins},)')
 
 

@@ -161,24 +161,8 @@ class TimeSeriesDataset(Dataset):
 
                 # Load convolutional channel data (power spectra, f-stat, ACF)
                 if use_conv_channels:
-                    with h5py.File(h5path, 'r') as f:
-                        if 'power' in f and 'f_stat' in f and 'acf' in f:
-                            full_power = f['power'][:]
-                            full_f_stat = f['f_stat'][:]
-                            full_acf = f['acf'][:]
-                            if sample_indices is not None:
-                                self.power = full_power[sample_indices]
-                                self.f_stat = full_f_stat[sample_indices]
-                                self.acf = full_acf[sample_indices]
-                            else:
-                                self.power = full_power[:len(self.flux)]
-                                self.f_stat = full_f_stat[:len(self.flux)]
-                                self.acf = full_acf[:len(self.flux)]
-                        else:
-                            print("Warning: Conv channel data (power/f_stat/acf) not found in HDF5 file")
-                            self.power = None
-                            self.f_stat = None
-                            self.acf = None
+                    self.power, self.f_stat, self.acf = self._load_conv_channels(
+                        h5path, sample_indices=sample_indices, n_flux=len(self.flux))
                 else:
                     self.power = None
                     self.f_stat = None
@@ -201,15 +185,8 @@ class TimeSeriesDataset(Dataset):
                         self.metadata = None
                     # Load convolutional channel data
                     if use_conv_channels:
-                        if 'power' in f and 'f_stat' in f and 'acf' in f:
-                            self.power = f['power'][:]
-                            self.f_stat = f['f_stat'][:]
-                            self.acf = f['acf'][:]
-                        else:
-                            print("Warning: Conv channel data (power/f_stat/acf) not found in HDF5 file")
-                            self.power = None
-                            self.f_stat = None
-                            self.acf = None
+                        self.power, self.f_stat, self.acf = self._load_conv_channels(
+                            h5path, sample_indices=None, n_flux=len(self.flux))
                     else:
                         self.power = None
                         self.f_stat = None
@@ -234,9 +211,9 @@ class TimeSeriesDataset(Dataset):
             self.metadata = None
             # Synthetic conv data
             if use_conv_channels:
-                self.power = np.random.randn(N, 16000).astype(np.float32)
-                self.f_stat = np.random.randn(N, 16000).astype(np.float32)
-                self.acf = np.random.randn(N, 16000).astype(np.float32)
+                self.power = np.random.randn(N, 2500).astype(np.float32)
+                self.f_stat = np.random.randn(N, 2500).astype(np.float32)
+                self.acf = np.random.randn(N, 2500).astype(np.float32)
             else:
                 self.power = None
                 self.f_stat = None
@@ -255,6 +232,35 @@ class TimeSeriesDataset(Dataset):
                 flux_at_t_noisy = flux_at_t + np.random.normal(0, self.mock_noise, size=flux_at_t.shape)  # Add noise
                 self.flux[i] = flux_at_t_noisy
                 self.flux_err[i] = np.abs(np.random.normal(1,0.5, size=self.flux.shape[1]))+0.05
+
+    @staticmethod
+    def _load_conv_channels(h5path, sample_indices=None, n_flux=None):
+        """Load power/f_stat/acf from a sidecar *_spectra.h5 or from the main H5.
+
+        Lookup order:
+          1. <stem>_spectra.h5  (separate file, preferred — keeps originals safe)
+          2. Datasets inside h5path itself (legacy / in-file storage)
+        """
+        # Try sidecar file first
+        stem = h5path.rsplit('.h5', 1)[0]
+        spectra_path = stem + '_spectra.h5'
+        conv_path = spectra_path if Path(spectra_path).exists() else h5path
+
+        with h5py.File(conv_path, 'r') as f:
+            if 'power' in f and 'f_stat' in f and 'acf' in f:
+                if sample_indices is not None:
+                    power = f['power'][:][sample_indices]
+                    f_stat = f['f_stat'][:][sample_indices]
+                    acf = f['acf'][:][sample_indices]
+                else:
+                    power = f['power'][:n_flux] if n_flux else f['power'][:]
+                    f_stat = f['f_stat'][:n_flux] if n_flux else f['f_stat'][:]
+                    acf = f['acf'][:n_flux] if n_flux else f['acf'][:]
+                return power, f_stat, acf
+
+        print(f"Warning: Conv channel data (power/f_stat/acf) not found in "
+              f"{conv_path} or {h5path}")
+        return None, None, None
 
     def _load_metadata_from_h5(self, meta_grp, n_samples):
         """Load and normalise metadata features from H5 group using MetadataStandardizer."""
