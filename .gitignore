@@ -9,5 +9,6 @@ final_pretrain/*
 final_model/*
 checkpoints/*
 .DS_Store
+*.npz
 # output/age_predictor/*
 # output/age_predictor_tests/*
