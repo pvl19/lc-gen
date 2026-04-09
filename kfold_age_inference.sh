@@ -52,6 +52,7 @@ SAVE_LATENTS=${10:-""}   # e.g. output/latents_cache/baseline_long_multiscale.np
 LOAD_LATENTS=${11:-"final_model/final_parallel_e10/latents.npz"}   # e.g. output/latents_cache/baseline_long_multiscale.npz
 ENCODER_TYPE=${12:-"mlp"}   # pca or mlp
 USE_MG=${13:-"false"}       # true to include log10(MG_quick) as 4th flow context variable
+MLP_ENCODER_HIDDEN="256 128"
 AUX_LOSS_WEIGHT=1.0
 DROPOUT=0.1
 VARIANCE_REG_WEIGHT=0.25
@@ -101,6 +102,7 @@ CMD="${CMD} \
   --n_folds 5 \
   --encoder_type ${ENCODER_TYPE} \
   --pca_dim 32 \
+  --mlp_encoder_hidden ${MLP_ENCODER_HIDDEN} \
   --lr 1e-3 \
   --lr_decay_rate 0.97 \
   --n_epochs 75 \
