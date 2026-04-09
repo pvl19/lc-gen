@@ -33,15 +33,19 @@ class minGRUCell(nn.Module):
         self.W_z = nn.Linear(input_size, hidden_size)
         self.W_h = nn.Linear(input_size, hidden_size)
 
+    @staticmethod
     def g(x):
         return torch.where(x >= 0, x+0.5, torch.sigmoid(x))
-    
+
+    @staticmethod
     def log_g(x):
         return torch.where(x >= 0, (F.relu(x)+0.5).log(), 5 -F.softplus(-x))
 
+    @staticmethod
     def parallel_scan_log(log_coeffs, log_values):
-        # log_coeffs: (batch_size, seq_len, input_size)
-        # log_values: (batch_size, seq_len + 1, input_size)
+        # log_coeffs: (B, T, H)   — log(1 - sigmoid(k)), the forget factor in log space
+        # log_values: (B, T+1, H) — [log_g(h_0), log_z + log_g(h_tilde)]
+        # Two single PyTorch ops with fast backward (vs. a T-step Python loop).
         a_star = F.pad(torch.cumsum(log_coeffs, dim=1), (0, 0, 1, 0))
         log_h0_plus_b_star = torch.logcumsumexp(log_values - a_star, dim=1)
         log_h = a_star + log_h0_plus_b_star
@@ -91,27 +95,22 @@ class minGRUCell(nn.Module):
     def step_parallel(self, x, h_0):
         # x: (batch_size, seq_len, input_size)
         # h_0: (batch_size, 1, hidden_size)
-
-        z = torch.sigmoid(self.W_z(x))           # (B, T, H)
-        h_tilde = torch.tanh(self.W_h(x))        # (B, T, H) - must match step() which uses tanh
-
-        a = 1.0 - z
-        b = torch.cat([h_0, z * h_tilde], dim=1)
-
-        h = self.parallel_scan(a, b)
-        return h
-    
-    def step_parallel_log(self, x, h_0):
-        """Parallelized step for batch processing."""
-        # x: (batch_size, seq_len, input_size)
-        # h_0: (batch_size, 1, hidden_size)
-        k = self.linear_z(x)
-        log_z = -F.softplus(-k)
-        log_coeffs = -F.softplus(k)
-        log_h_0 = self.log_g(h_0)
-        log_tilde_h = self.log_g(self.linear_h(x))
-        h = self.parallel_scan_log(log_coeffs,torch.cat([log_h_0, log_z + log_tilde_h], dim=1))
-        return h
+        #
+        # Uses the log-domain parallel scan: two cumulative ops (cumsum +
+        # logcumsumexp) instead of a T-step Python loop. The loop creates T
+        # nodes in the autograd graph, making backward ~80× slower than
+        # forward. The log-domain version has O(1) graph depth regardless of T.
+        #
+        # Uses g(x) = relu(x)+0.5 (always ≥ 0.5, as in the original minGRU
+        # paper) instead of tanh, because log_g requires non-negative inputs.
+        k = self.W_z(x)                                               # (B, T, H)
+        log_z      = -F.softplus(-k)                                  # log sigmoid(k)
+        log_coeffs = -F.softplus(k)                                   # log(1 - sigmoid(k))
+        log_h_0    = minGRUCell.log_g(h_0)                            # (B, 1, H)
+        log_h_tilde = minGRUCell.log_g(self.W_h(x))                  # (B, T, H)
+        return minGRUCell.parallel_scan_log(
+            log_coeffs, torch.cat([log_h_0, log_z + log_h_tilde], dim=1)
+        )
         
 
 class BiDirectionalMinGRU(nn.Module):

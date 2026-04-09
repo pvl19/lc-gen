@@ -207,16 +207,21 @@ class AgePredictorMLP(nn.Module):
             hidden_features=flow_hidden_features,
         )
 
-    def _nll_with_outlier(self, log_prob_flow: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        nf_weight    = P_CLUSTER_MEM * (1.0 - P_OUTLIER)
+    def _nll_with_outlier(self, log_prob_flow: torch.Tensor, z: torch.Tensor,
+                          mem_prob: torch.Tensor = None) -> torch.Tensor:
+        if mem_prob is None:
+            p_mem = P_CLUSTER_MEM
+        else:
+            p_mem = torch.where(torch.isnan(mem_prob), torch.full_like(mem_prob, P_CLUSTER_MEM), mem_prob)
+        nf_weight    = p_mem * (1.0 - P_OUTLIER)
         ln_p_outlier = (
             -0.5 * z.pow(2).sum(dim=-1)
             - 0.5 * self.bottleneck_dim * np.log(2.0 * np.pi)
         )
         ln_p_combined = torch.logsumexp(
             torch.stack([
-                np.log(nf_weight)       + log_prob_flow,
-                np.log(1.0 - nf_weight) + ln_p_outlier,
+                torch.log(nf_weight)       + log_prob_flow,
+                torch.log(1.0 - nf_weight) + ln_p_outlier,
             ], dim=0), dim=0
         )
         return -ln_p_combined.mean()
@@ -278,9 +283,10 @@ class AgePredictorMLP(nn.Module):
 
 def extract_latents_by_star(model, h5_path: str, device: torch.device,
                              sample_indices: np.ndarray, tic_ids_sorted: np.ndarray,
-                             max_length: int, pooling_mode: str,
+                             max_length: int = None, pooling_mode: str = 'multiscale',
                              batch_size: int = 32,
-                             use_metadata: bool = False, use_conv_channels: bool = False):
+                             use_metadata: bool = False, use_conv_channels: bool = False,
+                             compute_cross_sector: bool = True):
     """Single-pass extraction of per-sector AND cross-sector latents.
 
     Stars are accumulated into forward-pass batches of ~batch_size sectors so
@@ -315,36 +321,26 @@ def extract_latents_by_star(model, h5_path: str, device: torch.device,
     load_metadata = use_metadata and (model.meta_encoder is not None)
     N = len(sample_indices)
 
-    # Load all H5 data for selected samples up front (single sequential read)
+    # Load only lightweight arrays upfront (lengths + metadata are small scalars)
     with h5py.File(h5_path, 'r') as f:
-        flux_all     = f['flux'][sample_indices]
-        flux_err_all = f['flux_err'][sample_indices]
-        time_all     = f['time'][sample_indices]
-        lengths      = f['length'][sample_indices]
-
-        if use_conv_channels:
-            power_all  = f['power'][sample_indices]
-            acf_all    = f['acf'][sample_indices]
-            f_stat_all = f['f_stat'][sample_indices]
-        else:
-            power_all = acf_all = f_stat_all = None
+        lengths = f['length'][sample_indices]
 
         if load_metadata and 'metadata' in f:
-            meta_grp  = f['metadata']
-            meta_list = []
+            from lcgen.models.MetadataAgePredictor import MetadataStandardizer
+            meta_grp = f['metadata']
+            raw = {}
             for feat in METADATA_FEATURES:
                 if feat in meta_grp:
                     vals = meta_grp[feat][sample_indices]
                     if vals.dtype.kind == 'S':
                         vals = vals.astype(float)
-                    meta_list.append(vals.astype(np.float32))
+                    raw[feat] = vals.astype(np.float32)
                 else:
-                    meta_list.append(np.zeros(N, dtype=np.float32))
-            metadata_all = np.nan_to_num(np.stack(meta_list, axis=1), nan=0.0)
+                    raw[feat] = np.zeros(N, dtype=np.float32)
+            standardizer = MetadataStandardizer(fields=METADATA_FEATURES)
+            metadata_all = standardizer.transform(raw)  # applies log10, scaling; NaNs → 0
         else:
             metadata_all = None
-
-    actual_max = min(max_length, flux_all.shape[1])
 
     # Group positions (0..N-1) by TIC; preserve unique_tics order for output alignment
     unique_tics = np.unique(tic_ids_sorted)
@@ -352,75 +348,6 @@ def extract_latents_by_star(model, h5_path: str, device: torch.device,
 
     per_sector_latents   = [None] * N
     cross_sector_latents = []
-
-    def _run_buffer(star_buffer):
-        """Forward pass for a list of (pos_array, tic) pairs; fills per_sector_latents
-        and appends to cross_sector_latents in the same order as star_buffer."""
-        all_pos    = np.concatenate([pos for pos, _ in star_buffer])
-        star_sizes = [len(pos) for pos, _ in star_buffer]
-
-        flux_b = torch.tensor(flux_all[all_pos, :actual_max],     dtype=torch.float32, device=device)
-        ferr_b = torch.tensor(flux_err_all[all_pos, :actual_max], dtype=torch.float32, device=device)
-        time_b = torch.tensor(time_all[all_pos, :actual_max],     dtype=torch.float32, device=device)
-        lens_b = np.minimum(lengths[all_pos], actual_max)
-
-        B, L = flux_b.shape
-        mask = torch.zeros(B, L, device=device)
-        for j, vlen in enumerate(lens_b):
-            mask[j, :vlen] = 1.0
-
-        x_in = torch.stack([flux_b, ferr_b], dim=-1)
-        t_in = time_b.unsqueeze(-1)
-
-        meta_batch = (torch.tensor(metadata_all[all_pos], dtype=torch.float32, device=device)
-                      if metadata_all is not None else None)
-
-        if use_conv_channels and power_all is not None:
-            conv_data_batch = {
-                'power':  torch.tensor(power_all[all_pos,  :actual_max], dtype=torch.float32, device=device),
-                'acf':    torch.tensor(acf_all[all_pos,    :actual_max], dtype=torch.float32, device=device),
-                'f_stat': torch.tensor(f_stat_all[all_pos, :actual_max], dtype=torch.float32, device=device),
-            }
-        else:
-            conv_data_batch = None
-
-        out   = model(x_in, t_in, mask=mask, metadata=meta_batch,
-                      conv_data=conv_data_batch, return_states=True)
-        h_fwd = out.get('h_fwd_tensor')   # (B, L, H) or None
-        h_bwd = out.get('h_bwd_tensor')   # (B, L, H) or None
-
-        # Split hidden states back into per-star chunks
-        h_fwd_split = torch.split(h_fwd, star_sizes, dim=0) if h_fwd is not None else [None] * len(star_buffer)
-        h_bwd_split = torch.split(h_bwd, star_sizes, dim=0) if h_bwd is not None else [None] * len(star_buffer)
-
-        offset = 0
-        for (pos, _), hf, hb in zip(star_buffer, h_fwd_split, h_bwd_split):
-            h_sectors = []
-            for j in range(len(pos)):
-                vlen = int(lens_b[offset + j])
-                if hf is not None and hb is not None:
-                    h = torch.cat([hf[j, :vlen, :], hb[j, :vlen, :]], dim=-1)
-                elif hf is not None:
-                    h = hf[j, :vlen, :]
-                else:
-                    h = hb[j, :vlen, :]
-
-                if pooling_mode == 'mean':
-                    latent = h.mean(dim=0)
-                elif pooling_mode == 'final':
-                    latent = h[-1, :]
-                elif pooling_mode == 'multiscale':
-                    latent = compute_multiscale_features(h, n_segments=4)
-                else:
-                    raise ValueError(f'Unknown pooling_mode: {pooling_mode}')
-
-                per_sector_latents[pos[j]] = latent.cpu().numpy()
-                h_sectors.append(h)
-
-            h_all = torch.cat(h_sectors, dim=0)
-            cross_sector_latents.append(compute_multiscale_features(h_all, n_segments=4).cpu().numpy())
-            offset += len(pos)
-            # h_sectors / h_all go out of scope — hidden states freed
 
     model.eval()
     print(f'Extracting latents for {len(unique_tics)} stars '
@@ -430,7 +357,92 @@ def extract_latents_by_star(model, h5_path: str, device: torch.device,
     buffered_secs = 0
     stars_done    = 0
 
-    with torch.no_grad():
+    # Keep H5 file open during the loop — flux/time read per buffer, not upfront
+    with h5py.File(h5_path, 'r') as f, torch.no_grad():
+
+        def _run_buffer(star_buffer):
+            """Forward pass for a list of (pos_array, tic) pairs; fills per_sector_latents
+            and appends to cross_sector_latents in the same order as star_buffer."""
+            all_pos    = np.concatenate([pos for pos, _ in star_buffer])
+            star_sizes = [len(pos) for pos, _ in star_buffer]
+
+            # Map local positions to actual H5 row indices; sort for efficient read
+            h5_idx   = sample_indices[all_pos]
+            sort_ord = np.argsort(h5_idx)
+            inv_ord  = np.argsort(sort_ord)
+            h5_idx_s = h5_idx[sort_ord]
+
+            lens_b    = lengths[all_pos]
+            batch_max = int(lens_b.max())
+
+            flux_b = torch.tensor(f['flux'][h5_idx_s,     :batch_max][inv_ord], dtype=torch.float32, device=device)
+            ferr_b = torch.tensor(f['flux_err'][h5_idx_s, :batch_max][inv_ord], dtype=torch.float32, device=device)
+            time_b = torch.tensor(f['time'][h5_idx_s,     :batch_max][inv_ord], dtype=torch.float32, device=device)
+
+            B, L = flux_b.shape
+            mask = torch.zeros(B, L, device=device)
+            for j, vlen in enumerate(lens_b):
+                mask[j, :vlen] = 1.0
+
+            x_in = torch.stack([flux_b, ferr_b], dim=-1)
+            t_in = time_b.unsqueeze(-1)
+
+            meta_batch = (torch.tensor(metadata_all[all_pos], dtype=torch.float32, device=device)
+                          if metadata_all is not None else None)
+
+            if use_conv_channels and 'power' in f:
+                conv_data_batch = {
+                    'power':  torch.tensor(f['power'][h5_idx_s,  :batch_max][inv_ord], dtype=torch.float32, device=device),
+                    'acf':    torch.tensor(f['acf'][h5_idx_s,    :batch_max][inv_ord], dtype=torch.float32, device=device),
+                    'f_stat': torch.tensor(f['f_stat'][h5_idx_s, :batch_max][inv_ord], dtype=torch.float32, device=device),
+                }
+            else:
+                conv_data_batch = None
+
+            out   = model(x_in, t_in, mask=mask, metadata=meta_batch,
+                          conv_data=conv_data_batch, return_states=True)
+            h_fwd = out.get('h_fwd_tensor')
+            h_bwd = out.get('h_bwd_tensor')
+            del out, flux_b, ferr_b, time_b, x_in, t_in, mask, meta_batch, conv_data_batch
+
+            h_fwd_split = torch.split(h_fwd, star_sizes, dim=0) if h_fwd is not None else [None] * len(star_buffer)
+            h_bwd_split = torch.split(h_bwd, star_sizes, dim=0) if h_bwd is not None else [None] * len(star_buffer)
+            del h_fwd, h_bwd
+
+            offset = 0
+            for (pos, _), hf, hb in zip(star_buffer, h_fwd_split, h_bwd_split):
+                h_sectors = [] if compute_cross_sector else None
+                for j in range(len(pos)):
+                    vlen = int(lens_b[offset + j])
+                    if hf is not None and hb is not None:
+                        h = torch.cat([hf[j, :vlen, :], hb[j, :vlen, :]], dim=-1)
+                    elif hf is not None:
+                        h = hf[j, :vlen, :]
+                    else:
+                        h = hb[j, :vlen, :]
+
+                    if pooling_mode == 'mean':
+                        latent = h.mean(dim=0)
+                    elif pooling_mode == 'final':
+                        latent = h[-1, :]
+                    elif pooling_mode == 'multiscale':
+                        latent = compute_multiscale_features(h, n_segments=4)
+                    else:
+                        raise ValueError(f'Unknown pooling_mode: {pooling_mode}')
+
+                    per_sector_latents[pos[j]] = latent.cpu().numpy()
+                    if compute_cross_sector:
+                        h_sectors.append(h)
+                    del h, latent
+
+                if compute_cross_sector:
+                    h_all = torch.cat(h_sectors, dim=0)
+                    cross_sector_latents.append(compute_multiscale_features(h_all, n_segments=4).cpu().numpy())
+                    del h_sectors, h_all
+                offset += len(pos)
+
+            del h_fwd_split, h_bwd_split
+
         for tic in unique_tics:
             pos = tic_to_pos[tic]
             star_buffer.append((pos, tic))
@@ -441,14 +453,14 @@ def extract_latents_by_star(model, h5_path: str, device: torch.device,
                 stars_done   += len(star_buffer)
                 star_buffer   = []
                 buffered_secs = 0
-                if stars_done % 500 < batch_size:   # approx every 500 stars
+                if stars_done % 500 < batch_size:
                     print(f'  {stars_done}/{len(unique_tics)} stars processed')
 
-        if star_buffer:   # flush remainder
+        if star_buffer:
             _run_buffer(star_buffer)
 
     per_sector_arr   = np.stack(per_sector_latents)
-    cross_sector_arr = np.stack(cross_sector_latents)
+    cross_sector_arr = np.stack(cross_sector_latents) if cross_sector_latents else np.empty((0, per_sector_arr.shape[1]))
     print(f'Done: {N} per-sector latents {per_sector_arr.shape}, '
           f'{len(unique_tics)} cross-sector latents {cross_sector_arr.shape}')
     return per_sector_arr, cross_sector_arr, unique_tics
@@ -456,12 +468,13 @@ def extract_latents_by_star(model, h5_path: str, device: torch.device,
 
 def load_data_fresh(model_path: str, h5_path: str, csv_path: str,
                     hidden_size: int, direction: str, mode: str, use_flow: bool,
-                    max_length: int, batch_size: int, pooling_mode: str,
+                    max_length: int = None, batch_size: int = 32, pooling_mode: str = 'multiscale',
                     max_samples: int = None, stratify_by_age: bool = False,
                     n_age_bins: int = 20, bprp0_min: float = None, bprp0_max: float = None,
                     use_metadata: bool = False, use_conv_channels: bool = False,
                     conv_config: dict = None, require_prot: bool = False,
-                    device: torch.device = None):
+                    device: torch.device = None, pca_h5_paths: list = None,
+                    use_mg: bool = False, compute_cross_sector: bool = False):
     """Load model and extract per-sector and cross-sector latent vectors.
 
     Returns:
@@ -483,7 +496,9 @@ def load_data_fresh(model_path: str, h5_path: str, csv_path: str,
     # -- Step 1: load full metadata to build the valid-sample mask ----------
     all_ages, all_bprp0, all_bprp0_err, all_mg, all_mem_prob, all_gaia_ids, _, _ = load_ages(h5_path, csv_path, sample_indices=None)
 
-    valid_mask = ~np.isnan(all_ages) & ~np.isnan(all_bprp0) & ~np.isnan(all_bprp0_err) & ~np.isnan(all_mg)
+    valid_mask = ~np.isnan(all_ages) & ~np.isnan(all_bprp0) & ~np.isnan(all_bprp0_err)
+    if use_mg:
+        valid_mask &= ~np.isnan(all_mg)
     if bprp0_min is not None:
         valid_mask &= (all_bprp0 >= bprp0_min)
     if bprp0_max is not None:
@@ -521,7 +536,9 @@ def load_data_fresh(model_path: str, h5_path: str, csv_path: str,
 
     # Defensive validity filter (load_ages returns sorted order matching sorted sample_indices)
     # mem_prob may be NaN for non-cluster stars — that is valid, do not filter on it
-    final_ok        = ~np.isnan(ages) & ~np.isnan(bprp0) & ~np.isnan(bprp0_err) & ~np.isnan(mg)
+    final_ok        = ~np.isnan(ages) & ~np.isnan(bprp0) & ~np.isnan(bprp0_err)
+    if use_mg:
+        final_ok &= ~np.isnan(mg)
     sorted_indices  = np.sort(sample_indices)[final_ok]
     ages      = ages[final_ok]
     bprp0     = bprp0[final_ok]
@@ -542,24 +559,62 @@ def load_data_fresh(model_path: str, h5_path: str, csv_path: str,
     actual_use_metadata = model.num_meta_features > 0
     actual_use_conv     = model.use_conv_channels
 
-    # -- Step 5: single-pass extraction (per-sector + cross-sector) ---------
-    print('\n=== Extracting latents (per-sector + cross-sector in one pass) ===')
-    latent_vectors, cross_sector_latents, cross_sector_tic_ids = extract_latents_by_star(
+    # -- Step 5: extract latents for ALL stars in h5_path (one pass) --------
+    # We extract everything at once and then filter to the labeled subset.
+    # This avoids re-processing h5_path in the PCA step.
+    with h5py.File(h5_path, 'r') as f:
+        all_tic_ids_h5 = f['metadata']['tic'][:]
+    all_h5_indices = np.arange(len(all_tic_ids_h5))
+
+    print('\n=== Extracting latents for all stars in h5_path ===')
+    all_per_sector, all_cross_sector, all_cross_tic_ids = extract_latents_by_star(
         model, h5_path, device,
-        sample_indices=sorted_indices,
-        tic_ids_sorted=tic_ids,
+        sample_indices=all_h5_indices,
+        tic_ids_sorted=all_tic_ids_h5,
         max_length=max_length,
         pooling_mode=pooling_mode,
         batch_size=batch_size,
         use_metadata=actual_use_metadata,
         use_conv_channels=actual_use_conv,
+        compute_cross_sector=compute_cross_sector,
     )
+
+    # Filter per-sector latents to the labeled subset (sorted_indices are H5 row indices)
+    latent_vectors = all_per_sector[sorted_indices]
+
+    # Filter cross-sector latents to labeled TIC IDs (only populated if compute_cross_sector=True)
+    if compute_cross_sector and len(all_cross_sector) > 0:
+        labeled_tic_set = set(tic_ids.tolist())
+        labeled_cross_mask = np.isin(all_cross_tic_ids, list(labeled_tic_set))
+        cross_sector_latents = all_cross_sector[labeled_cross_mask]
+        cross_sector_tic_ids = all_cross_tic_ids[labeled_cross_mask]
+    else:
+        cross_sector_latents = None
+        cross_sector_tic_ids = None
 
     print(f'Loaded {len(ages)} LC samples | latent dim: {latent_vectors.shape[1]}')
     print(f'Age range: {ages.min():.1f} – {ages.max():.1f} Myr')
     print(f'Unique stars: {len(np.unique(tic_ids))}')
 
-    return latent_vectors, cross_sector_latents, cross_sector_tic_ids, ages, bprp0, bprp0_err, mg, mem_prob, gaia_ids, tic_ids, sectors
+    # -- Step 6: build PCA latent set (h5_path already extracted; add extra files) --
+    pca_parts = [all_per_sector]
+    if pca_h5_paths:
+        from plot_umap_latent import extract_latent_vectors as _extract_all
+        extra_paths = [p for p in pca_h5_paths if Path(p).resolve() != Path(h5_path).resolve()]
+        if extra_paths:
+            print('\n=== Extracting all-star latents from additional PCA H5 files ===')
+            for p in extra_paths:
+                print(f'  {p}')
+                lv = _extract_all(model, p, device,
+                                  max_length=max_length, batch_size=batch_size,
+                                  pooling_mode=pooling_mode, sample_indices=None,
+                                  use_metadata=actual_use_metadata,
+                                  use_conv_channels=actual_use_conv)
+                pca_parts.append(lv)
+    pca_all_latents = np.concatenate(pca_parts, axis=0)
+    print(f'Total PCA latents: {len(pca_all_latents)} (from {1 + len(extra_paths if pca_h5_paths else [])} file(s))')
+
+    return latent_vectors, cross_sector_latents, cross_sector_tic_ids, ages, bprp0, bprp0_err, mg, mem_prob, gaia_ids, tic_ids, sectors, pca_all_latents
 
 
 # ---------------------------------------------------------------------------
@@ -813,15 +868,39 @@ class CombinedLRScheduler:
 # Training
 # ---------------------------------------------------------------------------
 
+def _batched_predict_stats(model, Z_val_t, bprp0_val_t, berr_val_t, mg_val_t,
+                            loga_grid, pred_batch_size=256):
+    """Run predict_stats in chunks to avoid the (B × G) memory spike.
+
+    With a 1000-point age grid, calling predict_stats on the full val set at once
+    creates tensors of shape (B*1000, D) which can be hundreds of MB. Chunking to
+    pred_batch_size stars keeps peak memory proportional to the chunk size.
+    """
+    stat_keys = ('median', 'mean', 'map', 'p16', 'p84')
+    accum = {k: [] for k in stat_keys}
+    n = Z_val_t.shape[0]
+    for start in range(0, n, pred_batch_size):
+        end = min(start + pred_batch_size, n)
+        stats = model.predict_stats(
+            Z_val_t[start:end], bprp0_val_t[start:end],
+            berr_val_t[start:end], mg_val_t[start:end], loga_grid
+        )
+        for k in stat_keys:
+            accum[k].append(stats[k].cpu())
+    return {k: torch.cat(accum[k]) for k in stat_keys}
+
+
 def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, mem_prob_train,
                       X_val, y_val, bprp0_val, bprp0_err_val, mg_val, mem_prob_val,
                       pca_dim, lr, weight_decay, n_epochs, batch_size, device,
                       flow_transforms=8, flow_hidden_features=None, loga_grid=None,
                       encoder_type='pca', mlp_encoder_hidden=None, aux_loss_weight=1.0,
-                      use_mg=False, lr_decay_rate=None):
+                      use_mg=False, lr_decay_rate=None, global_pca=None):
     """Train one fold NLE model.
 
     encoder_type='pca': PCA fit on training fold only (no leakage, no collapse).
+        If global_pca is provided, it is used as-is (pre-fit on all stars) and
+        only transform() is called — no per-fold fitting.
     encoder_type='mlp': Jointly-trained MLP encoder with auxiliary age L1 loss to
                         prevent collapse. No PCA step; raw z-scored latents used.
 
@@ -835,9 +914,14 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
     fold_pca = None
 
     if encoder_type == 'pca':
-        fold_pca  = PCA(n_components=pca_dim, whiten=True)
-        Z_train   = fold_pca.fit_transform(X_train).astype(np.float32)
-        Z_val     = fold_pca.transform(X_val).astype(np.float32)
+        if global_pca is not None:
+            fold_pca = global_pca
+            Z_train  = fold_pca.transform(X_train).astype(np.float32)
+            Z_val    = fold_pca.transform(X_val).astype(np.float32)
+        else:
+            fold_pca = PCA(n_components=pca_dim, whiten=True)
+            Z_train  = fold_pca.fit_transform(X_train).astype(np.float32)
+            Z_val    = fold_pca.transform(X_val).astype(np.float32)
         var_expl  = fold_pca.explained_variance_ratio_.sum()
         print(f'    PCA {pca_dim}D: {100*var_expl:.1f}% variance explained')
         model = AgePredictor(pca_dim, flow_transforms=flow_transforms,
@@ -910,8 +994,9 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
     model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
     model.eval()
     with torch.no_grad():
-        stats     = model.predict_stats(Z_val_t, bprp0_val_t, berr_val_t, mg_val_t, loga_grid.to(device))
-        val_stats = {k: v.cpu().numpy() for k, v in stats.items()}
+        stats     = _batched_predict_stats(model, Z_val_t, bprp0_val_t, berr_val_t, mg_val_t,
+                                           loga_grid.to(device))
+        val_stats = {k: v.numpy() for k, v in stats.items()}
 
     return val_stats, best_loss, best_state, fold_pca, train_losses, val_losses
 
@@ -921,7 +1006,7 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
 # ---------------------------------------------------------------------------
 
 def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
-                 n_folds=10, pca_dim=32,
+                 n_folds=10, pca_dim=32, pca_latents=None,
                  lr=1e-3, weight_decay=1e-4, n_epochs=100, batch_size=64,
                  device=None, seed=42, save_models_dir=None,
                  star_level_split=False,
@@ -951,7 +1036,11 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
     X = latent_vectors
     y = np.log10(ages)
 
-    X_mean, X_std = X.mean(axis=0), X.std(axis=0) + 1e-8
+    if pca_latents is not None:
+        X_mean, X_std = pca_latents.mean(axis=0), pca_latents.std(axis=0) + 1e-8
+        print(f'Normalization computed from {len(pca_latents)} all-star latents')
+    else:
+        X_mean, X_std = X.mean(axis=0), X.std(axis=0) + 1e-8
     X_norm = (X - X_mean) / X_std
 
     # bprp0: passed raw (~0–4 scale, matches log10_age range)
@@ -966,6 +1055,18 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
         'latent_dim': latent_vectors.shape[1],
         'input_dim': X.shape[1],
     }
+
+    # Fit a single global PCA on all-star latents (if provided), so every fold
+    # uses the same coordinate system rather than re-fitting per fold.
+    global_pca = None
+    if pca_latents is not None and encoder_type == 'pca':
+        pca_norm   = (pca_latents - X_mean) / X_std
+        global_pca = PCA(n_components=pca_dim, whiten=True)
+        global_pca.fit(pca_norm)
+        var_expl = global_pca.explained_variance_ratio_.sum()
+        print(f'Global PCA {pca_dim}D fitted on {len(pca_latents)} stars: '
+              f'{100*var_expl:.1f}% variance explained')
+        del pca_norm  # free the normalized copy; global_pca is now self-contained
 
     # Age grid for posterior inference
     G = loga_grid_size or LOGA_GRID_DEFAULT_SIZE
@@ -1029,6 +1130,7 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
             encoder_type=encoder_type, mlp_encoder_hidden=mlp_encoder_hidden,
             aux_loss_weight=aux_loss_weight, use_mg=use_mg,
             lr_decay_rate=lr_decay_rate,
+            global_pca=global_pca,
         )
         fold_models.append({
             'state_dict': model_state, 'pca': fold_pca,
@@ -1187,8 +1289,11 @@ def main():
     # Data / model
     parser.add_argument('--model_path', type=str, default=None,
                         help='Path to model checkpoint. Required unless --load_latents is set.')
-    parser.add_argument('--h5_path',    type=str, default='data/timeseries_x.h5')
-    parser.add_argument('--age_csv',    type=str, default='data/phot_all.csv')
+    parser.add_argument('--h5_path',       type=str, default='data/timeseries_x.h5')
+    parser.add_argument('--age_csv',       type=str, default='data/phot_all.csv')
+    parser.add_argument('--pca_h5_paths',  type=str, nargs='+', default=None,
+                        help='H5 files to use for global PCA/normalization (all stars, no age filter). '
+                             'If omitted, PCA is fit per-fold on training stars only.')
     parser.add_argument('--output_dir', type=str, default='output/age_predictor/kfold')
 
     # (kept for backward compat with old shell scripts; not used)
@@ -1295,6 +1400,7 @@ def main():
     # ── Step 1: latents (from model or from cache) ──────────────────────────
     cached_cross_sector_latents = None
     cached_cross_sector_tic_ids = None
+    pca_latents = None
 
     if args.load_latents:
         print(f'\n=== Loading latents from cache: {args.load_latents} ===')
@@ -1304,7 +1410,7 @@ def main():
         _df = pd.read_csv(args.age_csv)
         _df['GaiaDR3_ID'] = _df['GaiaDR3_ID'].astype(str)
         _id_to_bprp0_err = dict(zip(_df['GaiaDR3_ID'], _df['BPRP0_err']))
-        _id_to_mg        = dict(zip(_df['GaiaDR3_ID'], _df['MG_quick']))
+        _id_to_mg        = dict(zip(_df['GaiaDR3_ID'], _df['MG_quick'])) if 'MG_quick' in _df.columns else {}
         _id_to_mem_prob  = dict(zip(_df['GaiaDR3_ID'], _df['mem_prob_val'])) if 'mem_prob_val' in _df.columns else {}
         bprp0_err = np.array([_id_to_bprp0_err.get(g, np.nan) for g in gaia_ids], dtype=float)
         mg        = np.array([_id_to_mg.get(g, np.nan)        for g in gaia_ids], dtype=float)
@@ -1313,7 +1419,8 @@ def main():
         if args.model_path is None:
             parser.error('--model_path is required unless --load_latents is set.')
         (latent_vectors, cached_cross_sector_latents, cached_cross_sector_tic_ids,
-         ages, bprp0, bprp0_err, mg, mem_prob, gaia_ids, tic_ids, sectors) = load_data_fresh(
+         ages, bprp0, bprp0_err, mg, mem_prob, gaia_ids, tic_ids, sectors,
+         pca_latents) = load_data_fresh(
             model_path=args.model_path,
             h5_path=args.h5_path,
             csv_path=args.age_csv,
@@ -1334,6 +1441,9 @@ def main():
             conv_config=conv_config,
             require_prot=args.require_prot,
             device=device,
+            pca_h5_paths=args.pca_h5_paths if args.pca_h5_paths else None,
+            use_mg=args.use_mg,
+            compute_cross_sector=(args.star_aggregation == 'cross_sector'),
         )
 
         if args.save_latents:
@@ -1404,6 +1514,7 @@ def main():
         tic_ids=kfold_tics,
         n_folds=args.n_folds,
         pca_dim=args.pca_dim,
+        pca_latents=pca_latents,
         lr=args.lr,
         weight_decay=args.weight_decay,
         n_epochs=args.n_epochs,

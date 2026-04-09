@@ -7,13 +7,15 @@
 #   2. Update --epochs to your new target (e.g., 50 or 100)
 #   3. Training will continue from where it left off
 #
-#SBATCH --job-name=lcgen-final-parallel
+#SBATCH --job-name=lcgen-final-parallel-v2
 #### Change account to your allocation (e.g., abc123p)
 #SBATCH --account=phy260003p
 #SBATCH --partition=GPU-shared
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=5
+# cpus-per-task = nproc_per_node * (num_workers + 1)
+# GPU-shared (4 GPUs): 4 * (4 + 1) = 20
+#SBATCH --cpus-per-task=20
 #SBATCH --gpus=v100-32:4
 #SBATCH --time=48:00:00
 #SBATCH --output=slurm_logs/lcgen-%j.out
@@ -30,10 +32,10 @@ OUTPUT_DIR="$PROJECT_DIR/output/$SLURM_JOBID-$SLURM_JOB_NAME"
 #### OPTIONAL: Set to resume training from a previous checkpoint
 #### Example: RESUME_FROM="checkpoints/resume/model.pt"
 #### Leave empty ("") for fresh training
-RESUME_FROM=""
+RESUME_FROM="checkpoints/resume/model.pt"
 
 # Define container
-CONTAINER="/ocean/containers/ngc/pytorch/pytorch_24.11-py3.sif"
+CONTAINER="/ocean/containers/ngc/pytorch/delete/pytorch_24.11-py3.sif"
 
 echo "========================================"
 echo "Job ID: $SLURM_JOBID"
@@ -101,7 +103,7 @@ time -p singularity exec --nv --bind /ocean,$LOCAL,$HOME \
     --batch_size 64 \
     --hidden_size 64 \
     --output_name model.pt \
-    --epochs 1 \
+    --epochs 50 \
     --lr 1e-3 \
     --min_size 5 \
     --max_size 720 \
@@ -110,7 +112,8 @@ time -p singularity exec --nv --bind /ocean,$LOCAL,$HOME \
     --use_metadata \
     --mode parallel \
     --val_split 0.1 \
-    --val_k_values 1,16 \
+    --val_k_values 1,2,4,8 \
+    --num_workers 4 \
     --K 720 \
     --k_spacing log \
     --patience 10 \

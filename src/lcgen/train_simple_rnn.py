@@ -158,6 +158,9 @@ def _save_rolling_checkpoint(
     if persistent_dir is not None:
         shutil.copy2(ckpt_path,    persistent_dir / 'model.pt')
         shutil.copy2(losses_path,  persistent_dir / 'losses_per_epoch.npz')
+        args_src = output_path / 'train_args.json'
+        if args_src.exists():
+            shutil.copy2(args_src, persistent_dir / 'train_args.json')
         print(f'  → Copied checkpoint to {persistent_dir}')
 
 
@@ -218,10 +221,10 @@ def train(args):
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=shuffle_train,
                               sampler=train_sampler, collate_fn=collate_fn,
-                              num_workers=4, pin_memory=True, worker_init_fn=worker_init_fn)
+                              num_workers=args.num_workers, pin_memory=True, worker_init_fn=worker_init_fn)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                             sampler=val_sampler, collate_fn=collate_fn,
-                            num_workers=4, pin_memory=True, worker_init_fn=worker_init_fn) \
+                            num_workers=args.num_workers, pin_memory=True, worker_init_fn=worker_init_fn) \
                  if val_ds is not None else None
 
     # Convolutional channel configuration
@@ -251,6 +254,18 @@ def train(args):
             print(f"Using UNET conv encoder (slower but richer multi-scale features)")
 
     raw_model = BiDirectionalMinGRU(hidden_size=args.hidden_size, direction=args.direction, mode=args.mode, use_flow=args.use_flow, num_meta_features=num_meta_features, use_conv_channels=args.use_conv_channels, conv_config=conv_config).to(device)
+
+    # Compile before DDP so the compiler sees the full model graph.
+    # dynamic=True avoids recompilation when padded sequence length varies across batches.
+    # torch.compile requires CUDA capability >= 7.5 (inductor backend); skip on V100 (sm_70).
+    cuda_cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+    if cuda_cap >= (7, 5):
+        raw_model = torch.compile(raw_model, dynamic=True)
+        if is_main:
+            print(f'torch.compile enabled (CUDA capability {cuda_cap[0]}.{cuda_cap[1]})')
+    else:
+        if is_main:
+            print(f'torch.compile skipped (CUDA capability {cuda_cap[0]}.{cuda_cap[1]} < 7.5)')
 
     if ddp_active:
         model = DDP(raw_model, device_ids=[device.index])
@@ -614,6 +629,9 @@ def parse_args():
                    help='Path to checkpoint .pt file to resume training from. Will load model state, optimizer state, and previous losses.')
     p.add_argument('--save_every', type=int, default=1,
                    help='Save a rolling checkpoint every N epochs (default: 1). Set to 0 to disable mid-run saves.')
+    p.add_argument('--num_workers', type=int, default=4,
+                        help='DataLoader workers per GPU process. Set to '
+                             '(cpus_per_task - nproc_per_node) // nproc_per_node.')
     p.add_argument('--checkpoint_copy_dir', type=str, default=None,
                    help='If set, copy checkpoint_latest.pt and losses_per_epoch.npz here after every save. '
                         'Use a path on persistent storage (e.g. $HOME/lcgen/checkpoints/resume) so progress '
