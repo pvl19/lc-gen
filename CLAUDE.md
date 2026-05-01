@@ -28,6 +28,9 @@ k-fold cross-validation.
 | `src/lcgen/utils/loss.py` | `bounded_horizon_future_nll` — training loss |
 | `scripts/kfold_age_inference.py` | Age prediction: PCA or MLP encoder → NSF flow |
 | `scripts/plot_umap_latent.py` | Latent extraction, `load_ages()`, UMAP plotting |
+| `scripts/plot_reconstructions.py` | Flow-based reconstructions at a given offset (random / Gaia ID / TIC ID), output to `output/reconstructions/` |
+| `plot_reconstructions.sh` | Shell wrapper for reconstructions |
+| `output/reconstructions/plot_reconstructions.ipynb` | Interactive notebook mirror of the above (reuses its helpers) |
 | `kfold_age_inference.sh` | Shell wrapper for age inference |
 | `slurm_bridges2.sh` | SLURM job script for PSC Bridges-2 |
 | `sync_to_bridges2.sh` | Rsync project to Bridges-2 |
@@ -39,6 +42,9 @@ k-fold cross-validation.
 - **Two distinct age-prediction pipelines exist — don't conflate them:**
   1. `MetadataAgePredictor` — uses raw metadata (BPRP0, parallax, etc.) directly, just used for testing
   2. NLE flow in `kfold_age_inference.py` — uses autoencoder latent vectors
+- **Always update this CLAUDE.md file** with the current status when changes are made, or when anything else in this file changes.
+- **Always check for memory leaks when testing scripts.** This project uses a lot of data, and it is easy to crash my laptop. Make sure that large files aren't being loaded all at once or that scripts are not trying to store too much all in memory at once.
+- **Always commit code/script/doc changes to git in logical chunks** before reporting a task done. Do NOT stage `.DS_Store`, `__pycache__/*.pyc`, `checkpoints/resume/*` (training state), or notebooks the user is actively editing — only commit source/script/doc changes from the current task. Group related changes into separate commits with descriptive messages, and never push without explicit user request.
 
 ## Model architecture (pretraining)
 
@@ -60,11 +66,18 @@ Inference: likelihood on 1000-point grid, normalize to posterior, extract stats.
 
 Star aggregation modes: `none`, `predict_mean`, `latent_mean`, `latent_median`, `latent_max`, `latent_mean_std`, `cross_sector`.
 
+## Age inference model tracking
+
+**Always update `final_model/final_parallel_e10/README.md`** when a new age inference model is trained or tested. The README contains a comparison table with MAE, Pearson r, and key hyperparameters for all runs. Regenerate metrics from the predictions CSVs in each `nf-*` subfolder.
+
+Current best: 3-stage MLP, bottleneck_dim=4, finetune_encoder_lr_mult=0.001 (r=0.705, MAE=0.296 dex).
+
 ## Current status
 
 - Pretraining complete with log-domain parallel scan. Active model checkpoints in `final_model/final_parallel_*`.
-- PCA age inference: r ~0.6 at 16D and 32D — significantly worse than previous runs.
-- MLP encoder underperforms PCA — next focus area for improvement.
+- Best age inference: 3-stage MLP encoder (r=0.705) — significantly better than PCA baseline (r~0.52).
+- `--train_full` flag added to train a deployment model on all labeled stars after k-fold CV.
+- `predict_ages.py` auto-detects `full_model.pt` for deployment; falls back to `kfold_models.pt` ensemble.
 - Rolling checkpoint (`checkpoints/resume/`) saves latest epoch only; best model only saved to output dir at end of training.
 
 ## Bridges-2 (PSC)
