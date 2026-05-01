@@ -231,16 +231,36 @@ class AgePredictorMLP(nn.Module):
 
     def forward(self, x: torch.Tensor, log_age: torch.Tensor,
                 bprp0: torch.Tensor, log_bprp0_err: torch.Tensor,
-                log_mg: torch.Tensor = None, mem_prob: torch.Tensor = None) -> torch.Tensor:
-        """NLL + auxiliary age loss."""
+                log_mg: torch.Tensor = None, mem_prob: torch.Tensor = None,
+                loss_mode: str = 'full') -> torch.Tensor:
+        """Compute loss.
+
+        loss_mode:
+            'full'     — NLL + aux L1 + variance reg (default, joint training)
+            'aux_only' — aux L1 + variance reg only (encoder pre-training, flow frozen)
+            'nll_only' — NLL only (flow training, encoder frozen)
+        """
         z     = self.encoder(x)
         parts = [log_age, bprp0, log_bprp0_err]
         if self.use_mg:
             parts.append(log_mg)
         context = torch.stack(parts, dim=1)
-        nll     = self._nll_with_outlier(self.flow(context).log_prob(z), z, mem_prob)
-        aux     = torch.mean(torch.abs(self.aux_age_head(z).squeeze(1) - log_age))
-        loss    = nll + self.aux_loss_weight * aux
+
+        if loss_mode == 'aux_only':
+            aux  = torch.mean(torch.abs(self.aux_age_head(z).squeeze(1) - log_age))
+            loss = aux  # weight is irrelevant when aux is the only loss term
+        elif loss_mode == 'nll_only':
+            nll  = self._nll_with_outlier(self.flow(context).log_prob(z), z, mem_prob)
+            return nll
+        else:  # 'full'
+            nll  = self._nll_with_outlier(self.flow(context).log_prob(z), z, mem_prob)
+            aux  = torch.mean(torch.abs(self.aux_age_head(z).squeeze(1) - log_age))
+            # Scale aux to match NLL magnitude so aux_loss_weight controls relative
+            # contribution (1.0 = equal gradient magnitude) regardless of raw scales
+            nll_scale = nll.detach().abs().clamp(min=1e-4)
+            aux_scale = aux.detach().abs().clamp(min=1e-4)
+            loss = nll + self.aux_loss_weight * (nll_scale / aux_scale) * aux
+
         if self.variance_reg_weight > 0:
             std      = z.std(dim=0)
             var_loss = torch.relu(1.0 - std).mean()
@@ -365,8 +385,27 @@ def extract_latents_by_star(model, h5_path: str, device: torch.device,
     buffered_secs = 0
     stars_done    = 0
 
+    # Resolve spectra sidecar path (same convention as LazyH5Dataset)
+    spectra_h5_path = None
+    if use_conv_channels:
+        stem = h5_path.rsplit('.h5', 1)[0]
+        candidate = stem + '_spectra.h5'
+        if Path(candidate).exists():
+            spectra_h5_path = candidate
+        else:
+            with h5py.File(h5_path, 'r') as f_check:
+                if 'power' in f_check and 'f_stat' in f_check and 'acf' in f_check:
+                    spectra_h5_path = h5_path
+        if spectra_h5_path is None:
+            raise FileNotFoundError(
+                f'Conv channel data not found. Expected sidecar at {candidate} '
+                f'or power/f_stat/acf datasets inside {h5_path}.')
+        print(f'  Conv channel source: {spectra_h5_path}')
+
     # Keep H5 file open during the loop — flux/time read per buffer, not upfront
+    spectra_ctx = h5py.File(spectra_h5_path, 'r') if (spectra_h5_path and spectra_h5_path != h5_path) else None
     with h5py.File(h5_path, 'r') as f, torch.no_grad():
+        sf = spectra_ctx if spectra_ctx is not None else f  # spectra file handle
 
         def _run_buffer(star_buffer):
             """Forward pass for a list of (pos_array, tic) pairs; fills per_sector_latents
@@ -398,11 +437,11 @@ def extract_latents_by_star(model, h5_path: str, device: torch.device,
             meta_batch = (torch.tensor(metadata_all[all_pos], dtype=torch.float32, device=device)
                           if metadata_all is not None else None)
 
-            if use_conv_channels and 'power' in f:
+            if use_conv_channels and spectra_h5_path is not None:
                 conv_data_batch = {
-                    'power':  torch.tensor(f['power'][h5_idx_s,  :batch_max][inv_ord], dtype=torch.float32, device=device),
-                    'acf':    torch.tensor(f['acf'][h5_idx_s,    :batch_max][inv_ord], dtype=torch.float32, device=device),
-                    'f_stat': torch.tensor(f['f_stat'][h5_idx_s, :batch_max][inv_ord], dtype=torch.float32, device=device),
+                    'power':  torch.tensor(sf['power'][h5_idx_s][inv_ord],  dtype=torch.float32, device=device),
+                    'f_stat': torch.tensor(sf['f_stat'][h5_idx_s][inv_ord], dtype=torch.float32, device=device),
+                    'acf':    torch.tensor(sf['acf'][h5_idx_s][inv_ord],    dtype=torch.float32, device=device),
                 }
             else:
                 conv_data_batch = None
@@ -467,11 +506,73 @@ def extract_latents_by_star(model, h5_path: str, device: torch.device,
         if star_buffer:
             _run_buffer(star_buffer)
 
+    if spectra_ctx is not None:
+        spectra_ctx.close()
+
     per_sector_arr   = np.stack(per_sector_latents)
     cross_sector_arr = np.stack(cross_sector_latents) if cross_sector_latents else np.empty((0, per_sector_arr.shape[1]))
     print(f'Done: {N} per-sector latents {per_sector_arr.shape}, '
           f'{len(unique_tics)} cross-sector latents {cross_sector_arr.shape}')
     return per_sector_arr, cross_sector_arr, unique_tics
+
+
+def load_host_ages(h5_path: str, age_csv: str, metadata_csv: str = None,
+                   sample_indices: np.ndarray = None):
+    """Load host-star ages joined with photometric metadata.
+
+    Mirrors the return signature of plot_umap_latent.load_ages so it can be
+    used as a drop-in `age_loader_fn` for load_data_fresh.
+
+    Reads `st_age` (Gyr), `st_ageerr1` (Gyr), `st_ageerr2` (Gyr) from
+    `archive_ages_default.csv`-style CSVs and converts to Myr. BPRP0 /
+    BPRP0_err / MG_quick are joined from `metadata_csv` by GaiaDR3_ID.
+    Hosts have no cluster membership prior, so mem_prob is returned as NaN
+    (the outlier-mixture loss falls back to the constant 0.9 prior).
+
+    Returns: ages, bprp0, bprp0_err, mg, mem_prob, gaia_ids, tic_ids, sectors
+    """
+    with h5py.File(h5_path, 'r') as f:
+        raw_ids = f['metadata']['GaiaDR3_ID'][:]
+        tic_ids = f['metadata']['tic'][:]
+        sectors = f['metadata']['sector'][:]
+
+    if sample_indices is not None:
+        sorted_indices = np.sort(sample_indices)
+        raw_ids = raw_ids[sorted_indices]
+        tic_ids = tic_ids[sorted_indices]
+        sectors = sectors[sorted_indices]
+
+    gaia_ids = np.array([g.decode('utf-8').strip() for g in raw_ids])
+
+    df_age = pd.read_csv(age_csv)
+    df_age['GaiaDR3_ID'] = df_age['GaiaDR3_ID'].astype(str)
+    if 'st_age' in df_age.columns:
+        df_age['age_Myr'] = df_age['st_age'].astype(float) * 1000.0  # Gyr → Myr
+
+    if metadata_csv is not None:
+        df_meta = pd.read_csv(metadata_csv)
+        df_meta['GaiaDR3_ID'] = df_meta['GaiaDR3_ID'].astype(str)
+        # Right-merge so age columns take priority for any overlapping name
+        df = df_age.merge(df_meta, on='GaiaDR3_ID', how='left', suffixes=('', '_meta'))
+    else:
+        df = df_age
+
+    id_to_age       = dict(zip(df['GaiaDR3_ID'], df['age_Myr']))      if 'age_Myr'      in df.columns else {}
+    id_to_bprp0     = dict(zip(df['GaiaDR3_ID'], df['BPRP0']))         if 'BPRP0'        in df.columns else {}
+    id_to_bprp0_err = dict(zip(df['GaiaDR3_ID'], df['BPRP0_err']))     if 'BPRP0_err'    in df.columns else {}
+    id_to_mg        = dict(zip(df['GaiaDR3_ID'], df['MG_quick']))      if 'MG_quick'     in df.columns else {}
+    id_to_mem_prob  = dict(zip(df['GaiaDR3_ID'], df['mem_prob_val']))  if 'mem_prob_val' in df.columns else {}
+
+    ages      = np.array([id_to_age.get(g, np.nan)       for g in gaia_ids], dtype=float)
+    bprp0     = np.array([id_to_bprp0.get(g, np.nan)     for g in gaia_ids], dtype=float)
+    bprp0_err = np.array([id_to_bprp0_err.get(g, np.nan) for g in gaia_ids], dtype=float)
+    mg        = np.array([id_to_mg.get(g, np.nan)        for g in gaia_ids], dtype=float)
+    mem_prob  = np.array([id_to_mem_prob.get(g, np.nan)  for g in gaia_ids], dtype=float)
+
+    n_with_age = np.sum(~np.isnan(ages))
+    print(f'Loaded host ages for {n_with_age}/{len(ages)} light curves '
+          f'({100*n_with_age/max(len(ages),1):.1f}%)')
+    return ages, bprp0, bprp0_err, mg, mem_prob, gaia_ids, tic_ids, sectors
 
 
 def load_data_fresh(model_path: str, h5_path: str, csv_path: str,
@@ -482,7 +583,8 @@ def load_data_fresh(model_path: str, h5_path: str, csv_path: str,
                     use_metadata: bool = False, use_conv_channels: bool = False,
                     conv_config: dict = None, require_prot: bool = False,
                     device: torch.device = None, pca_h5_paths: list = None,
-                    use_mg: bool = False, compute_cross_sector: bool = False):
+                    use_mg: bool = False, compute_cross_sector: bool = False,
+                    age_loader_fn=None):
     """Load model and extract per-sector and cross-sector latent vectors.
 
     Returns:
@@ -498,11 +600,14 @@ def load_data_fresh(model_path: str, h5_path: str, csv_path: str,
     from plot_umap_latent import load_model, load_ages, get_stratified_indices
     from lcgen.models.TimeSeriesDataset import METADATA_FEATURES
 
+    if age_loader_fn is None:
+        age_loader_fn = load_ages
+
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # -- Step 1: load full metadata to build the valid-sample mask ----------
-    all_ages, all_bprp0, all_bprp0_err, all_mg, all_mem_prob, all_gaia_ids, _, _ = load_ages(h5_path, csv_path, sample_indices=None)
+    all_ages, all_bprp0, all_bprp0_err, all_mg, all_mem_prob, all_gaia_ids, _, _ = age_loader_fn(h5_path, csv_path, sample_indices=None)
 
     valid_mask = ~np.isnan(all_ages) & ~np.isnan(all_bprp0) & ~np.isnan(all_bprp0_err)
     if use_mg:
@@ -540,7 +645,7 @@ def load_data_fresh(model_path: str, h5_path: str, csv_path: str,
 
     # -- Step 3: load metadata for selected samples -------------------------
     # Done before extraction so tic_ids are available for star-grouped processing.
-    ages, bprp0, bprp0_err, mg, mem_prob, gaia_ids, tic_ids, sectors = load_ages(h5_path, csv_path, sample_indices)
+    ages, bprp0, bprp0_err, mg, mem_prob, gaia_ids, tic_ids, sectors = age_loader_fn(h5_path, csv_path, sample_indices)
 
     # Defensive validity filter (load_ages returns sorted order matching sorted sample_indices)
     # mem_prob may be NaN for non-cluster stars — that is valid, do not filter on it
@@ -631,7 +736,8 @@ def load_data_fresh(model_path: str, h5_path: str, csv_path: str,
 
 def save_latents_cache(cache_path: str,
                        latent_vectors, ages, bprp0, bprp0_err, gaia_ids, tic_ids, sectors,
-                       cross_sector_latents=None, cross_sector_tic_ids=None):
+                       cross_sector_latents=None, cross_sector_tic_ids=None,
+                       mg=None, mem_prob=None):
     """Save per-sector latents + identifiers (and optionally cross-sector latents) to npz.
 
     The cache contains everything needed for all star_aggregation modes so that
@@ -642,18 +748,25 @@ def save_latents_cache(cache_path: str,
     latent_vectors        (N, D)          per-sector pooled latents
     ages                  (N,)            stellar age in Myr
     bprp0                 (N,)            BP-RP0
+    bprp0_err             (N,)            BP-RP0 uncertainty
     gaia_ids              (N,)  str       GaiaDR3_ID
     tic_ids               (N,)  int64     TESS TIC
     sectors               (N,)  int64     TESS sector number
+    mg                    (N,)            absolute G mag         [optional]
+    mem_prob              (N,)            cluster membership prob [optional]
     cross_sector_latents  (S, D)          one multiscale latent per unique star  [optional]
     cross_sector_tic_ids  (S,)  int64     TIC ordering for cross_sector_latents  [optional]
     """
     save_dict = dict(
         latent_vectors=latent_vectors,
-        ages=ages, bprp0=bprp0,
+        ages=ages, bprp0=bprp0, bprp0_err=bprp0_err,
         gaia_ids=gaia_ids.astype(str),
         tic_ids=tic_ids, sectors=sectors,
     )
+    if mg is not None:
+        save_dict['mg'] = mg
+    if mem_prob is not None:
+        save_dict['mem_prob'] = mem_prob
     if cross_sector_latents is not None:
         save_dict['cross_sector_latents'] = cross_sector_latents
         save_dict['cross_sector_tic_ids'] = cross_sector_tic_ids
@@ -668,29 +781,44 @@ def load_latents_cache(cache_path: str):
 
     Returns
     -------
-    latent_vectors, ages, bprp0, gaia_ids, tic_ids, sectors,
-    cross_sector_latents (or None), cross_sector_tic_ids (or None)
+    dict with keys: latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob,
+    gaia_ids, tic_ids, sectors, cross_sector_latents, cross_sector_tic_ids.
+    Optional fields are None when the cache was written without them
+    (legacy caches: bprp0_err / mg / mem_prob may need a CSV-based fill).
     """
     data = np.load(cache_path, allow_pickle=True)
-    cross_sector_latents  = data['cross_sector_latents']  if 'cross_sector_latents' in data else None
-    cross_sector_tic_ids  = data['cross_sector_tic_ids']  if 'cross_sector_tic_ids'  in data else None
+    out = {
+        'latent_vectors': data['latent_vectors'],
+        'ages':           data['ages'],
+        'bprp0':          data['bprp0'],
+        'gaia_ids':       data['gaia_ids'],
+        'tic_ids':        data['tic_ids'],
+        'sectors':        data['sectors'],
+        'bprp0_err':      data['bprp0_err'] if 'bprp0_err' in data else None,
+        'mg':             data['mg']        if 'mg'        in data else None,
+        'mem_prob':       data['mem_prob']  if 'mem_prob'  in data else None,
+        'cross_sector_latents': data['cross_sector_latents'] if 'cross_sector_latents' in data else None,
+        'cross_sector_tic_ids': data['cross_sector_tic_ids'] if 'cross_sector_tic_ids' in data else None,
+    }
     print(f'Loaded latents cache ← {cache_path}')
-    print(f'  per-sector samples : {len(data["ages"])}')
-    print(f'  latent dim         : {data["latent_vectors"].shape[1]}')
-    if cross_sector_latents is not None:
-        print(f'  cross-sector stars : {len(cross_sector_tic_ids)}')
+    print(f'  per-sector samples : {len(out["ages"])}')
+    print(f'  latent dim         : {out["latent_vectors"].shape[1]}')
+    if out['cross_sector_latents'] is not None:
+        print(f'  cross-sector stars : {len(out["cross_sector_tic_ids"])}')
     else:
         print(f'  cross-sector latents: not in cache')
-    return (data['latent_vectors'], data['ages'], data['bprp0'],
-            data['gaia_ids'], data['tic_ids'], data['sectors'],
-            cross_sector_latents, cross_sector_tic_ids)
+    missing = [k for k in ('bprp0_err', 'mg', 'mem_prob') if out[k] is None]
+    if missing:
+        print(f'  legacy cache (missing: {missing}) — will fill from CSV')
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Star-level aggregation helpers
 # ---------------------------------------------------------------------------
 
-def aggregate_by_star(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids, gaia_ids, method: str):
+def aggregate_by_star(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids, gaia_ids,
+                      method: str, source=None):
     """Reduce per-sector arrays to one row per unique star.
 
     Groups by GaiaID (not TIC ID) as the primary key, since occasional cases
@@ -722,6 +850,7 @@ def aggregate_by_star(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_
     star_bprp0_err = []
     star_mg        = []
     star_mem_prob  = []
+    star_source    = [] if source is not None else None
 
     for gid in unique_gids:
         mask = gaia_ids == gid
@@ -743,11 +872,16 @@ def aggregate_by_star(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_
         star_bprp0_err.append(bprp0_err[mask][0])
         star_mg.append(mg[mask][0])
         star_mem_prob.append(mem_prob[mask][0])
+        if star_source is not None:
+            star_source.append(source[mask][0])
 
     star_latents = np.stack(star_latents)
     print(f'{method}: reduced to {len(unique_gids)} stars | latent dim: {star_latents.shape[1]}')
-    return (star_latents, np.array(star_ages), np.array(star_bprp0), np.array(star_bprp0_err),
-            np.array(star_mg), np.array(star_mem_prob), unique_gids)
+    out = (star_latents, np.array(star_ages), np.array(star_bprp0), np.array(star_bprp0_err),
+           np.array(star_mg), np.array(star_mem_prob), unique_gids)
+    if star_source is not None:
+        out = out + (np.array(star_source, dtype=int),)
+    return out
 
 
 def extract_cross_sector_latents(model, h5_path: str, device: torch.device,
@@ -862,13 +996,18 @@ class CombinedLRScheduler:
         self.initial_lr   = initial_lr
         self.decay_rate   = decay_rate if decay_rate is not None else 10 ** (-3.0 / n_epochs)
         self.current_epoch = 0
+        # Capture each group's current LR as its base. Schedule scales all
+        # groups by the same factor so per-group ratios (e.g. encoder LR being
+        # 0.001× the flow LR) are preserved across steps.
+        for pg in optimizer.param_groups:
+            pg.setdefault('base_lr', pg['lr'])
 
     def step(self):
         exp_factor    = self.decay_rate ** self.current_epoch
         cos_factor    = 0.5 * (1.0 + np.cos(np.pi * self.current_epoch / self.T_max))
-        new_lr        = self.initial_lr * exp_factor * cos_factor
+        scale         = exp_factor * cos_factor
         for pg in self.optimizer.param_groups:
-            pg['lr'] = new_lr
+            pg['lr'] = pg['base_lr'] * scale
         self.current_epoch += 1
 
 
@@ -904,18 +1043,26 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
                       flow_transforms=8, flow_hidden_features=None, loga_grid=None,
                       encoder_type='pca', mlp_encoder_hidden=None, aux_loss_weight=1.0,
                       use_mg=False, lr_decay_rate=None, global_pca=None,
-                      dropout=0.1, variance_reg_weight=0.0):
+                      dropout=0.1, variance_reg_weight=0.0,
+                      training_stages='joint', encoder_pretrain_epochs=100,
+                      joint_finetune_epochs=50, finetune_encoder_lr_mult=0.01,
+                      finetune_flow_lr_mult=0.1):
     """Train one fold NLE model.
 
     encoder_type='pca': PCA fit on training fold only (no leakage, no collapse).
         If global_pca is provided, it is used as-is (pre-fit on all stars) and
         only transform() is called — no per-fold fitting.
-    encoder_type='mlp': Jointly-trained MLP encoder with auxiliary age L1 loss to
-                        prevent collapse. No PCA step; raw z-scored latents used.
+    encoder_type='mlp' or 'linear': Learned encoder with auxiliary age L1 loss.
+        No PCA step; raw z-scored latents used.
+
+    training_stages:
+        'joint'       — train all params together (current default)
+        'two_stage'   — stage 1: encoder+aux only; stage 2: flow only
+        'three_stage' — stage 1: encoder+aux; stage 2: flow; stage 3: joint fine-tune
 
     Returns:
         val_stats, best_loss, best_state, fold_pca, train_losses, val_losses
-        (fold_pca is None when encoder_type='mlp')
+        (fold_pca is None when encoder_type='mlp' or 'linear')
     """
     if loga_grid is None:
         loga_grid = torch.tensor(LOGA_GRID, dtype=torch.float32, device=device)
@@ -936,15 +1083,20 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
         model = AgePredictor(pca_dim, flow_transforms=flow_transforms,
                              flow_hidden_features=flow_hidden_features,
                              use_mg=use_mg).to(device)
-    else:  # mlp
+    else:  # mlp or linear
         Z_train = X_train.astype(np.float32)
         Z_val   = X_val.astype(np.float32)
         input_dim = Z_train.shape[1]
-        print(f'    MLP encoder {input_dim}D → {pca_dim}D bottleneck')
+        if encoder_type == 'linear':
+            mlp_hidden = []
+            print(f'    Linear encoder {input_dim}D → {pca_dim}D bottleneck')
+        else:
+            mlp_hidden = mlp_encoder_hidden
+            print(f'    MLP encoder {input_dim}D → {pca_dim}D bottleneck')
         model = AgePredictorMLP(
             input_dim=input_dim,
             bottleneck_dim=pca_dim,
-            mlp_hidden=mlp_encoder_hidden,
+            mlp_hidden=mlp_hidden,
             flow_transforms=flow_transforms,
             flow_hidden_features=flow_hidden_features,
             aux_loss_weight=aux_loss_weight,
@@ -963,12 +1115,6 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
     )
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = CombinedLRScheduler(optimizer, n_epochs=n_epochs, initial_lr=lr,
-                                    decay_rate=lr_decay_rate)
-    best_loss  = float('inf')
-    best_state = None
-
     Z_val_t        = torch.tensor(Z_val,         dtype=torch.float32, device=device)
     bprp0_val_t    = torch.tensor(bprp0_val,     dtype=torch.float32, device=device)
     berr_val_t     = torch.tensor(bprp0_err_val, dtype=torch.float32, device=device)
@@ -978,29 +1124,117 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
 
     train_losses = []
     val_losses   = []
+    best_loss  = float('inf')
+    best_state = None
 
-    for _ in range(n_epochs):
-        model.train()
-        epoch_loss = 0.0
-        for Z_b, y_b, bprp0_b, bprp0_err_b, mg_b, mem_prob_b in train_loader:
-            optimizer.zero_grad()
-            loss = model(Z_b, y_b, bprp0_b, bprp0_err_b, mg_b, mem_prob_b)
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item() * len(Z_b)
-        epoch_loss /= len(Z_train)
-        train_losses.append(epoch_loss)
+    def _run_stage(params, n_stage_epochs, stage_lr, loss_mode='full', label='',
+                   optimizer=None):
+        """Run one training stage, updating train_losses/val_losses/best in-place.
 
-        model.eval()
-        with torch.no_grad():
-            val_nll = model(Z_val_t, y_val_t, bprp0_val_t, berr_val_t, mg_val_t, mem_prob_val_t).item()
-        val_losses.append(val_nll)
-        model.train()
+        If `optimizer` is provided, reuse it (preserves AdamW momentum/variance
+        state across stages). Otherwise build a fresh AdamW from `params`.
+        Returns the optimizer used so the caller can pass it to the next stage.
+        """
+        nonlocal best_loss, best_state
+        opt = optimizer if optimizer is not None else optim.AdamW(
+            params, lr=stage_lr, weight_decay=weight_decay)
+        sched = CombinedLRScheduler(opt, n_epochs=n_stage_epochs, initial_lr=stage_lr,
+                                    decay_rate=lr_decay_rate)
+        for _ in range(n_stage_epochs):
+            model.train()
+            epoch_loss = 0.0
+            for Z_b, y_b, bprp0_b, bprp0_err_b, mg_b, mem_prob_b in train_loader:
+                opt.zero_grad()
+                if isinstance(model, AgePredictorMLP):
+                    loss = model(Z_b, y_b, bprp0_b, bprp0_err_b, mg_b, mem_prob_b,
+                                 loss_mode=loss_mode)
+                else:
+                    loss = model(Z_b, y_b, bprp0_b, bprp0_err_b, mg_b, mem_prob_b)
+                loss.backward()
+                opt.step()
+                epoch_loss += loss.item() * len(Z_b)
+            epoch_loss /= len(Z_train)
+            train_losses.append(epoch_loss)
 
-        if val_nll < best_loss:
-            best_loss  = val_nll
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        scheduler.step()
+            model.eval()
+            with torch.no_grad():
+                # Always use NLL-only for model selection — the combined loss
+                # (NLL + scaled aux) can cancel to ~0 and is not a useful metric
+                if isinstance(model, AgePredictorMLP):
+                    val_nll = model(Z_val_t, y_val_t, bprp0_val_t, berr_val_t,
+                                    mg_val_t, mem_prob_val_t, loss_mode='nll_only').item()
+                else:
+                    val_nll = model(Z_val_t, y_val_t, bprp0_val_t, berr_val_t,
+                                    mg_val_t, mem_prob_val_t).item()
+            val_losses.append(val_nll)
+            model.train()
+
+            if val_nll < best_loss:
+                best_loss  = val_nll
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            sched.step()
+        if label:
+            print(f'      {label}: {n_stage_epochs} epochs, best_val_nll={best_loss:.4f}')
+        return opt
+
+    use_staged = (training_stages in ('two_stage', 'three_stage')
+                  and isinstance(model, AgePredictorMLP))
+
+    if use_staged:
+        # Stage 1: encoder + aux_head only (flow frozen)
+        for p in model.flow.parameters():
+            p.requires_grad_(False)
+        encoder_params = list(model.encoder.parameters()) + list(model.aux_age_head.parameters())
+        _run_stage(encoder_params, encoder_pretrain_epochs, lr,
+                   loss_mode='aux_only', label='Stage 1 (encoder)')
+
+        # Stage 2: flow only (encoder + aux_head frozen)
+        # Reset best_loss — stage 1 val used full loss with untrained flow (meaningless)
+        best_loss = float('inf')
+        best_state = None
+        for p in model.flow.parameters():
+            p.requires_grad_(True)
+        for p in model.encoder.parameters():
+            p.requires_grad_(False)
+        for p in model.aux_age_head.parameters():
+            p.requires_grad_(False)
+        flow_epochs = n_epochs - encoder_pretrain_epochs
+        if training_stages == 'three_stage':
+            flow_epochs = n_epochs - encoder_pretrain_epochs - joint_finetune_epochs
+        flow_epochs = max(flow_epochs, 1)
+        stage2_opt = _run_stage(list(model.flow.parameters()), flow_epochs, lr,
+                                loss_mode='nll_only', label='Stage 2 (flow)')
+
+        # Stage 3 (three_stage only): joint fine-tuning. Reuses stage 2's
+        # optimizer (preserves AdamW momentum/variance for the flow) and adds
+        # the encoder + aux_head as a second param group. Flow LR is bumped to
+        # `lr * finetune_flow_lr_mult` (stage 2's cosine had decayed it to ~0)
+        # so the flow has headroom to keep adapting alongside the encoder.
+        if training_stages == 'three_stage' and joint_finetune_epochs > 0:
+            for p in model.parameters():
+                p.requires_grad_(True)
+            flow_lr_s3    = lr * finetune_flow_lr_mult
+            encoder_lr_s3 = lr * finetune_encoder_lr_mult
+            # Reset flow group LR + base_lr; the new scheduler will scale from base_lr.
+            for pg in stage2_opt.param_groups:
+                pg['lr']      = flow_lr_s3
+                pg['base_lr'] = flow_lr_s3
+            stage2_opt.add_param_group({
+                'params': list(model.encoder.parameters()) + list(model.aux_age_head.parameters()),
+                'lr':      encoder_lr_s3,
+                'base_lr': encoder_lr_s3,
+            })
+            print(f'      Stage 3 setup: flow_lr={flow_lr_s3:.2e}, '
+                  f'encoder_lr={encoder_lr_s3:.2e} (reusing stage 2 optimizer state)')
+            _run_stage(None, joint_finetune_epochs, lr, loss_mode='full',
+                       label='Stage 3 (joint)', optimizer=stage2_opt)
+
+        # Ensure all params are unfrozen for prediction
+        for p in model.parameters():
+            p.requires_grad_(True)
+    else:
+        # Joint training (original behavior)
+        _run_stage(list(model.parameters()), n_epochs, lr, loss_mode='full')
 
     model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
     model.eval()
@@ -1024,7 +1258,11 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
                  flow_transforms=8, flow_hidden_features=None, loga_grid_size=None,
                  encoder_type='pca', mlp_encoder_hidden=None, aux_loss_weight=1.0,
                  use_mg=False, lr_decay_rate=None,
-                 dropout=0.1, variance_reg_weight=0.0):
+                 dropout=0.1, variance_reg_weight=0.0,
+                 training_stages='joint', encoder_pretrain_epochs=100,
+                 joint_finetune_epochs=50, finetune_encoder_lr_mult=0.01,
+                 finetune_flow_lr_mult=0.1,
+                 train_full=False, source=None):
     """Run k-fold cross-validation.
 
     Args:
@@ -1088,7 +1326,29 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
     # Build fold assignments
     fold_of_sample = np.zeros(n_samples, dtype=int)
 
-    if star_level_split:
+    combined_mode = source is not None
+    if combined_mode:
+        # K-fold over host stars only; non-host (source==0) rows always train
+        host_mask    = (source == 1)
+        host_idx_all = np.where(host_mask)[0]
+        host_tics    = tic_ids[host_mask]
+        unique_host_tics = np.unique(host_tics)
+        perm             = np.random.permutation(len(unique_host_tics))
+        tics_shuffled    = unique_host_tics[perm]
+        tic_fold_size    = max(len(tics_shuffled) // n_folds, 1)
+        tic_to_fold = {}
+        for f in range(n_folds):
+            s = f * tic_fold_size
+            e = s + tic_fold_size if f < n_folds - 1 else len(tics_shuffled)
+            for t in tics_shuffled[s:e]:
+                tic_to_fold[t] = f
+
+        fold_of_sample = np.full(n_samples, -1, dtype=int)
+        for i in host_idx_all:
+            fold_of_sample[i] = tic_to_fold[tic_ids[i]]
+        print(f'Combined k-fold split: {len(unique_host_tics)} unique hosts across '
+              f'{n_folds} folds; {(source == 0).sum()} non-host rows always in train.')
+    elif star_level_split:
         unique_tics   = np.unique(tic_ids)
         perm          = np.random.permutation(len(unique_tics))
         tics_shuffled = unique_tics[perm]
@@ -1119,8 +1379,12 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
           f'({"star-level" if star_level_split else "sample-level"} split)...')
 
     for fold in range(n_folds):
-        val_idx   = np.where(fold_of_sample == fold)[0]
-        train_idx = np.where(fold_of_sample != fold)[0]
+        val_idx = np.where(fold_of_sample == fold)[0]
+        if combined_mode:
+            # Non-host rows (fold_of_sample == -1) join train every fold
+            train_idx = np.where((source == 0) | ((source == 1) & (fold_of_sample != fold)))[0]
+        else:
+            train_idx = np.where(fold_of_sample != fold)[0]
 
         X_train, y_train   = X_norm[train_idx],        y[train_idx]
         X_val              = X_norm[val_idx]
@@ -1144,6 +1408,11 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
             lr_decay_rate=lr_decay_rate,
             global_pca=global_pca,
             dropout=dropout, variance_reg_weight=variance_reg_weight,
+            training_stages=training_stages,
+            encoder_pretrain_epochs=encoder_pretrain_epochs,
+            joint_finetune_epochs=joint_finetune_epochs,
+            finetune_encoder_lr_mult=finetune_encoder_lr_mult,
+            finetune_flow_lr_mult=finetune_flow_lr_mult,
         )
         fold_models.append({
             'state_dict': model_state, 'pca': fold_pca,
@@ -1184,6 +1453,55 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
         with open(save_dir / 'training_curves.json', 'w') as fp:
             json.dump(loss_curves, fp)
         print(f'Saved training curves to {save_dir / "training_curves.json"}')
+
+    # ── Optional: train a single model on ALL labeled stars for deployment ──
+    if train_full and save_models_dir is not None:
+        print('\n' + '='*60)
+        print('Training full model on ALL labeled stars for deployment')
+        print('='*60)
+        save_dir = Path(save_models_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        full_stats, full_loss, full_state, full_pca, full_train, full_val = train_single_fold(
+            X_norm, y, bprp0_norm, bprp0_err_norm, mg_norm, mem_prob,   # train = all
+            X_norm, y, bprp0_norm, bprp0_err_norm, mg_norm, mem_prob,   # val = all (tracking only)
+            pca_dim, lr, weight_decay, n_epochs, batch_size, device,
+            flow_transforms=flow_transforms, flow_hidden_features=flow_hidden_features,
+            loga_grid=loga_grid_t,
+            encoder_type=encoder_type, mlp_encoder_hidden=mlp_encoder_hidden,
+            aux_loss_weight=aux_loss_weight, use_mg=use_mg,
+            lr_decay_rate=lr_decay_rate,
+            global_pca=global_pca,
+            dropout=dropout, variance_reg_weight=variance_reg_weight,
+            training_stages=training_stages,
+            encoder_pretrain_epochs=encoder_pretrain_epochs,
+            joint_finetune_epochs=joint_finetune_epochs,
+            finetune_encoder_lr_mult=finetune_encoder_lr_mult,
+            finetune_flow_lr_mult=finetune_flow_lr_mult,
+        )
+
+        torch.save({
+            'fold_models': [{'state_dict': full_state, 'pca': full_pca or global_pca,
+                             'train_losses': full_train, 'val_losses': full_val}],
+            'normalization_params': norm_params,
+            'pca_dim': pca_dim,
+            'n_folds': 1,
+            'seed': seed,
+        }, save_dir / 'full_model.pt')
+
+        full_pred_log = full_stats['median']
+        if combined_mode:
+            host_eval = (source == 1)
+            full_mae_h  = np.mean(np.abs(full_pred_log[host_eval] - y[host_eval]))
+            full_corr_h = np.corrcoef(full_pred_log[host_eval], y[host_eval])[0, 1]
+            print(f'Full model: train_nll={full_loss:.4f}  '
+                  f'host MAE={full_mae_h:.3f} dex  host r={full_corr_h:.3f}')
+        else:
+            full_mae  = np.mean(np.abs(full_pred_log - y))
+            full_corr = np.corrcoef(full_pred_log, y)[0, 1]
+            print(f'Full model: train_nll={full_loss:.4f}  '
+                  f'MAE={full_mae:.3f} dex  r={full_corr:.3f}')
+        print(f'Saved full model to {save_dir / "full_model.pt"}')
 
     all_predictions = all_stats['median']  # log10(age/Myr), used as primary prediction
     return all_predictions, all_stats, ages, tic_ids, fold_of_sample, fold_losses, norm_params
@@ -1357,9 +1675,10 @@ def main():
 
     # Age predictor training
     parser.add_argument('--encoder_type',         type=str,   default='pca',
-                        choices=['pca', 'mlp'],
-                        help='Compression method: pca (fixed, per-fold) or mlp (learned, '
-                             'jointly trained with auxiliary age loss). Default: pca')
+                        choices=['pca', 'mlp', 'linear'],
+                        help='Compression method: pca (fixed, per-fold), mlp (learned, '
+                             'jointly trained with auxiliary age loss), or linear (learned '
+                             'linear projection + LayerNorm, comparable to PCA). Default: pca')
     parser.add_argument('--pca_dim',              type=int,   default=32,
                         help='Bottleneck dimensionality for both pca and mlp encoders (default: 32)')
     parser.add_argument('--mlp_encoder_hidden',   type=int,   nargs='+', default=[256, 128],
@@ -1370,6 +1689,24 @@ def main():
                         help='Dropout rate in MLP encoder layers (mlp mode only, default: 0.1)')
     parser.add_argument('--variance_reg_weight',  type=float, default=0.0,
                         help='VICReg variance regularization weight on bottleneck (mlp mode only, default: 0.0)')
+    parser.add_argument('--training_stages',       type=str,   default='joint',
+                        choices=['joint', 'two_stage', 'three_stage'],
+                        help='Training mode: joint (all params together), two_stage (encoder '
+                             'then flow), three_stage (encoder, flow, joint fine-tune). '
+                             'Staged modes only apply to mlp/linear encoders. Default: joint')
+    parser.add_argument('--encoder_pretrain_epochs', type=int, default=100,
+                        help='Epochs for encoder pre-training in two_stage/three_stage mode (default: 100)')
+    parser.add_argument('--joint_finetune_epochs',   type=int, default=50,
+                        help='Epochs for joint fine-tuning in three_stage mode (default: 50)')
+    parser.add_argument('--finetune_encoder_lr_mult', type=float, default=0.01,
+                        help='Encoder LR multiplier during stage 3 fine-tuning, relative to '
+                             'flow LR. E.g. 0.01 = encoder trains at 1%% of flow LR. (default: 0.01)')
+    parser.add_argument('--finetune_flow_lr_mult', type=float, default=0.1,
+                        help='Flow LR multiplier at the start of stage 3, relative to the '
+                             'original peak --lr. Stage 2 ended near LR=0 due to cosine '
+                             'annealing; bumping back up to lr*mult gives stage 3 headroom '
+                             'to fine-tune without the LR shock that comes from resetting '
+                             'to peak. (default: 0.1)')
     parser.add_argument('--use_mg',               action='store_true', default=False,
                         help='Include log10(MG_quick) as a 4th flow context variable (default: off)')
     parser.add_argument('--lr',                   type=float, default=1e-3)
@@ -1387,6 +1724,11 @@ def main():
     parser.add_argument('--loga_grid_size',       type=int,   default=LOGA_GRID_DEFAULT_SIZE,
                         help='Number of age grid points for posterior inference (default: 1000)')
 
+    # Full-training model
+    parser.add_argument('--train_full',   action='store_true',
+                        help='After k-fold CV, train a final model on ALL labeled stars '
+                             'and save as full_model.pt for deployment to unlabeled data.')
+
     # Latents cache
     parser.add_argument('--save_latents', type=str, default=None, metavar='PATH',
                         help='After extracting latents, save them (+ cross-sector latents) '
@@ -1396,6 +1738,29 @@ def main():
                         help='Load pre-computed latents from this npz file instead of '
                              'running the model. --model_path is not required when this '
                              'flag is set.')
+
+    # Combined pretrain + host k-fold mode
+    parser.add_argument('--combined_kfold', action='store_true',
+                        help='Combined mode: train on (all non-host pretrain stars) ∪ '
+                             '((K-1)/K of hosts), validate on held-out host fold. '
+                             'Requires --host_h5_path and host data (or host cache).')
+    parser.add_argument('--host_h5_path',  type=str, default=None,
+                        help='H5 file containing host star light curves (combined mode).')
+    parser.add_argument('--host_age_csv',  type=str, default=None,
+                        help='CSV with host ages in Gyr (e.g. archive_ages_default.csv); '
+                             'columns: GaiaDR3_ID, st_age, st_ageerr1, st_ageerr2. '
+                             'Converted to Myr at load.')
+    parser.add_argument('--host_metadata_csv', type=str, default=None,
+                        help='CSV with host BPRP0 / BPRP0_err (joined onto host ages by '
+                             'GaiaDR3_ID). Required if host_age_csv lacks photometry.')
+    parser.add_argument('--save_latents_pretrain', type=str, default=None, metavar='PATH',
+                        help='Cache path for non-host pretrain latents (combined mode).')
+    parser.add_argument('--load_latents_pretrain', type=str, default=None, metavar='PATH',
+                        help='Load non-host pretrain latents from cache (combined mode).')
+    parser.add_argument('--save_latents_hosts', type=str, default=None, metavar='PATH',
+                        help='Cache path for host latents (combined mode).')
+    parser.add_argument('--load_latents_hosts', type=str, default=None, metavar='PATH',
+                        help='Load host latents from cache (combined mode).')
 
     args = parser.parse_args()
 
@@ -1410,7 +1775,7 @@ def main():
             conv_config = {'encoder_type': 'lightweight', 'hidden_channels': 16,
                            'num_layers': 3, 'activation': 'gelu'}
         else:
-            conv_config = {'encoder_type': 'unet', 'input_length': 16000,
+            conv_config = {'encoder_type': 'unet', 'input_length': 2500,
                            'encoder_dims': [4, 8, 16, 32], 'num_layers': 4,
                            'activation': 'gelu'}
 
@@ -1418,20 +1783,160 @@ def main():
     cached_cross_sector_latents = None
     cached_cross_sector_tic_ids = None
     pca_latents = None
+    source = None  # set in combined_kfold mode: 0 = non-host pretrain, 1 = host
 
-    if args.load_latents:
+    def _fill_from_csv(gaia_ids, csv_path, col):
+        df = pd.read_csv(csv_path)
+        df['GaiaDR3_ID'] = df['GaiaDR3_ID'].astype(str)
+        if col not in df.columns:
+            return np.full(len(gaia_ids), np.nan, dtype=float)
+        m = dict(zip(df['GaiaDR3_ID'], df[col]))
+        return np.array([m.get(g, np.nan) for g in gaia_ids], dtype=float)
+
+    def _load_cache_with_csv_fallback(cache_path, csv_path):
+        c = load_latents_cache(cache_path)
+        if c['bprp0_err'] is None:
+            c['bprp0_err'] = _fill_from_csv(c['gaia_ids'], csv_path, 'BPRP0_err')
+        if c['mg'] is None:
+            c['mg'] = _fill_from_csv(c['gaia_ids'], csv_path, 'MG_quick')
+        if c['mem_prob'] is None:
+            c['mem_prob'] = _fill_from_csv(c['gaia_ids'], csv_path, 'mem_prob_val')
+
+        # Caches written by plot_umap_latent.py include unaged stars (UMAP is fit
+        # on the full set). The fresh-extraction path filters these in load_ages;
+        # mirror that here so the kfold trainer never sees NaN labels.
+        ok = ~np.isnan(c['ages']) & ~np.isnan(c['bprp0']) & ~np.isnan(c['bprp0_err'])
+        n_drop = (~ok).sum()
+        if n_drop:
+            print(f'  dropped {n_drop}/{len(ok)} rows with NaN age/bprp0/bprp0_err')
+            for k in ('latent_vectors', 'ages', 'bprp0', 'bprp0_err',
+                     'mg', 'mem_prob', 'gaia_ids', 'tic_ids', 'sectors'):
+                if c.get(k) is not None:
+                    c[k] = c[k][ok]
+        return c
+
+    def _load_or_extract_one_source(label, h5_path, csv_path, save_path, load_path,
+                                    age_loader_fn=None, csv_for_fallback=None):
+        """Returns dict with the same keys as load_latents_cache plus 'pca_latents'."""
+        if load_path:
+            print(f'\n=== Loading {label} latents from cache: {load_path} ===')
+            cache = _load_cache_with_csv_fallback(
+                load_path, csv_for_fallback if csv_for_fallback else csv_path)
+            cache['pca_latents'] = None  # cache doesn't store the all-star pool
+            return cache
+
+        if args.model_path is None:
+            parser.error(f'--model_path is required to extract {label} latents '
+                         f'(no --load_latents_{label}).')
+        print(f'\n=== Extracting {label} latents from {h5_path} ===')
+        (lv, css_lat, css_tic,
+         a, b, be, mg_, mp_, gid, tid, sec, pca_pool) = load_data_fresh(
+            model_path=args.model_path,
+            h5_path=h5_path,
+            csv_path=csv_path,
+            hidden_size=args.hidden_size,
+            direction=args.direction,
+            mode=args.mode,
+            use_flow=args.use_flow,
+            max_length=args.max_length,
+            batch_size=32,
+            pooling_mode=args.pooling_mode,
+            max_samples=args.max_samples,
+            stratify_by_age=args.stratify_by_age,
+            n_age_bins=args.n_age_bins,
+            bprp0_min=args.bprp0_min,
+            bprp0_max=args.bprp0_max,
+            use_metadata=args.use_metadata,
+            use_conv_channels=args.use_conv_channels,
+            conv_config=conv_config,
+            require_prot=args.require_prot,
+            device=device,
+            pca_h5_paths=None,  # combined mode aggregates pca pools after both sides extracted
+            use_mg=args.use_mg,
+            compute_cross_sector=(args.star_aggregation == 'cross_sector'),
+            age_loader_fn=age_loader_fn,
+        )
+        if save_path:
+            save_latents_cache(
+                save_path, lv, a, b, be, gid, tid, sec, css_lat, css_tic,
+                mg=mg_, mem_prob=mp_,
+            )
+        return dict(
+            latent_vectors=lv, ages=a, bprp0=b, bprp0_err=be, mg=mg_, mem_prob=mp_,
+            gaia_ids=gid, tic_ids=tid, sectors=sec,
+            cross_sector_latents=css_lat, cross_sector_tic_ids=css_tic,
+            pca_latents=pca_pool,
+        )
+
+    if args.combined_kfold:
+        if not args.host_h5_path:
+            parser.error('--combined_kfold requires --host_h5_path.')
+        if not args.load_latents_pretrain and not args.h5_path:
+            parser.error('--combined_kfold requires --h5_path for non-host pretrain stars '
+                         '(or --load_latents_pretrain).')
+        host_age_csv = args.host_age_csv or args.age_csv
+        host_loader  = (lambda h5p, csvp, sample_indices=None:
+                        load_host_ages(h5p, csvp, args.host_metadata_csv, sample_indices))
+
+        c_p = _load_or_extract_one_source(
+            'pretrain', args.h5_path, args.age_csv,
+            args.save_latents_pretrain, args.load_latents_pretrain,
+            age_loader_fn=None,  # default load_ages
+            csv_for_fallback=args.age_csv,
+        )
+        c_h = _load_or_extract_one_source(
+            'hosts', args.host_h5_path, host_age_csv,
+            args.save_latents_hosts, args.load_latents_hosts,
+            age_loader_fn=host_loader,
+            csv_for_fallback=host_age_csv,
+        )
+
+        # Concatenate per-sector arrays with a source tag
+        n_p, n_h = len(c_p['ages']), len(c_h['ages'])
+        source = np.concatenate([np.zeros(n_p, dtype=int), np.ones(n_h, dtype=int)])
+        latent_vectors = np.concatenate([c_p['latent_vectors'], c_h['latent_vectors']], axis=0)
+        ages           = np.concatenate([c_p['ages'],           c_h['ages']])
+        bprp0          = np.concatenate([c_p['bprp0'],          c_h['bprp0']])
+        bprp0_err      = np.concatenate([c_p['bprp0_err'],      c_h['bprp0_err']])
+        mg             = np.concatenate([c_p['mg'],             c_h['mg']])
+        mem_prob       = np.concatenate([c_p['mem_prob'],       c_h['mem_prob']])
+        gaia_ids       = np.concatenate([np.asarray(c_p['gaia_ids']),
+                                         np.asarray(c_h['gaia_ids'])])
+        tic_ids        = np.concatenate([c_p['tic_ids'],        c_h['tic_ids']])
+        sectors        = np.concatenate([c_p['sectors'],        c_h['sectors']])
+
+        # Cross-sector arrays: only available if both sides provide them
+        if (c_p['cross_sector_latents'] is not None
+                and c_h['cross_sector_latents'] is not None):
+            cached_cross_sector_latents = np.concatenate(
+                [c_p['cross_sector_latents'], c_h['cross_sector_latents']], axis=0)
+            cached_cross_sector_tic_ids = np.concatenate(
+                [c_p['cross_sector_tic_ids'], c_h['cross_sector_tic_ids']])
+        else:
+            cached_cross_sector_latents = None
+            cached_cross_sector_tic_ids = None
+
+        # Global PCA pool: only when BOTH sides came from fresh extraction
+        if c_p['pca_latents'] is not None and c_h['pca_latents'] is not None:
+            pca_latents = np.concatenate([c_p['pca_latents'], c_h['pca_latents']], axis=0)
+            print(f'Combined PCA pool: {len(pca_latents)} all-star latents '
+                  f'({len(c_p["pca_latents"])} pretrain + {len(c_h["pca_latents"])} hosts)')
+        else:
+            pca_latents = None
+            print('Combined mode: at least one side loaded from cache → '
+                  'falling back to labeled-subset normalization stats.')
+
+        print(f'Combined dataset: {n_p} pretrain rows + {n_h} host rows = {n_p + n_h} total')
+
+    elif args.load_latents:
         print(f'\n=== Loading latents from cache: {args.load_latents} ===')
-        (latent_vectors, ages, bprp0, gaia_ids, tic_ids, sectors,
-         cached_cross_sector_latents, cached_cross_sector_tic_ids) = load_latents_cache(args.load_latents)
-        # bprp0_err and mg are not stored in the cache — load from CSV using gaia_ids
-        _df = pd.read_csv(args.age_csv)
-        _df['GaiaDR3_ID'] = _df['GaiaDR3_ID'].astype(str)
-        _id_to_bprp0_err = dict(zip(_df['GaiaDR3_ID'], _df['BPRP0_err']))
-        _id_to_mg        = dict(zip(_df['GaiaDR3_ID'], _df['MG_quick'])) if 'MG_quick' in _df.columns else {}
-        _id_to_mem_prob  = dict(zip(_df['GaiaDR3_ID'], _df['mem_prob_val'])) if 'mem_prob_val' in _df.columns else {}
-        bprp0_err = np.array([_id_to_bprp0_err.get(g, np.nan) for g in gaia_ids], dtype=float)
-        mg        = np.array([_id_to_mg.get(g, np.nan)        for g in gaia_ids], dtype=float)
-        mem_prob  = np.array([_id_to_mem_prob.get(g, np.nan)  for g in gaia_ids], dtype=float)
+        c = _load_cache_with_csv_fallback(args.load_latents, args.age_csv)
+        latent_vectors = c['latent_vectors']
+        ages, bprp0, bprp0_err = c['ages'], c['bprp0'], c['bprp0_err']
+        mg, mem_prob = c['mg'], c['mem_prob']
+        gaia_ids, tic_ids, sectors = c['gaia_ids'], c['tic_ids'], c['sectors']
+        cached_cross_sector_latents = c['cross_sector_latents']
+        cached_cross_sector_tic_ids = c['cross_sector_tic_ids']
     else:
         if args.model_path is None:
             parser.error('--model_path is required unless --load_latents is set.')
@@ -1468,11 +1973,13 @@ def main():
                 args.save_latents,
                 latent_vectors, ages, bprp0, bprp0_err, gaia_ids, tic_ids, sectors,
                 cached_cross_sector_latents, cached_cross_sector_tic_ids,
+                mg=mg, mem_prob=mem_prob,
             )
 
     # ── Step 2: apply star aggregation ─────────────────────────────────────
     agg = args.star_aggregation
     star_level_split = False  # whether run_kfold_cv should split by unique TIC
+    kfold_source = None       # populated only in combined_kfold mode
 
     if agg == 'none':
         kfold_latents   = latent_vectors
@@ -1482,6 +1989,7 @@ def main():
         kfold_mg        = mg
         kfold_mem_prob  = mem_prob
         kfold_tics      = tic_ids
+        kfold_source    = source
 
     elif agg == 'predict_mean':
         kfold_latents   = latent_vectors
@@ -1491,13 +1999,21 @@ def main():
         kfold_mg        = mg
         kfold_mem_prob  = mem_prob
         kfold_tics      = tic_ids
+        kfold_source    = source
         star_level_split = True
 
     elif agg in ('latent_mean', 'latent_median', 'latent_max', 'latent_mean_std'):
         print(f'\n=== Aggregating latents ({agg}) ===')
-        kfold_latents, kfold_ages, kfold_bprp0, kfold_bprp0_err, kfold_mg, kfold_mem_prob, kfold_tics = aggregate_by_star(
-            latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids, gaia_ids, method=agg
+        agg_out = aggregate_by_star(
+            latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids, gaia_ids,
+            method=agg, source=source,
         )
+        if source is not None:
+            (kfold_latents, kfold_ages, kfold_bprp0, kfold_bprp0_err,
+             kfold_mg, kfold_mem_prob, kfold_tics, kfold_source) = agg_out
+        else:
+            (kfold_latents, kfold_ages, kfold_bprp0, kfold_bprp0_err,
+             kfold_mg, kfold_mem_prob, kfold_tics) = agg_out
 
     elif agg == 'cross_sector':
         print('\n=== Cross-sector hidden-state pooling ===')
@@ -1515,6 +2031,9 @@ def main():
         kfold_bprp0_err = np.array([gaia_to_bprp0_err[g] for g in kfold_tics])
         kfold_mg        = np.array([gaia_to_mg[g]        for g in kfold_tics])
         kfold_mem_prob  = np.array([gaia_to_mem_prob[g]  for g in kfold_tics])
+        if source is not None:
+            gaia_to_source = {g: source[gaia_ids == g][0] for g in np.unique(gaia_ids)}
+            kfold_source   = np.array([gaia_to_source[g] for g in kfold_tics], dtype=int)
 
     else:
         raise ValueError(f'Unknown star_aggregation: {agg}')
@@ -1550,15 +2069,40 @@ def main():
         lr_decay_rate=args.lr_decay_rate,
         dropout=args.dropout,
         variance_reg_weight=args.variance_reg_weight,
+        training_stages=args.training_stages,
+        encoder_pretrain_epochs=args.encoder_pretrain_epochs,
+        joint_finetune_epochs=args.joint_finetune_epochs,
+        finetune_encoder_lr_mult=args.finetune_encoder_lr_mult,
+        finetune_flow_lr_mult=args.finetune_flow_lr_mult,
+        train_full=args.train_full,
+        source=kfold_source,
     )
 
     # ── Step 4: for predict_mean, save per-sector CSV then average per star ─
     if agg == 'predict_mean':
+        # In combined mode, drop non-host rows here so the per-sector CSV
+        # and per-star averages reflect the validated set only.
+        if args.combined_kfold and kfold_source is not None:
+            ps_mask         = (fold_assignments >= 0)
+            result_tics     = result_tics[ps_mask]
+            sectors_ps      = sectors[ps_mask]
+            true_ages       = true_ages[ps_mask]
+            predictions     = predictions[ps_mask]
+            kfold_bprp0     = kfold_bprp0[ps_mask]
+            kfold_bprp0_err = kfold_bprp0_err[ps_mask]
+            kfold_mg        = kfold_mg[ps_mask]
+            kfold_mem_prob  = kfold_mem_prob[ps_mask]
+            fold_assignments = fold_assignments[ps_mask]
+            if pred_stats is not None:
+                pred_stats = {k: v[ps_mask] for k, v in pred_stats.items()}
+        else:
+            sectors_ps = sectors
+
         # Save per-sector predictions first — useful for uncertainty estimation
         # (spread of per-sector predictions = observational scatter per star)
         pd.DataFrame({
             'TIC_ID': result_tics,
-            'sector': sectors,
+            'sector': sectors_ps,
             'true_age_myr': true_ages,
             'predicted_age_myr': predictions,
             'bprp0': kfold_bprp0,
@@ -1577,6 +2121,23 @@ def main():
         fold_assignments = np.array([fold_assignments[result_tics == t][0]     for t in unique_tics])
         result_tics     = unique_tics
         print(f'Averaged to {len(unique_tics)} unique stars')
+
+    # In combined_kfold mode, only host rows have a real fold assignment;
+    # restrict plotting/metrics to those rows.
+    if args.combined_kfold and kfold_source is not None:
+        # 'predict_mean' aggregation may have collapsed source array; rebuild
+        # by filtering on fold_assignments != -1 (only hosts ever got a fold).
+        host_mask = (fold_assignments >= 0)
+        n_before = len(predictions)
+        predictions = predictions[host_mask]
+        true_ages   = true_ages[host_mask]
+        kfold_bprp0 = kfold_bprp0[host_mask]
+        result_tics = result_tics[host_mask]
+        fold_assignments = fold_assignments[host_mask]
+        if pred_stats is not None:
+            pred_stats = {k: v[host_mask] for k, v in pred_stats.items()}
+        print(f'\nCombined mode: filtered to {len(predictions)} host rows '
+              f'(from {n_before} total).')
 
     # ── Step 5: results ─────────────────────────────────────────────────────
     plot_kfold_results(

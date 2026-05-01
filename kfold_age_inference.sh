@@ -39,28 +39,34 @@
 #   multiscale  - Multi-scale temporal features: mean, std, max, min, quartiles (1536 dims)
 #   final       - Final hidden state only (128 dims)
 
-MODEL_PATH=${1:-"final_model/final_parallel_e10/model.pt"}
+MODEL_PATH=${1:-"final_model/parallel_fixed/e110/best_model.pt"}
 VERSION=${2:-"default"}
 POOLING_MODE=${3:-"multiscale"}
 STAR_AGGREGATION=${4:-"latent_max"}
 USE_METADATA=${5:-"true"}
-USE_CONV=${6:-"false"}
+USE_CONV=${6:-"true"}
 CONV_TYPE=${7:-"unet"}
 REQUIRE_PROT=${8:-"false"}
 H5_PATH=${9:-"final_pretrain/timeseries_pretrain.h5"}
 SAVE_LATENTS=${10:-""}   # e.g. output/latents_cache/baseline_long_multiscale.npz
-LOAD_LATENTS=${11:-"final_model/final_parallel_e10/latents.npz"}   # e.g. output/latents_cache/baseline_long_multiscale.npz
-ENCODER_TYPE=${12:-"pca"}   # pca or mlp
+LOAD_LATENTS=${11:-"final_model/parallel_fixed/e110/latents_pretrain.npz"}   # e.g. output/latents_cache/baseline_long_multiscale.npz
+ENCODER_TYPE=${12:-"mlp"}   # pca, mlp, or linear
 USE_MG=${13:-"false"}       # true to include log10(MG_quick) as 4th flow context variable
 MLP_ENCODER_HIDDEN="128 64"
 AUX_LOSS_WEIGHT=1.0
 DROPOUT=0.1
 VARIANCE_REG_WEIGHT=0.25
+TRAINING_STAGES="three_stage"     # joint, two_stage, or three_stage
+ENCODER_PRETRAIN_EPOCHS=100
+JOINT_FINETUNE_EPOCHS=100
+FINETUNE_ENCODER_LR_MULT=0.1  # encoder LR = flow LR * this during stage 3
+FINETUNE_FLOW_LR_MULT=0.1       # stage 3 flow LR = peak --lr * this (avoids LR shock from full reset)
+TRAIN_FULL="true"               # train a final model on ALL stars after k-fold CV
 
 # H5 files to use for global PCA + normalization (all stars, no age filter)
 PCA_H5_PATHS="final_pretrain/timeseries_pretrain.h5 final_pretrain/timeseries_exop_hosts.h5"
 
-OUTPUT_DIR="final_model/final_parallel_e10/nf-pca64-${POOLING_MODE}-${STAR_AGGREGATION}-${ENCODER_TYPE}"
+OUTPUT_DIR="final_model/parallel_fixed/e110/age-inference-${POOLING_MODE}-${STAR_AGGREGATION}"
 
 echo "Running k-fold age inference:"
 echo "  Model:            ${MODEL_PATH:-'(from cache)'}"
@@ -69,6 +75,7 @@ echo "  Version:          ${VERSION}"
 echo "  Pooling mode:     ${POOLING_MODE}"
 echo "  Star aggregation: ${STAR_AGGREGATION}"
 echo "  Encoder type:     ${ENCODER_TYPE}"
+echo "  Training stages:  ${TRAINING_STAGES}"
 echo "  Use MG:           ${USE_MG}"
 echo "  Use metadata:     ${USE_METADATA}"
 echo "  Use conv:         ${USE_CONV} (${CONV_TYPE})"
@@ -99,13 +106,13 @@ CMD="${CMD} \
   --pca_h5_paths ${PCA_H5_PATHS} \
   --output_dir ${OUTPUT_DIR} \
   --star_aggregation ${STAR_AGGREGATION} \
-  --n_folds 5 \
+  --n_folds 10 \
   --encoder_type ${ENCODER_TYPE} \
-  --pca_dim 64 \
+  --pca_dim 4 \
   --mlp_encoder_hidden ${MLP_ENCODER_HIDDEN} \
   --lr 1e-3 \
   --lr_decay_rate 0.97 \
-  --n_epochs 200 \
+  --n_epochs 300 \
   --batch_size 64 \
   --flow_transforms 6 \
   --flow_hidden_dims 64 64 \
@@ -113,7 +120,12 @@ CMD="${CMD} \
   --seed 42 \
   --aux_loss_weight ${AUX_LOSS_WEIGHT} \
   --dropout ${DROPOUT} \
-  --variance_reg_weight ${VARIANCE_REG_WEIGHT}"
+  --variance_reg_weight ${VARIANCE_REG_WEIGHT} \
+  --training_stages ${TRAINING_STAGES} \
+  --encoder_pretrain_epochs ${ENCODER_PRETRAIN_EPOCHS} \
+  --joint_finetune_epochs ${JOINT_FINETUNE_EPOCHS} \
+  --finetune_encoder_lr_mult ${FINETUNE_ENCODER_LR_MULT} \
+  --finetune_flow_lr_mult ${FINETUNE_FLOW_LR_MULT}"
 
 if [ -n "${SAVE_LATENTS}" ]; then
   CMD="${CMD} --save_latents ${SAVE_LATENTS}"
@@ -133,6 +145,10 @@ fi
 
 if [ "${USE_MG}" = "true" ]; then
   CMD="${CMD} --use_mg"
+fi
+
+if [ "${TRAIN_FULL}" = "true" ]; then
+  CMD="${CMD} --train_full"
 fi
 
 eval $CMD
