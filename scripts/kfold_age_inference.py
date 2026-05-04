@@ -2003,6 +2003,11 @@ def main():
     star_level_split = False  # whether run_kfold_cv should split by unique TIC
     kfold_source = None       # populated only in combined_kfold mode
 
+    # kfold_sectors is per-sector and aligned with kfold_* only in 'none' and
+    # 'predict_mean' modes. It feeds the per-sector CSV saved by predict_mean
+    # below. Other aggregations collapse sectors into a single row per star.
+    kfold_sectors = None
+
     if agg == 'none':
         kfold_latents   = latent_vectors
         kfold_ages      = ages
@@ -2012,6 +2017,7 @@ def main():
         kfold_mg_err    = mg_err
         kfold_mem_prob  = mem_prob
         kfold_tics      = tic_ids
+        kfold_sectors   = sectors
         kfold_source    = source
 
     elif agg == 'predict_mean':
@@ -2023,6 +2029,7 @@ def main():
         kfold_mg_err    = mg_err
         kfold_mem_prob  = mem_prob
         kfold_tics      = tic_ids
+        kfold_sectors   = sectors
         kfold_source    = source
         star_level_split = True
 
@@ -2081,6 +2088,8 @@ def main():
             kfold_mg_err    = kfold_mg_err[mg_ok]
             kfold_mem_prob  = kfold_mem_prob[mg_ok]
             kfold_tics      = kfold_tics[mg_ok]
+            if kfold_sectors is not None:
+                kfold_sectors = kfold_sectors[mg_ok]
             if kfold_source is not None:
                 kfold_source = kfold_source[mg_ok]
         print(f'--use_mg_only: swapping (BPRP0, BPRP0_err) ← (MG, MG_err) '
@@ -2135,7 +2144,7 @@ def main():
         if args.combined_kfold and kfold_source is not None:
             ps_mask         = (fold_assignments >= 0)
             result_tics     = result_tics[ps_mask]
-            sectors_ps      = sectors[ps_mask]
+            sectors_ps      = kfold_sectors[ps_mask]
             true_ages       = true_ages[ps_mask]
             predictions     = predictions[ps_mask]
             kfold_bprp0     = kfold_bprp0[ps_mask]
@@ -2147,16 +2156,19 @@ def main():
             if pred_stats is not None:
                 pred_stats = {k: v[ps_mask] for k, v in pred_stats.items()}
         else:
-            sectors_ps = sectors
+            sectors_ps = kfold_sectors
 
         # Save per-sector predictions first — useful for uncertainty estimation
-        # (spread of per-sector predictions = observational scatter per star)
+        # (spread of per-sector predictions = observational scatter per star).
+        # Column name reflects what kfold_bprp0 actually carries, since
+        # --use_mg_only swaps MG into the BPRP0 slot.
+        photom_col = 'mg' if args.use_mg_only else 'bprp0'
         pd.DataFrame({
             'TIC_ID': result_tics,
             'sector': sectors_ps,
             'true_age_myr': true_ages,
             'predicted_age_myr': predictions,
-            'bprp0': kfold_bprp0,
+            photom_col: kfold_bprp0,
             'fold': fold_assignments,
         }).to_csv(output_dir / 'kfold_predictions_per_sector.csv', index=False)
         print(f'Saved per-sector predictions to {output_dir / "kfold_predictions_per_sector.csv"}')
