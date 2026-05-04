@@ -525,11 +525,11 @@ def load_host_ages(h5_path: str, age_csv: str, metadata_csv: str = None,
 
     Reads `st_age` (Gyr), `st_ageerr1` (Gyr), `st_ageerr2` (Gyr) from
     `archive_ages_default.csv`-style CSVs and converts to Myr. BPRP0 /
-    BPRP0_err / MG_quick are joined from `metadata_csv` by GaiaDR3_ID.
-    Hosts have no cluster membership prior, so mem_prob is returned as NaN
-    (the outlier-mixture loss falls back to the constant 0.9 prior).
+    BPRP0_err / MG_quick / MG_quick_err are joined from `metadata_csv` by
+    GaiaDR3_ID. Hosts have no cluster membership prior, so mem_prob is returned
+    as NaN (the outlier-mixture loss falls back to the constant 0.9 prior).
 
-    Returns: ages, bprp0, bprp0_err, mg, mem_prob, gaia_ids, tic_ids, sectors
+    Returns: ages, bprp0, bprp0_err, mg, mg_err, mem_prob, gaia_ids, tic_ids, sectors
     """
     with h5py.File(h5_path, 'r') as f:
         raw_ids = f['metadata']['GaiaDR3_ID'][:]
@@ -561,18 +561,20 @@ def load_host_ages(h5_path: str, age_csv: str, metadata_csv: str = None,
     id_to_bprp0     = dict(zip(df['GaiaDR3_ID'], df['BPRP0']))         if 'BPRP0'        in df.columns else {}
     id_to_bprp0_err = dict(zip(df['GaiaDR3_ID'], df['BPRP0_err']))     if 'BPRP0_err'    in df.columns else {}
     id_to_mg        = dict(zip(df['GaiaDR3_ID'], df['MG_quick']))      if 'MG_quick'     in df.columns else {}
+    id_to_mg_err    = dict(zip(df['GaiaDR3_ID'], df['MG_quick_err']))  if 'MG_quick_err' in df.columns else {}
     id_to_mem_prob  = dict(zip(df['GaiaDR3_ID'], df['mem_prob_val']))  if 'mem_prob_val' in df.columns else {}
 
     ages      = np.array([id_to_age.get(g, np.nan)       for g in gaia_ids], dtype=float)
     bprp0     = np.array([id_to_bprp0.get(g, np.nan)     for g in gaia_ids], dtype=float)
     bprp0_err = np.array([id_to_bprp0_err.get(g, np.nan) for g in gaia_ids], dtype=float)
     mg        = np.array([id_to_mg.get(g, np.nan)        for g in gaia_ids], dtype=float)
+    mg_err    = np.array([id_to_mg_err.get(g, np.nan)    for g in gaia_ids], dtype=float)
     mem_prob  = np.array([id_to_mem_prob.get(g, np.nan)  for g in gaia_ids], dtype=float)
 
     n_with_age = np.sum(~np.isnan(ages))
     print(f'Loaded host ages for {n_with_age}/{len(ages)} light curves '
           f'({100*n_with_age/max(len(ages),1):.1f}%)')
-    return ages, bprp0, bprp0_err, mg, mem_prob, gaia_ids, tic_ids, sectors
+    return ages, bprp0, bprp0_err, mg, mg_err, mem_prob, gaia_ids, tic_ids, sectors
 
 
 def load_data_fresh(model_path: str, h5_path: str, csv_path: str,
@@ -607,7 +609,7 @@ def load_data_fresh(model_path: str, h5_path: str, csv_path: str,
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # -- Step 1: load full metadata to build the valid-sample mask ----------
-    all_ages, all_bprp0, all_bprp0_err, all_mg, all_mem_prob, all_gaia_ids, _, _ = age_loader_fn(h5_path, csv_path, sample_indices=None)
+    all_ages, all_bprp0, all_bprp0_err, all_mg, all_mg_err, all_mem_prob, all_gaia_ids, _, _ = age_loader_fn(h5_path, csv_path, sample_indices=None)
 
     valid_mask = ~np.isnan(all_ages) & ~np.isnan(all_bprp0) & ~np.isnan(all_bprp0_err)
     if use_mg:
@@ -645,7 +647,7 @@ def load_data_fresh(model_path: str, h5_path: str, csv_path: str,
 
     # -- Step 3: load metadata for selected samples -------------------------
     # Done before extraction so tic_ids are available for star-grouped processing.
-    ages, bprp0, bprp0_err, mg, mem_prob, gaia_ids, tic_ids, sectors = age_loader_fn(h5_path, csv_path, sample_indices)
+    ages, bprp0, bprp0_err, mg, mg_err, mem_prob, gaia_ids, tic_ids, sectors = age_loader_fn(h5_path, csv_path, sample_indices)
 
     # Defensive validity filter (load_ages returns sorted order matching sorted sample_indices)
     # mem_prob may be NaN for non-cluster stars — that is valid, do not filter on it
@@ -657,6 +659,7 @@ def load_data_fresh(model_path: str, h5_path: str, csv_path: str,
     bprp0     = bprp0[final_ok]
     bprp0_err = bprp0_err[final_ok]
     mg        = mg[final_ok]
+    mg_err    = mg_err[final_ok]
     mem_prob  = mem_prob[final_ok]
     gaia_ids  = gaia_ids[final_ok]
     tic_ids   = tic_ids[final_ok]
@@ -727,7 +730,7 @@ def load_data_fresh(model_path: str, h5_path: str, csv_path: str,
     pca_all_latents = np.concatenate(pca_parts, axis=0)
     print(f'Total PCA latents: {len(pca_all_latents)} (from {1 + len(extra_paths if pca_h5_paths else [])} file(s))')
 
-    return latent_vectors, cross_sector_latents, cross_sector_tic_ids, ages, bprp0, bprp0_err, mg, mem_prob, gaia_ids, tic_ids, sectors, pca_all_latents
+    return latent_vectors, cross_sector_latents, cross_sector_tic_ids, ages, bprp0, bprp0_err, mg, mg_err, mem_prob, gaia_ids, tic_ids, sectors, pca_all_latents
 
 
 # ---------------------------------------------------------------------------
@@ -737,7 +740,7 @@ def load_data_fresh(model_path: str, h5_path: str, csv_path: str,
 def save_latents_cache(cache_path: str,
                        latent_vectors, ages, bprp0, bprp0_err, gaia_ids, tic_ids, sectors,
                        cross_sector_latents=None, cross_sector_tic_ids=None,
-                       mg=None, mem_prob=None):
+                       mg=None, mg_err=None, mem_prob=None):
     """Save per-sector latents + identifiers (and optionally cross-sector latents) to npz.
 
     The cache contains everything needed for all star_aggregation modes so that
@@ -765,6 +768,8 @@ def save_latents_cache(cache_path: str,
     )
     if mg is not None:
         save_dict['mg'] = mg
+    if mg_err is not None:
+        save_dict['mg_err'] = mg_err
     if mem_prob is not None:
         save_dict['mem_prob'] = mem_prob
     if cross_sector_latents is not None:
@@ -781,10 +786,10 @@ def load_latents_cache(cache_path: str):
 
     Returns
     -------
-    dict with keys: latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob,
+    dict with keys: latent_vectors, ages, bprp0, bprp0_err, mg, mg_err, mem_prob,
     gaia_ids, tic_ids, sectors, cross_sector_latents, cross_sector_tic_ids.
     Optional fields are None when the cache was written without them
-    (legacy caches: bprp0_err / mg / mem_prob may need a CSV-based fill).
+    (legacy caches: bprp0_err / mg / mg_err / mem_prob may need a CSV-based fill).
     """
     data = np.load(cache_path, allow_pickle=True)
     out = {
@@ -796,6 +801,7 @@ def load_latents_cache(cache_path: str):
         'sectors':        data['sectors'],
         'bprp0_err':      data['bprp0_err'] if 'bprp0_err' in data else None,
         'mg':             data['mg']        if 'mg'        in data else None,
+        'mg_err':         data['mg_err']    if 'mg_err'    in data else None,
         'mem_prob':       data['mem_prob']  if 'mem_prob'  in data else None,
         'cross_sector_latents': data['cross_sector_latents'] if 'cross_sector_latents' in data else None,
         'cross_sector_tic_ids': data['cross_sector_tic_ids'] if 'cross_sector_tic_ids' in data else None,
@@ -807,7 +813,7 @@ def load_latents_cache(cache_path: str):
         print(f'  cross-sector stars : {len(out["cross_sector_tic_ids"])}')
     else:
         print(f'  cross-sector latents: not in cache')
-    missing = [k for k in ('bprp0_err', 'mg', 'mem_prob') if out[k] is None]
+    missing = [k for k in ('bprp0_err', 'mg', 'mg_err', 'mem_prob') if out[k] is None]
     if missing:
         print(f'  legacy cache (missing: {missing}) — will fill from CSV')
     return out
@@ -817,7 +823,7 @@ def load_latents_cache(cache_path: str):
 # Star-level aggregation helpers
 # ---------------------------------------------------------------------------
 
-def aggregate_by_star(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids, gaia_ids,
+def aggregate_by_star(latent_vectors, ages, bprp0, bprp0_err, mg, mg_err, mem_prob, tic_ids, gaia_ids,
                       method: str, source=None):
     """Reduce per-sector arrays to one row per unique star.
 
@@ -840,6 +846,7 @@ def aggregate_by_star(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_
         star_bprp0:      (n_stars,)
         star_bprp0_err:  (n_stars,)
         star_mg:         (n_stars,)
+        star_mg_err:     (n_stars,)
         star_mem_prob:   (n_stars,)
         unique_gaia_ids: (n_stars,)
     """
@@ -849,6 +856,7 @@ def aggregate_by_star(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_
     star_bprp0     = []
     star_bprp0_err = []
     star_mg        = []
+    star_mg_err    = []
     star_mem_prob  = []
     star_source    = [] if source is not None else None
 
@@ -871,6 +879,7 @@ def aggregate_by_star(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_
         star_bprp0.append(bprp0[mask][0])
         star_bprp0_err.append(bprp0_err[mask][0])
         star_mg.append(mg[mask][0])
+        star_mg_err.append(mg_err[mask][0])
         star_mem_prob.append(mem_prob[mask][0])
         if star_source is not None:
             star_source.append(source[mask][0])
@@ -878,7 +887,7 @@ def aggregate_by_star(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_
     star_latents = np.stack(star_latents)
     print(f'{method}: reduced to {len(unique_gids)} stars | latent dim: {star_latents.shape[1]}')
     out = (star_latents, np.array(star_ages), np.array(star_bprp0), np.array(star_bprp0_err),
-           np.array(star_mg), np.array(star_mem_prob), unique_gids)
+           np.array(star_mg), np.array(star_mg_err), np.array(star_mem_prob), unique_gids)
     if star_source is not None:
         out = out + (np.array(star_source, dtype=int),)
     return out
@@ -1295,10 +1304,11 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
 
     # bprp0: passed raw (~0–4 scale, matches log10_age range)
     # bprp0_err: log10 transform only
-    # mg: log10 transform only
+    # mg: passed raw (MG_quick is already a log quantity in [-8, +12]; double-log
+    #     would clip negative values — i.e. all giants — to a fixed floor)
     bprp0_norm     = bprp0
     bprp0_err_norm = np.log10(np.clip(bprp0_err, 1e-10, None))
-    mg_norm        = np.log10(np.clip(mg,        1e-10, None))
+    mg_norm        = mg
 
     norm_params = {
         'X_mean': X_mean, 'X_std': X_std,
@@ -1708,7 +1718,12 @@ def main():
                              'to fine-tune without the LR shock that comes from resetting '
                              'to peak. (default: 0.1)')
     parser.add_argument('--use_mg',               action='store_true', default=False,
-                        help='Include log10(MG_quick) as a 4th flow context variable (default: off)')
+                        help='Include MG_quick as a 4th flow context variable (default: off). '
+                             'MG is passed raw (like BPRP0); MG is NOT included in this mode.')
+    parser.add_argument('--use_mg_only',          action='store_true', default=False,
+                        help='Use (MG, MG_err) instead of (BPRP0, BPRP0_err) as flow context. '
+                             'Implemented as a swap before training so the flow still sees a '
+                             '3-context input. Mutually exclusive with --use_mg.')
     parser.add_argument('--lr',                   type=float, default=1e-3)
     parser.add_argument('--lr_decay_rate',        type=float, default=None,
                         help='Exponential decay rate per epoch for the LR scheduler. '
@@ -1764,6 +1779,9 @@ def main():
 
     args = parser.parse_args()
 
+    if args.use_mg and args.use_mg_only:
+        parser.error('--use_mg and --use_mg_only are mutually exclusive.')
+
     device     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1799,6 +1817,8 @@ def main():
             c['bprp0_err'] = _fill_from_csv(c['gaia_ids'], csv_path, 'BPRP0_err')
         if c['mg'] is None:
             c['mg'] = _fill_from_csv(c['gaia_ids'], csv_path, 'MG_quick')
+        if c['mg_err'] is None:
+            c['mg_err'] = _fill_from_csv(c['gaia_ids'], csv_path, 'MG_quick_err')
         if c['mem_prob'] is None:
             c['mem_prob'] = _fill_from_csv(c['gaia_ids'], csv_path, 'mem_prob_val')
 
@@ -1810,7 +1830,7 @@ def main():
         if n_drop:
             print(f'  dropped {n_drop}/{len(ok)} rows with NaN age/bprp0/bprp0_err')
             for k in ('latent_vectors', 'ages', 'bprp0', 'bprp0_err',
-                     'mg', 'mem_prob', 'gaia_ids', 'tic_ids', 'sectors'):
+                     'mg', 'mg_err', 'mem_prob', 'gaia_ids', 'tic_ids', 'sectors'):
                 if c.get(k) is not None:
                     c[k] = c[k][ok]
         return c
@@ -1830,7 +1850,7 @@ def main():
                          f'(no --load_latents_{label}).')
         print(f'\n=== Extracting {label} latents from {h5_path} ===')
         (lv, css_lat, css_tic,
-         a, b, be, mg_, mp_, gid, tid, sec, pca_pool) = load_data_fresh(
+         a, b, be, mg_, mge_, mp_, gid, tid, sec, pca_pool) = load_data_fresh(
             model_path=args.model_path,
             h5_path=h5_path,
             csv_path=csv_path,
@@ -1859,10 +1879,11 @@ def main():
         if save_path:
             save_latents_cache(
                 save_path, lv, a, b, be, gid, tid, sec, css_lat, css_tic,
-                mg=mg_, mem_prob=mp_,
+                mg=mg_, mg_err=mge_, mem_prob=mp_,
             )
         return dict(
-            latent_vectors=lv, ages=a, bprp0=b, bprp0_err=be, mg=mg_, mem_prob=mp_,
+            latent_vectors=lv, ages=a, bprp0=b, bprp0_err=be,
+            mg=mg_, mg_err=mge_, mem_prob=mp_,
             gaia_ids=gid, tic_ids=tid, sectors=sec,
             cross_sector_latents=css_lat, cross_sector_tic_ids=css_tic,
             pca_latents=pca_pool,
@@ -1899,6 +1920,7 @@ def main():
         bprp0          = np.concatenate([c_p['bprp0'],          c_h['bprp0']])
         bprp0_err      = np.concatenate([c_p['bprp0_err'],      c_h['bprp0_err']])
         mg             = np.concatenate([c_p['mg'],             c_h['mg']])
+        mg_err         = np.concatenate([c_p['mg_err'],         c_h['mg_err']])
         mem_prob       = np.concatenate([c_p['mem_prob'],       c_h['mem_prob']])
         gaia_ids       = np.concatenate([np.asarray(c_p['gaia_ids']),
                                          np.asarray(c_h['gaia_ids'])])
@@ -1933,7 +1955,7 @@ def main():
         c = _load_cache_with_csv_fallback(args.load_latents, args.age_csv)
         latent_vectors = c['latent_vectors']
         ages, bprp0, bprp0_err = c['ages'], c['bprp0'], c['bprp0_err']
-        mg, mem_prob = c['mg'], c['mem_prob']
+        mg, mg_err, mem_prob = c['mg'], c['mg_err'], c['mem_prob']
         gaia_ids, tic_ids, sectors = c['gaia_ids'], c['tic_ids'], c['sectors']
         cached_cross_sector_latents = c['cross_sector_latents']
         cached_cross_sector_tic_ids = c['cross_sector_tic_ids']
@@ -1941,7 +1963,7 @@ def main():
         if args.model_path is None:
             parser.error('--model_path is required unless --load_latents is set.')
         (latent_vectors, cached_cross_sector_latents, cached_cross_sector_tic_ids,
-         ages, bprp0, bprp0_err, mg, mem_prob, gaia_ids, tic_ids, sectors,
+         ages, bprp0, bprp0_err, mg, mg_err, mem_prob, gaia_ids, tic_ids, sectors,
          pca_latents) = load_data_fresh(
             model_path=args.model_path,
             h5_path=args.h5_path,
@@ -1973,7 +1995,7 @@ def main():
                 args.save_latents,
                 latent_vectors, ages, bprp0, bprp0_err, gaia_ids, tic_ids, sectors,
                 cached_cross_sector_latents, cached_cross_sector_tic_ids,
-                mg=mg, mem_prob=mem_prob,
+                mg=mg, mg_err=mg_err, mem_prob=mem_prob,
             )
 
     # ── Step 2: apply star aggregation ─────────────────────────────────────
@@ -1987,6 +2009,7 @@ def main():
         kfold_bprp0     = bprp0
         kfold_bprp0_err = bprp0_err
         kfold_mg        = mg
+        kfold_mg_err    = mg_err
         kfold_mem_prob  = mem_prob
         kfold_tics      = tic_ids
         kfold_source    = source
@@ -1997,6 +2020,7 @@ def main():
         kfold_bprp0     = bprp0
         kfold_bprp0_err = bprp0_err
         kfold_mg        = mg
+        kfold_mg_err    = mg_err
         kfold_mem_prob  = mem_prob
         kfold_tics      = tic_ids
         kfold_source    = source
@@ -2005,15 +2029,15 @@ def main():
     elif agg in ('latent_mean', 'latent_median', 'latent_max', 'latent_mean_std'):
         print(f'\n=== Aggregating latents ({agg}) ===')
         agg_out = aggregate_by_star(
-            latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids, gaia_ids,
+            latent_vectors, ages, bprp0, bprp0_err, mg, mg_err, mem_prob, tic_ids, gaia_ids,
             method=agg, source=source,
         )
         if source is not None:
             (kfold_latents, kfold_ages, kfold_bprp0, kfold_bprp0_err,
-             kfold_mg, kfold_mem_prob, kfold_tics, kfold_source) = agg_out
+             kfold_mg, kfold_mg_err, kfold_mem_prob, kfold_tics, kfold_source) = agg_out
         else:
             (kfold_latents, kfold_ages, kfold_bprp0, kfold_bprp0_err,
-             kfold_mg, kfold_mem_prob, kfold_tics) = agg_out
+             kfold_mg, kfold_mg_err, kfold_mem_prob, kfold_tics) = agg_out
 
     elif agg == 'cross_sector':
         print('\n=== Cross-sector hidden-state pooling ===')
@@ -2025,11 +2049,13 @@ def main():
         gaia_to_bprp0     = {g: bprp0[gaia_ids == g][0]     for g in np.unique(gaia_ids)}
         gaia_to_bprp0_err = {g: bprp0_err[gaia_ids == g][0] for g in np.unique(gaia_ids)}
         gaia_to_mg        = {g: mg[gaia_ids == g][0]        for g in np.unique(gaia_ids)}
+        gaia_to_mg_err    = {g: mg_err[gaia_ids == g][0]    for g in np.unique(gaia_ids)}
         gaia_to_mem_prob  = {g: mem_prob[gaia_ids == g][0]  for g in np.unique(gaia_ids)}
         kfold_ages      = np.array([gaia_to_age[g]       for g in kfold_tics])
         kfold_bprp0     = np.array([gaia_to_bprp0[g]     for g in kfold_tics])
         kfold_bprp0_err = np.array([gaia_to_bprp0_err[g] for g in kfold_tics])
         kfold_mg        = np.array([gaia_to_mg[g]        for g in kfold_tics])
+        kfold_mg_err    = np.array([gaia_to_mg_err[g]    for g in kfold_tics])
         kfold_mem_prob  = np.array([gaia_to_mem_prob[g]  for g in kfold_tics])
         if source is not None:
             gaia_to_source = {g: source[gaia_ids == g][0] for g in np.unique(gaia_ids)}
@@ -2037,6 +2063,30 @@ def main():
 
     else:
         raise ValueError(f'Unknown star_aggregation: {agg}')
+
+    # ── Step 2b: optional MG-only swap ─────────────────────────────────────
+    # Replace (BPRP0, BPRP0_err) with (MG, MG_err) so the flow context becomes
+    # (log10_age, MG, log10(MG_err)) without changing model classes. Filter NaNs
+    # in mg/mg_err first since hosts can have a few non-finite values.
+    if args.use_mg_only:
+        mg_ok = np.isfinite(kfold_mg) & np.isfinite(kfold_mg_err) & (kfold_mg_err > 0)
+        n_drop = (~mg_ok).sum()
+        if n_drop:
+            print(f'\n--use_mg_only: dropping {n_drop}/{len(mg_ok)} rows with NaN MG / MG_err.')
+            kfold_latents   = kfold_latents[mg_ok]
+            kfold_ages      = kfold_ages[mg_ok]
+            kfold_bprp0     = kfold_bprp0[mg_ok]
+            kfold_bprp0_err = kfold_bprp0_err[mg_ok]
+            kfold_mg        = kfold_mg[mg_ok]
+            kfold_mg_err    = kfold_mg_err[mg_ok]
+            kfold_mem_prob  = kfold_mem_prob[mg_ok]
+            kfold_tics      = kfold_tics[mg_ok]
+            if kfold_source is not None:
+                kfold_source = kfold_source[mg_ok]
+        print(f'--use_mg_only: swapping (BPRP0, BPRP0_err) ← (MG, MG_err) '
+              f'[{len(kfold_mg)} samples].')
+        kfold_bprp0     = kfold_mg
+        kfold_bprp0_err = kfold_mg_err
 
     # ── Step 3: k-fold cross-validation ────────────────────────────────────
     print('\n=== Running K-Fold Cross-Validation ===')
@@ -2091,6 +2141,7 @@ def main():
             kfold_bprp0     = kfold_bprp0[ps_mask]
             kfold_bprp0_err = kfold_bprp0_err[ps_mask]
             kfold_mg        = kfold_mg[ps_mask]
+            kfold_mg_err    = kfold_mg_err[ps_mask]
             kfold_mem_prob  = kfold_mem_prob[ps_mask]
             fold_assignments = fold_assignments[ps_mask]
             if pred_stats is not None:
@@ -2117,6 +2168,7 @@ def main():
         kfold_bprp0     = np.array([kfold_bprp0[result_tics == t][0]           for t in unique_tics])
         kfold_bprp0_err = np.array([kfold_bprp0_err[result_tics == t][0]       for t in unique_tics])
         kfold_mg        = np.array([kfold_mg[result_tics == t][0]              for t in unique_tics])
+        kfold_mg_err    = np.array([kfold_mg_err[result_tics == t][0]          for t in unique_tics])
         kfold_mem_prob  = np.array([kfold_mem_prob[result_tics == t][0]        for t in unique_tics])
         fold_assignments = np.array([fold_assignments[result_tics == t][0]     for t in unique_tics])
         result_tics     = unique_tics

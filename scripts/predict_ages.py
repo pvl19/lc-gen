@@ -44,7 +44,11 @@ from lcgen.models.MetadataAgePredictor import MetadataStandardizer
 # ---------------------------------------------------------------------------
 
 def load_and_filter_h5_metadata(h5_path: str):
-    """Read metadata from H5 and apply strict filtering (no NaN substitution)."""
+    """Read metadata from H5 and apply strict filtering (no NaN substitution).
+
+    Also reads MG_quick / MG_quick_err if present (added by add_mg_quick.py); falls
+    back to NaN-filled arrays otherwise so callers can detect missing MG metadata.
+    """
     with h5py.File(h5_path, 'r') as f:
         gaia_ids  = np.array([g.decode('utf-8').strip() for g in f['metadata']['GaiaDR3_ID'][:]])
         tic_ids   = f['metadata']['tic'][:]
@@ -52,6 +56,14 @@ def load_and_filter_h5_metadata(h5_path: str):
         bprp0     = f['metadata']['BPRP0'][:].astype(float)
         bprp0_err = f['metadata']['e_BPRP0'][:].astype(float)
         lengths   = f['length'][:]
+        if 'MG_quick' in f['metadata'].keys():
+            mg = f['metadata']['MG_quick'][:].astype(float)
+        else:
+            mg = np.full(len(tic_ids), np.nan)
+        if 'MG_quick_err' in f['metadata'].keys():
+            mg_err = f['metadata']['MG_quick_err'][:].astype(float)
+        else:
+            mg_err = np.full(len(tic_ids), np.nan)
 
     mask = (
         np.array([len(g) > 0 for g in gaia_ids])
@@ -64,8 +76,9 @@ def load_and_filter_h5_metadata(h5_path: str):
     n_total, n_valid = len(mask), int(mask.sum())
     print(f'  {n_valid}/{n_total} entries pass strict filter ({n_total - n_valid} skipped)')
     valid_indices = np.where(mask)[0]
-    return valid_indices, gaia_ids[valid_indices], tic_ids[valid_indices], \
-           sectors[valid_indices], bprp0[valid_indices], bprp0_err[valid_indices]
+    return (valid_indices, gaia_ids[valid_indices], tic_ids[valid_indices],
+            sectors[valid_indices], bprp0[valid_indices], bprp0_err[valid_indices],
+            mg[valid_indices], mg_err[valid_indices])
 
 
 def extract_latents_lazy(ae_model_path, h5_path, valid_indices, tic_ids,
@@ -186,17 +199,21 @@ def extract_latents_lazy(ae_model_path, h5_path, valid_indices, tic_ids,
 # Aggregation
 # ---------------------------------------------------------------------------
 
-def aggregate_latent_max(latents, gaia_ids, bprp0, bprp0_err):
+def aggregate_latent_max(latents, gaia_ids, bprp0, bprp0_err, mg, mg_err):
     """Element-wise max across sectors per Gaia ID."""
     unique_gids = np.unique(gaia_ids)
     star_latents, star_bprp0, star_bprp0_err = [], [], []
+    star_mg, star_mg_err = [], []
     for gid in unique_gids:
         m = gaia_ids == gid
         star_latents.append(latents[m].max(axis=0))
         star_bprp0.append(float(bprp0[m][0]))
         star_bprp0_err.append(float(bprp0_err[m][0]))
+        star_mg.append(float(mg[m][0]))
+        star_mg_err.append(float(mg_err[m][0]))
     return (np.array(star_latents), np.array(star_bprp0),
-            np.array(star_bprp0_err), unique_gids)
+            np.array(star_bprp0_err), np.array(star_mg),
+            np.array(star_mg_err), unique_gids)
 
 
 # ---------------------------------------------------------------------------
@@ -293,12 +310,14 @@ def main():
     pca_dim       = ckpt['pca_dim']
     n_folds       = ckpt['n_folds']
     encoder_type  = config.get('encoder_type', 'pca')
+    use_mg_only   = bool(config.get('use_mg_only', False))
 
     # Augment config with norm_params for model construction
     config['input_dim'] = norm_params['input_dim']
     config['latent_dim'] = norm_params['latent_dim']
 
-    print(f'  encoder_type={encoder_type}  pca_dim={pca_dim}  n_folds={n_folds}')
+    print(f'  encoder_type={encoder_type}  pca_dim={pca_dim}  n_folds={n_folds}  '
+          f'use_mg_only={use_mg_only}')
 
     # ── Get per-sector latents ───────────────────────────────────────────────
     if args.load_latents:
@@ -318,37 +337,57 @@ def main():
                     else np.full(len(gaia_ids), np.nan)
         bprp0_err = npz['bprp0_err'].astype(float) if 'bprp0_err' in npz.files \
                     else np.full(len(gaia_ids), np.nan)
+        mg        = npz['mg'].astype(float) if 'mg' in npz.files \
+                    else np.full(len(gaia_ids), np.nan)
+        mg_err    = npz['mg_err'].astype(float) if 'mg_err' in npz.files \
+                    else np.full(len(gaia_ids), np.nan)
 
-        # Fill NaN BPRP0/BPRP0_err from a metadata CSV when provided. Caches
+        # Fill NaN photometry/MG from a metadata CSV when provided. Caches
         # written before the host H5 Gaia ID repair have NaN here because the
-        # bad sci-notation IDs failed the original CSV lookup.
-        n_bad = int(np.isnan(bprp0).sum() + np.isnan(bprp0_err).sum())
+        # bad sci-notation IDs failed the original CSV lookup; older caches also
+        # predate the MG_quick / MG_quick_err columns.
+        n_bad = int(np.isnan(bprp0).sum() + np.isnan(bprp0_err).sum()
+                    + np.isnan(mg).sum() + np.isnan(mg_err).sum())
         if n_bad and args.metadata_csv:
-            print(f'  filling {n_bad} NaN BPRP0/BPRP0_err entries from {args.metadata_csv}')
+            print(f'  filling {n_bad} NaN BPRP0/MG entries from {args.metadata_csv}')
             df = pd.read_csv(args.metadata_csv)
             df['GaiaDR3_ID'] = df['GaiaDR3_ID'].astype(np.int64).astype(str)
             id_to_bprp0     = dict(zip(df['GaiaDR3_ID'], df['BPRP0']))
             id_to_bprp0_err = dict(zip(df['GaiaDR3_ID'], df['BPRP0_err']))
+            id_to_mg        = (dict(zip(df['GaiaDR3_ID'], df['MG_quick']))
+                               if 'MG_quick' in df.columns else {})
+            id_to_mg_err    = (dict(zip(df['GaiaDR3_ID'], df['MG_quick_err']))
+                               if 'MG_quick_err' in df.columns else {})
             for i, g in enumerate(gaia_ids):
                 if np.isnan(bprp0[i]):
                     bprp0[i]     = id_to_bprp0.get(g, np.nan)
                 if np.isnan(bprp0_err[i]):
                     bprp0_err[i] = id_to_bprp0_err.get(g, np.nan)
+                if np.isnan(mg[i]):
+                    mg[i]        = id_to_mg.get(g, np.nan)
+                if np.isnan(mg_err[i]):
+                    mg_err[i]    = id_to_mg_err.get(g, np.nan)
 
-        # Drop rows still missing BPRP0/BPRP0_err — predict_ages can't run on them.
-        ok = ~np.isnan(bprp0) & ~np.isnan(bprp0_err)
+        # Drop rows missing the photometry the model was trained on.
+        if use_mg_only:
+            ok = np.isfinite(mg) & np.isfinite(mg_err) & (mg_err > 0)
+            label = 'MG/MG_err'
+        else:
+            ok = np.isfinite(bprp0) & np.isfinite(bprp0_err) & (bprp0_err > 0)
+            label = 'BPRP0/BPRP0_err'
         if (~ok).any():
-            print(f'  dropping {(~ok).sum()}/{len(ok)} rows with NaN BPRP0/BPRP0_err')
-            latents, gaia_ids, bprp0, bprp0_err = (
+            print(f'  dropping {(~ok).sum()}/{len(ok)} rows with bad {label}')
+            latents, gaia_ids, bprp0, bprp0_err, mg, mg_err = (
                 latents[ok], gaia_ids[ok], bprp0[ok], bprp0_err[ok],
+                mg[ok], mg_err[ok],
             )
         print(f'  {len(gaia_ids)} sectors, {len(np.unique(gaia_ids))} unique stars, dim={latents.shape[1]}')
     else:
         if args.ae_model is None:
             raise ValueError('--ae_model is required unless --load_latents is given')
         print(f'\n=== Loading H5 metadata: {args.h5_path} ===')
-        valid_indices, gaia_ids, tic_ids, _, bprp0, bprp0_err = \
-            load_and_filter_h5_metadata(args.h5_path)
+        (valid_indices, gaia_ids, tic_ids, _, bprp0, bprp0_err,
+         mg, mg_err) = load_and_filter_h5_metadata(args.h5_path)
         print(f'\n=== Extracting latents ===')
         latents = extract_latents_lazy(
             args.ae_model, args.h5_path, valid_indices, tic_ids,
@@ -360,14 +399,32 @@ def main():
             Path(args.save_latents).parent.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(args.save_latents,
                                 latents=latents, gaia_ids=gaia_ids,
-                                bprp0=bprp0, bprp0_err=bprp0_err)
+                                bprp0=bprp0, bprp0_err=bprp0_err,
+                                mg=mg, mg_err=mg_err)
             print(f'Saved latents → {args.save_latents}')
 
     # ── Aggregate per-sector → one latent per star (latent_max) ─────────────
     print('\n=== Aggregating by Gaia ID (latent_max) ===')
-    star_latents, star_bprp0, star_bprp0_err, star_gaia_ids = \
-        aggregate_latent_max(latents, gaia_ids, bprp0, bprp0_err)
+    (star_latents, star_bprp0, star_bprp0_err, star_mg, star_mg_err,
+     star_gaia_ids) = aggregate_latent_max(latents, gaia_ids, bprp0, bprp0_err,
+                                            mg, mg_err)
     print(f'  {len(star_gaia_ids)} unique stars')
+
+    # ── Optional MG-only swap (must mirror training) ───────────────────────
+    if use_mg_only:
+        ok = np.isfinite(star_mg) & np.isfinite(star_mg_err) & (star_mg_err > 0)
+        if (~ok).any():
+            print(f'  --use_mg_only: dropping {(~ok).sum()}/{len(ok)} stars with bad MG/MG_err')
+            star_latents   = star_latents[ok]
+            star_bprp0     = star_bprp0[ok]
+            star_bprp0_err = star_bprp0_err[ok]
+            star_mg        = star_mg[ok]
+            star_mg_err    = star_mg_err[ok]
+            star_gaia_ids  = star_gaia_ids[ok]
+        print(f'  --use_mg_only: swapping (BPRP0, BPRP0_err) ← (MG, MG_err) '
+              f'[{len(star_gaia_ids)} stars].')
+        star_bprp0     = star_mg
+        star_bprp0_err = star_mg_err
 
     # ── Normalise latents ────────────────────────────────────────────────────
     X_mean = norm_params['X_mean']
@@ -467,6 +524,7 @@ def main():
         'load_latents':   args.load_latents,
         'save_latents':   args.save_latents,
         'encoder_type':   encoder_type,
+        'use_mg_only':    use_mg_only,
         'pca_dim':        pca_dim,
         'n_folds':        n_folds,
         'hidden_size':    args.hidden_size,

@@ -51,7 +51,8 @@ H5_PATH=${9:-"final_pretrain/timeseries_pretrain.h5"}
 SAVE_LATENTS=${10:-""}   # e.g. output/latents_cache/baseline_long_multiscale.npz
 LOAD_LATENTS=${11:-"final_model/parallel_fixed/e110/latents_pretrain.npz"}   # e.g. output/latents_cache/baseline_long_multiscale.npz
 ENCODER_TYPE=${12:-"mlp"}   # pca, mlp, or linear
-USE_MG=${13:-"false"}       # true to include log10(MG_quick) as 4th flow context variable
+USE_MG=${13:-"false"}       # true to include MG_quick as 4th flow context variable
+USE_MG_ONLY=${14:-"false"}  # true to swap (BPRP0, BPRP0_err) for (MG, MG_err); mutex with USE_MG
 MLP_ENCODER_HIDDEN="128 64"
 AUX_LOSS_WEIGHT=1.0
 DROPOUT=0.1
@@ -77,6 +78,7 @@ echo "  Star aggregation: ${STAR_AGGREGATION}"
 echo "  Encoder type:     ${ENCODER_TYPE}"
 echo "  Training stages:  ${TRAINING_STAGES}"
 echo "  Use MG:           ${USE_MG}"
+echo "  Use MG only:      ${USE_MG_ONLY}"
 echo "  Use metadata:     ${USE_METADATA}"
 echo "  Use conv:         ${USE_CONV} (${CONV_TYPE})"
 echo "  Require Prot:     ${REQUIRE_PROT}"
@@ -145,6 +147,10 @@ fi
 
 if [ "${USE_MG}" = "true" ]; then
   CMD="${CMD} --use_mg"
+fi
+
+if [ "${USE_MG_ONLY}" = "true" ]; then
+  CMD="${CMD} --use_mg_only"
 fi
 
 if [ "${TRAIN_FULL}" = "true" ]; then
