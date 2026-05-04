@@ -26,12 +26,12 @@ from lcgen.models.MetadataAgePredictor import MetadataStandardizer
 
 def save_latents_cache(cache_path: str, latent_vectors, ages, bprp0,
                        gaia_ids, tic_ids, sectors,
-                       bprp0_err=None, mg=None, mem_prob=None):
+                       bprp0_err=None, mg=None, mg_err=None, mem_prob=None):
     """Save latents + identifiers to npz in the canonical kfold format.
 
     The resulting file is a drop-in cache for kfold_age_inference.py's
-    ``--load_latents``. Optional fields (bprp0_err, mg, mem_prob) are written
-    when supplied; their absence triggers kfold's CSV-fill fallback.
+    ``--load_latents``. Optional fields (bprp0_err, mg, mg_err, mem_prob) are
+    written when supplied; their absence triggers kfold's CSV-fill fallback.
     """
     Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
     save_dict = dict(
@@ -46,6 +46,8 @@ def save_latents_cache(cache_path: str, latent_vectors, ages, bprp0,
         save_dict['bprp0_err'] = np.asarray(bprp0_err)
     if mg is not None:
         save_dict['mg'] = np.asarray(mg)
+    if mg_err is not None:
+        save_dict['mg_err'] = np.asarray(mg_err)
     if mem_prob is not None:
         save_dict['mem_prob'] = np.asarray(mem_prob)
     np.savez(cache_path, **save_dict)
@@ -102,13 +104,14 @@ def load_latents_cache(cache_path: str, age_csv_paths=None, return_extras: bool 
     sectors = d['sectors'] if 'sectors' in keys else np.full(n, -1, dtype=np.int64)
     bprp0_err = d['bprp0_err'] if 'bprp0_err' in keys else np.full(n, np.nan)
     mg        = d['mg']        if 'mg'        in keys else np.full(n, np.nan)
+    mg_err    = d['mg_err']    if 'mg_err'    in keys else np.full(n, np.nan)
     mem_prob  = d['mem_prob']  if 'mem_prob'  in keys else np.full(n, np.nan)
 
     n_with_age = int(np.sum(~np.isnan(ages)))
     print(f'Loaded latents cache ← {cache_path} ({n} samples, latent_dim={latent_vectors.shape[1]}, '
           f'ages: {n_with_age}/{n}{" — filled from CSV" if "ages" not in keys else ""})')
     if return_extras:
-        return latent_vectors, ages, bprp0, gaia_ids, tic_ids, sectors, bprp0_err, mg, mem_prob
+        return latent_vectors, ages, bprp0, gaia_ids, tic_ids, sectors, bprp0_err, mg, mg_err, mem_prob
     return latent_vectors, ages, bprp0, gaia_ids, tic_ids, sectors
 
 
@@ -467,12 +470,8 @@ def load_ages(h5_path: str, csv_path: str, sample_indices: np.ndarray = None):
         csv_path: path to phot_all.csv with stellar ages and BPRP0 keyed by GaiaDR3_ID
         sample_indices: specific indices to load (None = all)
 
-    Returns:
-        ages: array of ages in Myr (NaN for light curves without age data)
-        bprp0: array of BPRP0 values (NaN for light curves without data)
-        gaia_ids: array of GaiaDR3_ID strings for each light curve
-        tic_ids: array of TESS TIC IDs (int64) for each light curve
-        sectors: array of TESS sector numbers (int64) for each light curve
+    Returns 10-tuple: ages, bprp0, bprp0_err, mg, mg_err, mem_prob, gaia_ids,
+    tic_ids, sectors. All metadata arrays are NaN where the CSV lookup fails.
     """
     # Read GaiaDR3_IDs, TIC IDs, and sectors from H5 metadata
     with h5py.File(h5_path, 'r') as f:
@@ -513,25 +512,28 @@ def load_ages(h5_path: str, csv_path: str, sample_indices: np.ndarray = None):
     id_to_bprp0     = dict(zip(df['GaiaDR3_ID'], df['BPRP0']))         if 'BPRP0'        in df.columns else {}
     id_to_bprp0_err = dict(zip(df['GaiaDR3_ID'], df['BPRP0_err']))     if 'BPRP0_err'    in df.columns else {}
     id_to_mg        = dict(zip(df['GaiaDR3_ID'], df['MG_quick']))      if 'MG_quick'     in df.columns else {}
+    id_to_mg_err    = dict(zip(df['GaiaDR3_ID'], df['MG_quick_err']))  if 'MG_quick_err' in df.columns else {}
     id_to_mem_prob  = dict(zip(df['GaiaDR3_ID'], df['mem_prob_val']))  if 'mem_prob_val' in df.columns else {}
 
     # TIC-based fallback maps (only for CSVs that carry TIC_ID, e.g. host_all_metadata.csv).
     # Used to fill rows whose Gaia ID didn't match — robust to sci-notation corruption.
     df_tic = df[df.get('TIC_ID', pd.Series(dtype=int)).notna()] if 'TIC_ID' in df.columns else None
-    tic_to_bprp0     = dict(zip(df_tic['TIC_ID'].astype('int64'), df_tic['BPRP0']))     if df_tic is not None and 'BPRP0'     in df.columns else {}
-    tic_to_bprp0_err = dict(zip(df_tic['TIC_ID'].astype('int64'), df_tic['BPRP0_err'])) if df_tic is not None and 'BPRP0_err' in df.columns else {}
-    tic_to_mg        = dict(zip(df_tic['TIC_ID'].astype('int64'), df_tic['MG_quick']))  if df_tic is not None and 'MG_quick'  in df.columns else {}
+    tic_to_bprp0     = dict(zip(df_tic['TIC_ID'].astype('int64'), df_tic['BPRP0']))         if df_tic is not None and 'BPRP0'        in df.columns else {}
+    tic_to_bprp0_err = dict(zip(df_tic['TIC_ID'].astype('int64'), df_tic['BPRP0_err']))     if df_tic is not None and 'BPRP0_err'    in df.columns else {}
+    tic_to_mg        = dict(zip(df_tic['TIC_ID'].astype('int64'), df_tic['MG_quick']))      if df_tic is not None and 'MG_quick'     in df.columns else {}
+    tic_to_mg_err    = dict(zip(df_tic['TIC_ID'].astype('int64'), df_tic['MG_quick_err']))  if df_tic is not None and 'MG_quick_err' in df.columns else {}
 
     ages      = np.array([id_to_age.get(gid, np.nan)       for gid       in gaia_ids],          dtype=float)
     bprp0     = np.array([id_to_bprp0.get(gid, tic_to_bprp0.get(int(t), np.nan))         for gid, t in zip(gaia_ids, tic_ids)], dtype=float)
     bprp0_err = np.array([id_to_bprp0_err.get(gid, tic_to_bprp0_err.get(int(t), np.nan)) for gid, t in zip(gaia_ids, tic_ids)], dtype=float)
     mg        = np.array([id_to_mg.get(gid, tic_to_mg.get(int(t), np.nan))               for gid, t in zip(gaia_ids, tic_ids)], dtype=float)
+    mg_err    = np.array([id_to_mg_err.get(gid, tic_to_mg_err.get(int(t), np.nan))       for gid, t in zip(gaia_ids, tic_ids)], dtype=float)
     mem_prob  = np.array([id_to_mem_prob.get(gid, np.nan)  for gid       in gaia_ids],          dtype=float)
 
     n_with_age = np.sum(~np.isnan(ages))
     print(f'Loaded ages for {n_with_age}/{len(ages)} light curves ({100*n_with_age/len(ages):.1f}%)')
 
-    return ages, bprp0, bprp0_err, mg, mem_prob, gaia_ids, tic_ids, sectors
+    return ages, bprp0, bprp0_err, mg, mg_err, mem_prob, gaia_ids, tic_ids, sectors
 
 
 def plot_umap(latent_vectors: np.ndarray, ages: np.ndarray, output_path: str,
@@ -708,11 +710,11 @@ def main():
     if args.load_latents is not None:
         # Cache mode: skip model loading and H5 extraction entirely.
         for i, cache_path in enumerate(args.load_latents):
-            lv, a, b, g, t, s, be, mgv, mp = load_latents_cache(
+            lv, a, b, g, t, s, be, mgv, mge, mp = load_latents_cache(
                 cache_path, age_csv_paths=args.age_csv_path, return_extras=True)
             if args.save_latents is not None:
                 save_latents_cache(args.save_latents[i], lv, a, b, g, t, s,
-                                   bprp0_err=be, mg=mgv, mem_prob=mp)
+                                   bprp0_err=be, mg=mgv, mg_err=mge, mem_prob=mp)
             all_latents.append(lv)
             all_ages.append(a); all_bprp0.append(b)
             all_gaia_ids.append(g); all_tic_ids.append(t); all_sectors.append(s)
@@ -771,13 +773,13 @@ def main():
                 use_conv_channels=args.use_conv_channels,
             )
 
-            ages, bprp0, bprp0_err, mg, mem_prob, gaia_ids, tic_ids, sectors = load_ages(
+            ages, bprp0, bprp0_err, mg, mg_err, mem_prob, gaia_ids, tic_ids, sectors = load_ages(
                 h5_path, args.age_csv_path, sample_indices=sample_indices)
 
             if args.save_latents is not None:
                 save_latents_cache(args.save_latents[i],
                                    latent_vectors, ages, bprp0, gaia_ids, tic_ids, sectors,
-                                   bprp0_err=bprp0_err, mg=mg, mem_prob=mem_prob)
+                                   bprp0_err=bprp0_err, mg=mg, mg_err=mg_err, mem_prob=mem_prob)
 
             all_latents.append(latent_vectors)
             all_ages.append(ages); all_bprp0.append(bprp0)
