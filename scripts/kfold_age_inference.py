@@ -261,7 +261,7 @@ class AgePredictorMLP(nn.Module):
             aux_scale = aux.detach().abs().clamp(min=1e-4)
             loss = nll + self.aux_loss_weight * (nll_scale / aux_scale) * aux
 
-        if self.variance_reg_weight > 0:
+        if self.variance_reg_weight > 0 and z.shape[0] > 1:
             std      = z.std(dim=0)
             var_loss = torch.relu(1.0 - std).mean()
             loss     = loss + self.variance_reg_weight * var_loss
@@ -1245,6 +1245,10 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
         # Joint training (original behavior)
         _run_stage(list(model.parameters()), n_epochs, lr, loss_mode='full')
 
+    if best_state is None:
+        print('      Warning: val NLL never improved from inf (possible NaN loss). '
+              'Using final model weights as fallback.')
+        best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
     model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
     model.eval()
     with torch.no_grad():
