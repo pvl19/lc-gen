@@ -2222,14 +2222,20 @@ def main():
 
         print('\nAveraging per-sector predictions per star...')
         unique_tics = np.unique(result_tics)
-        predictions     = np.array([predictions[result_tics == t].mean()       for t in unique_tics])
-        true_ages       = np.array([true_ages[result_tics == t][0]             for t in unique_tics])
-        kfold_bprp0     = np.array([kfold_bprp0[result_tics == t][0]           for t in unique_tics])
-        kfold_bprp0_err = np.array([kfold_bprp0_err[result_tics == t][0]       for t in unique_tics])
-        kfold_mg        = np.array([kfold_mg[result_tics == t][0]              for t in unique_tics])
-        kfold_mg_err    = np.array([kfold_mg_err[result_tics == t][0]          for t in unique_tics])
-        kfold_mem_prob  = np.array([kfold_mem_prob[result_tics == t][0]        for t in unique_tics])
-        fold_assignments = np.array([fold_assignments[result_tics == t][0]     for t in unique_tics])
+        per_sector_tics = result_tics
+        predictions     = np.array([predictions[per_sector_tics == t].mean()       for t in unique_tics])
+        true_ages       = np.array([true_ages[per_sector_tics == t][0]             for t in unique_tics])
+        kfold_bprp0     = np.array([kfold_bprp0[per_sector_tics == t][0]           for t in unique_tics])
+        kfold_bprp0_err = np.array([kfold_bprp0_err[per_sector_tics == t][0]       for t in unique_tics])
+        kfold_mg        = np.array([kfold_mg[per_sector_tics == t][0]              for t in unique_tics])
+        kfold_mg_err    = np.array([kfold_mg_err[per_sector_tics == t][0]          for t in unique_tics])
+        kfold_mem_prob  = np.array([kfold_mem_prob[per_sector_tics == t][0]        for t in unique_tics])
+        fold_assignments = np.array([fold_assignments[per_sector_tics == t][0]     for t in unique_tics])
+        if pred_stats is not None:
+            pred_stats = {
+                k: np.array([v[per_sector_tics == t].mean() for t in unique_tics])
+                for k, v in pred_stats.items()
+            }
         result_tics     = unique_tics
         print(f'Averaged to {len(unique_tics)} unique stars')
 
