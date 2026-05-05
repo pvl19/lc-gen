@@ -1728,6 +1728,17 @@ def main():
                         help='Use (MG, MG_err) instead of (BPRP0, BPRP0_err) as flow context. '
                              'Implemented as a swap before training so the flow still sees a '
                              '3-context input. Mutually exclusive with --use_mg.')
+
+    # Subset filtering
+    parser.add_argument('--subset_col', type=str, default=None,
+                        help='Column name to filter on (e.g. "ref"). Applied after loading '
+                             'latents; keeps only rows whose value is in --subset_val.')
+    parser.add_argument('--subset_val', type=str, nargs='+', default=None,
+                        help='Allowed value(s) for --subset_col (e.g. "ChronoFlow"). '
+                             'Multiple values = OR logic.')
+    parser.add_argument('--subset_csv', type=str, default=None,
+                        help='CSV file containing --subset_col, joined on GaiaDR3_ID. '
+                             'Defaults to --age_csv if omitted.')
     parser.add_argument('--lr',                   type=float, default=1e-3)
     parser.add_argument('--lr_decay_rate',        type=float, default=None,
                         help='Exponential decay rate per epoch for the LR scheduler. '
@@ -2001,6 +2012,38 @@ def main():
                 cached_cross_sector_latents, cached_cross_sector_tic_ids,
                 mg=mg, mg_err=mg_err, mem_prob=mem_prob,
             )
+
+    # ── Step 1b: optional subset filter ────────────────────────────────────
+    if args.subset_col and args.subset_val:
+        csv_for_filter = args.subset_csv or args.age_csv
+        df_sub = pd.read_csv(csv_for_filter)
+        df_sub['GaiaDR3_ID'] = df_sub['GaiaDR3_ID'].astype(str)
+        if args.subset_col not in df_sub.columns:
+            parser.error(f'--subset_col "{args.subset_col}" not found in {csv_for_filter}. '
+                         f'Available columns: {list(df_sub.columns)}')
+        allowed_ids = set(
+            df_sub.loc[df_sub[args.subset_col].isin(args.subset_val), 'GaiaDR3_ID']
+        )
+        keep = np.array([g in allowed_ids for g in gaia_ids])
+        n_before = len(ages)
+        latent_vectors = latent_vectors[keep]
+        ages      = ages[keep]
+        bprp0     = bprp0[keep]
+        bprp0_err = bprp0_err[keep]
+        mg        = mg[keep]
+        mg_err    = mg_err[keep]
+        mem_prob  = mem_prob[keep]
+        gaia_ids  = gaia_ids[keep]
+        tic_ids   = tic_ids[keep]
+        sectors   = sectors[keep]
+        if source is not None:
+            source = source[keep]
+        n_after = len(ages)
+        print(f'\nSubset filter: {args.subset_col} in {args.subset_val} '
+              f'→ {n_after}/{n_before} per-sector samples '
+              f'({len(np.unique(gaia_ids))} unique stars)')
+        if n_after == 0:
+            raise ValueError('Subset filter removed all samples — check --subset_col / --subset_val / --subset_csv.')
 
     # ── Step 2: apply star aggregation ─────────────────────────────────────
     agg = args.star_aggregation

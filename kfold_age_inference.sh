@@ -42,7 +42,7 @@
 MODEL_PATH=${1:-"final_model/parallel_fixed/e110/best_model.pt"}
 VERSION=${2:-"default"}
 POOLING_MODE=${3:-"multiscale"}
-STAR_AGGREGATION=${4:-"latent_max"}
+STAR_AGGREGATION=${4:-"predict_mean"}
 USE_METADATA=${5:-"true"}
 USE_CONV=${6:-"true"}
 CONV_TYPE=${7:-"unet"}
@@ -53,6 +53,14 @@ LOAD_LATENTS=${11:-"final_model/parallel_fixed/e110/latents_pretrain.npz"}   # e
 ENCODER_TYPE=${12:-"mlp"}   # pca, mlp, or linear
 USE_MG=${13:-"false"}       # true to include MG_quick as 4th flow context variable
 USE_MG_ONLY=${14:-"false"}  # true to swap (BPRP0, BPRP0_err) for (MG, MG_err); mutex with USE_MG
+
+# Optional subset filter — keep only stars where SUBSET_COL is one of SUBSET_VAL.
+# Leave SUBSET_COL empty to train on all labeled stars.
+# Example: SUBSET_COL="ref"  SUBSET_VAL="ChronoFlow"  SUBSET_CSV="final_pretrain/metadata.csv"
+SUBSET_COL=""
+SUBSET_VAL=""
+SUBSET_CSV=""   # CSV with SUBSET_COL joined on GaiaDR3_ID; defaults to --age_csv if blank
+
 MLP_ENCODER_HIDDEN="128 64"
 AUX_LOSS_WEIGHT=1.0
 DROPOUT=0.1
@@ -155,6 +163,13 @@ fi
 
 if [ "${TRAIN_FULL}" = "true" ]; then
   CMD="${CMD} --train_full"
+fi
+
+if [ -n "${SUBSET_COL}" ] && [ -n "${SUBSET_VAL}" ]; then
+  CMD="${CMD} --subset_col ${SUBSET_COL} --subset_val ${SUBSET_VAL}"
+  if [ -n "${SUBSET_CSV}" ]; then
+    CMD="${CMD} --subset_csv ${SUBSET_CSV}"
+  fi
 fi
 
 eval $CMD
