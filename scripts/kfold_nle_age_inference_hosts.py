@@ -161,11 +161,9 @@ def main():
     # normalized scale — feed it to the flow directly, no log10 transform.
     skip_log10 = (args.host_age_col != 'st_age')
     if skip_log10:
-        # Pad the data range by 25% on each side so the posterior grid covers
-        # the tails. Hardcoded to ±0.25 × span — ample for z-scored ages.
-        span = float(star_age.max() - star_age.min())
-        pad  = max(0.25 * span, 0.5)
-        age_grid_range = (float(star_age.min() - pad), float(star_age.max() + pad))
+        # Fixed grid for the normalized age — wide enough to cover the
+        # observed st_age_norm range (~[-2, 4.5]) plus comfortable margin.
+        age_grid_range = (-5.0, 10.0)
         age_label = f'age ({args.host_age_col})'
         print(f'Skipping log10: feeding {args.host_age_col} directly to the flow. '
               f'Grid range: [{age_grid_range[0]:.2f}, {age_grid_range[1]:.2f}]')
