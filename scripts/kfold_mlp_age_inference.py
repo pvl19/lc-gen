@@ -57,11 +57,14 @@ def load_host_latents(cache_path: str, age_csv: str, metadata_csv: str | None,
 
     df_age = pd.read_csv(age_csv)
     df_age['GaiaDR3_ID'] = df_age['GaiaDR3_ID'].astype(str)
-    if age_col in df_age.columns and 'age_Myr' not in df_age.columns:
-        df_age['age_Myr'] = df_age[age_col].astype(float) * 1000.0  # Gyr → Myr
-    elif age_col not in df_age.columns and 'age_Myr' not in df_age.columns:
-        raise KeyError(f"age column {age_col!r} not in {age_csv} "
-                       f"(have: {list(df_age.columns)})")
+    if 'age_Myr' not in df_age.columns:
+        if age_col not in df_age.columns:
+            raise KeyError(f"age column {age_col!r} not in {age_csv} "
+                           f"(have: {list(df_age.columns)})")
+        # 'st_age' is in Gyr (NASA Exoplanet Archive convention) → convert to Myr.
+        # Any other column (e.g. 'st_age_norm') is taken as-is in Myr-equivalent units.
+        scale = 1000.0 if age_col == 'st_age' else 1.0
+        df_age['age_Myr'] = df_age[age_col].astype(float) * scale
 
     if metadata_csv is not None:
         df_meta = pd.read_csv(metadata_csv)
