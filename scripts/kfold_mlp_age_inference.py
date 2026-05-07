@@ -36,12 +36,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_host_latents(cache_path: str, age_csv: str, metadata_csv: str | None):
+def load_host_latents(cache_path: str, age_csv: str, metadata_csv: str | None,
+                      age_col: str = 'st_age'):
     """Load host latents and join ages/BPRP0/BPRP0_err/MG from CSVs by GaiaDR3_ID.
 
     Accepts both cache schemas:
       - kfold/UMAP: latent_vectors, gaia_ids, [ages, bprp0, ...]
       - predict_ages: latents, gaia_ids, bprp0, [bprp0_err]
+
+    `age_col` selects which CSV column carries the (Gyr) age — defaults to
+    'st_age', set to 'st_age_norm' for the normalized archive ages.
     """
     d = np.load(cache_path, allow_pickle=True)
     keys = set(d.keys())
@@ -53,8 +57,11 @@ def load_host_latents(cache_path: str, age_csv: str, metadata_csv: str | None):
 
     df_age = pd.read_csv(age_csv)
     df_age['GaiaDR3_ID'] = df_age['GaiaDR3_ID'].astype(str)
-    if 'st_age' in df_age.columns and 'age_Myr' not in df_age.columns:
-        df_age['age_Myr'] = df_age['st_age'].astype(float) * 1000.0  # Gyr → Myr
+    if age_col in df_age.columns and 'age_Myr' not in df_age.columns:
+        df_age['age_Myr'] = df_age[age_col].astype(float) * 1000.0  # Gyr → Myr
+    elif age_col not in df_age.columns and 'age_Myr' not in df_age.columns:
+        raise KeyError(f"age column {age_col!r} not in {age_csv} "
+                       f"(have: {list(df_age.columns)})")
 
     if metadata_csv is not None:
         df_meta = pd.read_csv(metadata_csv)

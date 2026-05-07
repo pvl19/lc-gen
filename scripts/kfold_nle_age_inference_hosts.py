@@ -77,6 +77,8 @@ def main():
     parser.add_argument('--load_latents', type=str, required=True,
                         help='Path to host latents npz (kfold or predict_ages format).')
     parser.add_argument('--host_age_csv', type=str, required=True)
+    parser.add_argument('--host_age_col', type=str, default='st_age',
+                        help="CSV column carrying the host age in Gyr (e.g. st_age, st_age_norm).")
     parser.add_argument('--host_metadata_csv', type=str, default=None)
     parser.add_argument('--output_dir', type=str, required=True)
 
@@ -133,7 +135,8 @@ def main():
 
     # 1. Load + aggregate
     latents, ages, bprp0, bprp0_err, mg, gaia_ids = load_host_latents(
-        args.load_latents, args.host_age_csv, args.host_metadata_csv)
+        args.load_latents, args.host_age_csv, args.host_metadata_csv,
+        age_col=args.host_age_col)
 
     valid = ~np.isnan(ages) & ~np.isnan(bprp0) & ~np.isnan(bprp0_err)
     if args.use_mg:
