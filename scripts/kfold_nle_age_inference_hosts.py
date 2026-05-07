@@ -163,7 +163,7 @@ def main():
     if skip_log10:
         # Fixed grid for the normalized age — wide enough to cover the
         # observed st_age_norm range (~[-2, 4.5]) plus comfortable margin.
-        age_grid_range = (-5.0, 10.0)
+        age_grid_range = (-2.5, 5.0)
         age_label = f'age ({args.host_age_col})'
         print(f'Skipping log10: feeding {args.host_age_col} directly to the flow. '
               f'Grid range: [{age_grid_range[0]:.2f}, {age_grid_range[1]:.2f}]')
