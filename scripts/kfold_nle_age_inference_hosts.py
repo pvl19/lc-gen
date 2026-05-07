@@ -97,6 +97,12 @@ def main():
                         help='Per-star membership probability fed to the outlier model. '
                              'Default 1.0 (rely solely on the static 5%% outlier prior). '
                              'Set <1.0 to soften the assumption that hosts are inliers.')
+    parser.add_argument('--prediction_mode', type=str, default='nle',
+                        choices=['nle', 'npe'],
+                        help="'nle': flow models p(z | age, colours); posterior via Bayes "
+                             "on a likelihood grid. 'npe': flow models p(age | z, colours) "
+                             "directly — bottleneck enters as flow context, age is the "
+                             "1D output. NPE requires --encoder_type mlp or linear.")
 
     parser.add_argument('--n_folds', type=int, default=10)
     parser.add_argument('--seed', type=int, default=42)
@@ -238,6 +244,7 @@ def main():
         age_grid_range=age_grid_range,
         age_err=star_age_err,
         k_age_samples=args.k_age_samples,
+        prediction_mode=args.prediction_mode,
     )
 
     # 3. Plots + predictions

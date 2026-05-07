@@ -367,6 +367,196 @@ class AgePredictorMLP(nn.Module):
         }
 
 
+class AgePredictorNPE(nn.Module):
+    """Neural Posterior Estimation: models p(log10_age | bottleneck, BPRP0,
+    log10(BPRP0_err), [log10(MG)]).
+
+    Inverts the NLE construction in AgePredictorMLP — the flow output is a 1D
+    distribution over age, conditioned on the latent bottleneck *and* the colour
+    features. This avoids modelling p(z | …) over a high-dim latent and instead
+    directly amortises the posterior, which is what we ultimately use for
+    inference anyway.
+
+    Architecture:
+        latent (input_dim) → MLP encoder → bottleneck (LayerNorm) ┐
+                                                                  │
+        context = [bottleneck ∥ bprp0 ∥ log_bprp0_err [∥ log_mg]] ┘
+                                            │
+                                            ▼
+                            NSF flow → p(log10_age | context)
+
+    Per-star outlier mixture: a uniform distribution over the configured age
+    grid plays the same role as the standard-normal background in NLE — it
+    protects the flow from being pulled by stars whose archive age is wrong
+    (rather than just noisy; archive σ already enters via Gaussian samples).
+    """
+
+    def __init__(self, input_dim: int, bottleneck_dim: int,
+                 mlp_hidden: list = None,
+                 flow_transforms: int = 8,
+                 flow_hidden_features: list = None,
+                 aux_loss_weight: float = 1.0,
+                 use_mg: bool = False,
+                 dropout: float = 0.1,
+                 variance_reg_weight: float = 0.0,
+                 age_grid_range: tuple = PRIOR_LOGA_MYR):
+        super().__init__()
+        if zuko is None:
+            raise ImportError("zuko is required for the flow head. Install with: pip install zuko")
+        if mlp_hidden is None:
+            mlp_hidden = [256, 128]
+        if flow_hidden_features is None:
+            flow_hidden_features = [64, 64]
+
+        self.bottleneck_dim      = bottleneck_dim
+        self.aux_loss_weight     = aux_loss_weight
+        self.variance_reg_weight = variance_reg_weight
+        self.use_mg              = use_mg
+        self.register_buffer('_grid_min',
+                             torch.tensor(float(age_grid_range[0]), dtype=torch.float32))
+        self.register_buffer('_grid_max',
+                             torch.tensor(float(age_grid_range[1]), dtype=torch.float32))
+
+        n_color     = 3 if use_mg else 2  # bprp0, log_bprp0_err [, log_mg]
+        context_dim = bottleneck_dim + n_color
+
+        # MLP encoder (mirrors AgePredictorMLP)
+        layers = []
+        prev = input_dim
+        for h in mlp_hidden:
+            layers += [nn.Linear(prev, h), nn.ReLU(), nn.Dropout(dropout)]
+            prev = h
+        layers += [nn.Linear(prev, bottleneck_dim), nn.LayerNorm(bottleneck_dim)]
+        self.encoder = nn.Sequential(*layers)
+
+        # Auxiliary linear age head — same role as in AgePredictorMLP: gives the
+        # encoder a direct age gradient during stage 1 / aux-only mode so the
+        # bottleneck cannot collapse into age-irrelevant directions.
+        self.aux_age_head = nn.Linear(bottleneck_dim, 1)
+
+        # 1D NSF flow over log10_age, conditioned on (bottleneck ∥ colours)
+        self.flow = zuko.flows.NSF(
+            features=1,
+            context=context_dim,
+            transforms=flow_transforms,
+            hidden_features=flow_hidden_features,
+        )
+
+    def _build_context(self, z: torch.Tensor, bprp0: torch.Tensor,
+                        log_bprp0_err: torch.Tensor,
+                        log_mg: torch.Tensor = None) -> torch.Tensor:
+        parts = [z, bprp0.unsqueeze(-1), log_bprp0_err.unsqueeze(-1)]
+        if self.use_mg:
+            parts.append(log_mg.unsqueeze(-1))
+        return torch.cat(parts, dim=-1)
+
+    def _per_sample_nll(self, log_prob_flow: torch.Tensor,
+                         mem_prob: torch.Tensor = None) -> torch.Tensor:
+        """Per-sample NLL under the flow + uniform-over-grid outlier mixture."""
+        if mem_prob is None:
+            p_mem = P_CLUSTER_MEM
+        else:
+            p_mem = torch.where(torch.isnan(mem_prob),
+                                torch.full_like(mem_prob, P_CLUSTER_MEM), mem_prob)
+        nf_weight    = p_mem * (1.0 - P_OUTLIER)
+        ln_p_outlier = -torch.log(self._grid_max - self._grid_min)
+        ln_p_outlier = ln_p_outlier.expand_as(log_prob_flow)
+        ln_p_combined = torch.logsumexp(
+            torch.stack([
+                torch.log(nf_weight)       + log_prob_flow,
+                torch.log(1.0 - nf_weight) + ln_p_outlier,
+            ], dim=0), dim=0
+        )
+        return -ln_p_combined  # (N,)
+
+    def _flow_nll(self, z: torch.Tensor, log_age: torch.Tensor,
+                  bprp0: torch.Tensor, log_bprp0_err: torch.Tensor,
+                  log_mg: torch.Tensor = None,
+                  mem_prob: torch.Tensor = None) -> torch.Tensor:
+        """Flow NLL with optional per-star multi-sample averaging.
+
+        log_age (B,)    → standard mean over batch.
+        log_age (B, K)  → expand context over K samples, mean per star, then per batch.
+        """
+        if log_age.dim() == 2:
+            B, K   = log_age.shape
+            ctx    = self._build_context(z, bprp0, log_bprp0_err, log_mg)         # (B, C)
+            ctx_f  = ctx.unsqueeze(1).expand(B, K, -1).reshape(B * K, -1)
+            target = log_age.reshape(B * K, 1)
+            mp_f   = (mem_prob.unsqueeze(1).expand(B, K).reshape(B * K)
+                      if mem_prob is not None else None)
+            log_prob   = self.flow(ctx_f).log_prob(target)
+            per_sample = self._per_sample_nll(log_prob, mp_f)
+            return per_sample.reshape(B, K).mean(dim=1).mean()
+
+        ctx      = self._build_context(z, bprp0, log_bprp0_err, log_mg)
+        target   = log_age.unsqueeze(-1)
+        log_prob = self.flow(ctx).log_prob(target)
+        return self._per_sample_nll(log_prob, mem_prob).mean()
+
+    def forward(self, x: torch.Tensor, log_age: torch.Tensor,
+                bprp0: torch.Tensor, log_bprp0_err: torch.Tensor,
+                log_mg: torch.Tensor = None, mem_prob: torch.Tensor = None,
+                loss_mode: str = 'full') -> torch.Tensor:
+        z          = self.encoder(x)
+        aux_target = log_age.mean(dim=1) if log_age.dim() == 2 else log_age
+
+        if loss_mode == 'aux_only':
+            aux  = torch.mean(torch.abs(self.aux_age_head(z).squeeze(1) - aux_target))
+            loss = aux
+        elif loss_mode == 'nll_only':
+            return self._flow_nll(z, log_age, bprp0, log_bprp0_err, log_mg, mem_prob)
+        else:  # 'full'
+            nll  = self._flow_nll(z, log_age, bprp0, log_bprp0_err, log_mg, mem_prob)
+            aux  = torch.mean(torch.abs(self.aux_age_head(z).squeeze(1) - aux_target))
+            nll_scale = nll.detach().abs().clamp(min=1e-4)
+            aux_scale = aux.detach().abs().clamp(min=1e-4)
+            loss = nll + self.aux_loss_weight * (nll_scale / aux_scale) * aux
+
+        if self.variance_reg_weight > 0 and z.shape[0] > 1:
+            std      = z.std(dim=0)
+            var_loss = torch.relu(1.0 - std).mean()
+            loss     = loss + self.variance_reg_weight * var_loss
+        return loss
+
+    def predict_stats(self, x: torch.Tensor, bprp0: torch.Tensor,
+                      log_bprp0_err: torch.Tensor, log_mg: torch.Tensor,
+                      loga_grid: torch.Tensor) -> dict:
+        """Posterior over log10_age via direct flow evaluation.
+
+        Returns dict with median, mean, map, p16, p84 — same interface as the
+        NLE predictors so downstream batching code is unchanged.
+        """
+        z   = self.encoder(x)
+        B   = z.shape[0]
+        G   = loga_grid.shape[0]
+        ctx = self._build_context(z, bprp0, log_bprp0_err, log_mg)            # (B, C)
+        C   = ctx.shape[-1]
+
+        ctx_exp  = ctx.unsqueeze(1).expand(B, G, C).reshape(B * G, C)
+        grid_exp = loga_grid.unsqueeze(0).expand(B, G).reshape(B * G, 1)
+
+        log_prob   = self.flow(ctx_exp).log_prob(grid_exp).reshape(B, G)
+        log_post   = log_prob - torch.logsumexp(log_prob, dim=1, keepdim=True)
+        posterior  = log_post.exp()
+
+        map_idx = posterior.argmax(dim=1)
+        map_est = loga_grid[map_idx]
+        mean    = (posterior * loga_grid.unsqueeze(0)).sum(dim=1)
+        cdf     = posterior.cumsum(dim=1)
+
+        def pct(p: float) -> torch.Tensor:
+            return loga_grid[(cdf >= p).float().argmax(dim=1)]
+
+        return {
+            'median': pct(0.5),
+            'mean':   mean,
+            'map':    map_est,
+            'p16':    pct(0.16),
+            'p84':    pct(0.84),
+        }
+
+
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
@@ -1117,8 +1307,14 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
                       dropout=0.1, variance_reg_weight=0.0,
                       training_stages='joint', encoder_pretrain_epochs=100,
                       joint_finetune_epochs=50, finetune_encoder_lr_mult=0.01,
-                      finetune_flow_lr_mult=0.1):
-    """Train one fold NLE model.
+                      finetune_flow_lr_mult=0.1,
+                      prediction_mode='nle'):
+    """Train one fold of NLE *or* NPE model.
+
+    prediction_mode:
+        'nle' — flow models p(z | log_age, colours), z is the bottleneck. Default.
+        'npe' — flow models p(log_age | z, colours) directly. Requires an MLP/linear
+                encoder (PCA-only mode is not supported for NPE).
 
     encoder_type='pca': PCA fit on training fold only (no leakage, no collapse).
         If global_pca is provided, it is used as-is (pre-fit on all stars) and
@@ -1140,6 +1336,11 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
 
     fold_pca = None
 
+    if prediction_mode == 'npe' and encoder_type == 'pca':
+        raise ValueError("prediction_mode='npe' requires encoder_type='mlp' or 'linear' "
+                         "(NPE conditions on a learned bottleneck — PCA-only NPE is "
+                         "not supported).")
+
     if encoder_type == 'pca':
         if global_pca is not None:
             fold_pca = global_pca
@@ -1160,21 +1361,38 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
         input_dim = Z_train.shape[1]
         if encoder_type == 'linear':
             mlp_hidden = []
-            print(f'    Linear encoder {input_dim}D → {pca_dim}D bottleneck')
+            print(f'    Linear encoder {input_dim}D → {pca_dim}D bottleneck '
+                  f'({prediction_mode.upper()})')
         else:
             mlp_hidden = mlp_encoder_hidden
-            print(f'    MLP encoder {input_dim}D → {pca_dim}D bottleneck')
-        model = AgePredictorMLP(
-            input_dim=input_dim,
-            bottleneck_dim=pca_dim,
-            mlp_hidden=mlp_hidden,
-            flow_transforms=flow_transforms,
-            flow_hidden_features=flow_hidden_features,
-            aux_loss_weight=aux_loss_weight,
-            use_mg=use_mg,
-            dropout=dropout,
-            variance_reg_weight=variance_reg_weight,
-        ).to(device)
+            print(f'    MLP encoder {input_dim}D → {pca_dim}D bottleneck '
+                  f'({prediction_mode.upper()})')
+        if prediction_mode == 'npe':
+            grid_range = (float(loga_grid.min().item()), float(loga_grid.max().item()))
+            model = AgePredictorNPE(
+                input_dim=input_dim,
+                bottleneck_dim=pca_dim,
+                mlp_hidden=mlp_hidden,
+                flow_transforms=flow_transforms,
+                flow_hidden_features=flow_hidden_features,
+                aux_loss_weight=aux_loss_weight,
+                use_mg=use_mg,
+                dropout=dropout,
+                variance_reg_weight=variance_reg_weight,
+                age_grid_range=grid_range,
+            ).to(device)
+        else:
+            model = AgePredictorMLP(
+                input_dim=input_dim,
+                bottleneck_dim=pca_dim,
+                mlp_hidden=mlp_hidden,
+                flow_transforms=flow_transforms,
+                flow_hidden_features=flow_hidden_features,
+                aux_loss_weight=aux_loss_weight,
+                use_mg=use_mg,
+                dropout=dropout,
+                variance_reg_weight=variance_reg_weight,
+            ).to(device)
 
     train_dataset = TensorDataset(
         torch.tensor(Z_train,         dtype=torch.float32, device=device),
@@ -1216,7 +1434,7 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
             epoch_loss = 0.0
             for Z_b, y_b, bprp0_b, bprp0_err_b, mg_b, mem_prob_b in train_loader:
                 opt.zero_grad()
-                if isinstance(model, AgePredictorMLP):
+                if isinstance(model, (AgePredictorMLP, AgePredictorNPE)):
                     loss = model(Z_b, y_b, bprp0_b, bprp0_err_b, mg_b, mem_prob_b,
                                  loss_mode=loss_mode)
                 else:
@@ -1231,7 +1449,7 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
             with torch.no_grad():
                 # Always use NLL-only for model selection — the combined loss
                 # (NLL + scaled aux) can cancel to ~0 and is not a useful metric
-                if isinstance(model, AgePredictorMLP):
+                if isinstance(model, (AgePredictorMLP, AgePredictorNPE)):
                     val_nll = model(Z_val_t, y_val_t, bprp0_val_t, berr_val_t,
                                     mg_val_t, mem_prob_val_t, loss_mode='nll_only').item()
                 else:
@@ -1249,7 +1467,7 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
         return opt
 
     use_staged = (training_stages in ('two_stage', 'three_stage')
-                  and isinstance(model, AgePredictorMLP))
+                  and isinstance(model, (AgePredictorMLP, AgePredictorNPE)))
 
     if use_staged:
         # Stage 1: encoder + aux_head only (flow frozen)
@@ -1339,7 +1557,8 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
                  finetune_flow_lr_mult=0.1,
                  train_full=False, source=None,
                  skip_log10=False, age_grid_range=None,
-                 age_err=None, k_age_samples=1):
+                 age_err=None, k_age_samples=1,
+                 prediction_mode='nle'):
     """Run k-fold cross-validation.
 
     Args:
@@ -1516,6 +1735,7 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
             joint_finetune_epochs=joint_finetune_epochs,
             finetune_encoder_lr_mult=finetune_encoder_lr_mult,
             finetune_flow_lr_mult=finetune_flow_lr_mult,
+            prediction_mode=prediction_mode,
         )
         fold_models.append({
             'state_dict': model_state, 'pca': fold_pca,
@@ -1581,6 +1801,7 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
             joint_finetune_epochs=joint_finetune_epochs,
             finetune_encoder_lr_mult=finetune_encoder_lr_mult,
             finetune_flow_lr_mult=finetune_flow_lr_mult,
+            prediction_mode=prediction_mode,
         )
 
         torch.save({

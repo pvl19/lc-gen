@@ -17,6 +17,11 @@ STAR_AGGREGATION="latent_max"   # latent_mean | latent_median | latent_max | lat
 USE_MG="false"                   # also include log10(MG_quick) as 4th flow context
 P_CLUSTER_MEM=1.0                # per-star inlier prior; 1.0 = rely on static 5% outlier model
 
+# nle: 1D-or-bottleneck flow models p(z | age, colours); posterior via Bayes on grid.
+# npe: 1D age flow conditioned on (bottleneck ∥ colours) — direct posterior, no Bayes flip.
+#      NPE requires ENCODER_TYPE=mlp or linear (PCA-only NPE is not supported).
+PREDICTION_MODE="nle"
+
 N_FOLDS=10
 SEED=42
 
@@ -45,13 +50,14 @@ LOGA_GRID_SIZE=1000
 
 TRAIN_FULL="true"
 
-OUTPUT_DIR="final_model/parallel_fixed/e110/nle_age_hosts/${STAR_AGGREGATION}"
+OUTPUT_DIR="final_model/parallel_fixed/e110/nle_age_hosts/${PREDICTION_MODE}/${STAR_AGGREGATION}"
 
 echo "Running k-fold NLE age inference (hosts):"
 echo "  Latents cache:    ${LOAD_LATENTS}"
 echo "  Host age CSV:     ${HOST_AGE_CSV}"
 echo "  Host metadata:    ${HOST_METADATA_CSV}"
 echo "  Star aggregation: ${STAR_AGGREGATION}"
+echo "  Prediction mode:  ${PREDICTION_MODE}"
 echo "  Encoder type:     ${ENCODER_TYPE}  (bottleneck=${BOTTLENECK_DIM})"
 echo "  Training stages:  ${TRAINING_STAGES}"
 echo "  Folds / seed:     ${N_FOLDS} / ${SEED}"
@@ -67,6 +73,7 @@ CMD="python scripts/kfold_nle_age_inference_hosts.py \
   --output_dir ${OUTPUT_DIR} \
   --star_aggregation ${STAR_AGGREGATION} \
   --p_cluster_mem ${P_CLUSTER_MEM} \
+  --prediction_mode ${PREDICTION_MODE} \
   --n_folds ${N_FOLDS} \
   --seed ${SEED} \
   --encoder_type ${ENCODER_TYPE} \
