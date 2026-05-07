@@ -79,6 +79,13 @@ def main():
     parser.add_argument('--host_age_csv', type=str, required=True)
     parser.add_argument('--host_age_col', type=str, default='st_age',
                         help="CSV column carrying the host age in Gyr (e.g. st_age, st_age_norm).")
+    parser.add_argument('--host_age_err_col', type=str, default=None,
+                        help="CSV column carrying the per-star age 1σ. Required when "
+                             "--k_age_samples > 1 (e.g. st_ageerr_norm).")
+    parser.add_argument('--k_age_samples', type=int, default=1,
+                        help="Per-star Gaussian age samples drawn from N(age, age_err) used "
+                             "in training. Loss is averaged per-star over K, then averaged "
+                             "across the batch. Default 1 disables sampling.")
     parser.add_argument('--host_metadata_csv', type=str, default=None)
     parser.add_argument('--output_dir', type=str, required=True)
 
@@ -157,6 +164,26 @@ def main():
     # lower values soften the inlier assumption.
     mem_prob = np.full(len(star_age), args.p_cluster_mem, dtype=np.float32)
 
+    # Per-star age uncertainty: looked up from the age CSV by GaiaDR3_ID and
+    # aligned to the post-aggregation star order. Stars without a recorded σ
+    # get 0, i.e. their K samples collapse to identical copies of the central
+    # age (no extra noise injected).
+    if args.k_age_samples > 1:
+        if args.host_age_err_col is None:
+            raise ValueError('--k_age_samples > 1 requires --host_age_err_col.')
+        df_err = pd.read_csv(args.host_age_csv)
+        df_err['GaiaDR3_ID'] = df_err['GaiaDR3_ID'].astype(str)
+        if args.host_age_err_col not in df_err.columns:
+            raise KeyError(f"{args.host_age_err_col!r} not in {args.host_age_csv}")
+        err_map = dict(zip(df_err['GaiaDR3_ID'], df_err[args.host_age_err_col]))
+        star_age_err = np.array(
+            [err_map.get(g, np.nan) for g in star_gids], dtype=np.float32)
+        n_with_err = int(np.sum(~np.isnan(star_age_err) & (star_age_err > 0)))
+        print(f'Loaded per-star σ from {args.host_age_err_col}: '
+              f'{n_with_err}/{len(star_age_err)} stars have non-zero uncertainty.')
+    else:
+        star_age_err = None
+
     # st_age_norm (and any other non-st_age column) is already on a
     # normalized scale — feed it to the flow directly, no log10 transform.
     skip_log10 = (args.host_age_col != 'st_age')
@@ -209,6 +236,8 @@ def main():
         train_full=args.train_full,
         skip_log10=skip_log10,
         age_grid_range=age_grid_range,
+        age_err=star_age_err,
+        k_age_samples=args.k_age_samples,
     )
 
     # 3. Plots + predictions

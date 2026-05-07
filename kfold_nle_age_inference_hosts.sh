@@ -8,7 +8,9 @@
 
 LOAD_LATENTS="final_model/parallel_fixed/e110/latents_hosts.npz"
 HOST_AGE_CSV="exop_hosts/archive_ages_normalized.csv"
-HOST_AGE_COL="st_age_norm"        # column in HOST_AGE_CSV carrying age in Gyr
+HOST_AGE_COL="st_age_norm"        # column in HOST_AGE_CSV carrying age (normalized or Gyr)
+HOST_AGE_ERR_COL="st_ageerr_norm" # 1σ for HOST_AGE_COL; used when K_AGE_SAMPLES > 1
+K_AGE_SAMPLES=10                  # 10 Gaussian draws per star; loss = mean over K, then mean over batch
 HOST_METADATA_CSV="final_pretrain/host_all_metadata.csv"
 
 STAR_AGGREGATION="latent_max"   # latent_mean | latent_median | latent_max | latent_mean_std
@@ -59,6 +61,8 @@ CMD="python scripts/kfold_nle_age_inference_hosts.py \
   --load_latents ${LOAD_LATENTS} \
   --host_age_csv ${HOST_AGE_CSV} \
   --host_age_col ${HOST_AGE_COL} \
+  --host_age_err_col ${HOST_AGE_ERR_COL} \
+  --k_age_samples ${K_AGE_SAMPLES} \
   --host_metadata_csv ${HOST_METADATA_CSV} \
   --output_dir ${OUTPUT_DIR} \
   --star_aggregation ${STAR_AGGREGATION} \

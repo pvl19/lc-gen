@@ -89,9 +89,9 @@ class AgePredictor(nn.Module):
             hidden_features=flow_hidden_features,
         )
 
-    def _nll_with_outlier(self, log_prob_flow: torch.Tensor, z: torch.Tensor,
-                          mem_prob: torch.Tensor = None) -> torch.Tensor:
-        # Per-sample membership probability; fall back to constant for NaN entries
+    def _per_sample_nll(self, log_prob_flow: torch.Tensor, z: torch.Tensor,
+                         mem_prob: torch.Tensor = None) -> torch.Tensor:
+        """Per-sample NLL under the flow + static-outlier mixture (no reduction)."""
         if mem_prob is None:
             p_mem = P_CLUSTER_MEM
         else:
@@ -107,11 +107,34 @@ class AgePredictor(nn.Module):
                 torch.log(1.0 - nf_weight) + ln_p_outlier,
             ], dim=0), dim=0
         )
-        return -ln_p_combined.mean()
+        return -ln_p_combined  # (N,)
+
+    def _nll_with_outlier(self, log_prob_flow: torch.Tensor, z: torch.Tensor,
+                          mem_prob: torch.Tensor = None) -> torch.Tensor:
+        return self._per_sample_nll(log_prob_flow, z, mem_prob).mean()
 
     def forward(self, z: torch.Tensor, log_age: torch.Tensor,
                 bprp0: torch.Tensor, log_bprp0_err: torch.Tensor,
                 log_mg: torch.Tensor = None, mem_prob: torch.Tensor = None) -> torch.Tensor:
+        # Multi-sample ages: log_age shape (B, K) → per-star mean then per-batch mean.
+        # Single-sample (legacy): log_age shape (B,).
+        if log_age.dim() == 2:
+            B, K = log_age.shape
+            log_age_f = log_age.reshape(B * K)
+            bprp0_f   = bprp0.unsqueeze(1).expand(B, K).reshape(B * K)
+            berr_f    = log_bprp0_err.unsqueeze(1).expand(B, K).reshape(B * K)
+            mg_f      = (log_mg.unsqueeze(1).expand(B, K).reshape(B * K)
+                         if log_mg is not None else None)
+            z_f       = z.unsqueeze(1).expand(B, K, -1).reshape(B * K, z.shape[-1])
+            mp_f      = (mem_prob.unsqueeze(1).expand(B, K).reshape(B * K)
+                         if mem_prob is not None else None)
+            parts = [log_age_f, bprp0_f, berr_f]
+            if self.use_mg:
+                parts.append(mg_f)
+            context = torch.stack(parts, dim=1)
+            per_sample = self._per_sample_nll(self.flow(context).log_prob(z_f), z_f, mp_f)
+            return per_sample.reshape(B, K).mean(dim=1).mean()
+
         parts = [log_age, bprp0, log_bprp0_err]
         if self.use_mg:
             parts.append(log_mg)
@@ -210,8 +233,9 @@ class AgePredictorMLP(nn.Module):
             hidden_features=flow_hidden_features,
         )
 
-    def _nll_with_outlier(self, log_prob_flow: torch.Tensor, z: torch.Tensor,
-                          mem_prob: torch.Tensor = None) -> torch.Tensor:
+    def _per_sample_nll(self, log_prob_flow: torch.Tensor, z: torch.Tensor,
+                         mem_prob: torch.Tensor = None) -> torch.Tensor:
+        """Per-sample NLL under the flow + static-outlier mixture (no reduction)."""
         if mem_prob is None:
             p_mem = P_CLUSTER_MEM
         else:
@@ -227,7 +251,44 @@ class AgePredictorMLP(nn.Module):
                 torch.log(1.0 - nf_weight) + ln_p_outlier,
             ], dim=0), dim=0
         )
-        return -ln_p_combined.mean()
+        return -ln_p_combined  # (N,)
+
+    def _nll_with_outlier(self, log_prob_flow: torch.Tensor, z: torch.Tensor,
+                          mem_prob: torch.Tensor = None) -> torch.Tensor:
+        return self._per_sample_nll(log_prob_flow, z, mem_prob).mean()
+
+    def _flow_nll(self, z: torch.Tensor, log_age: torch.Tensor,
+                  bprp0: torch.Tensor, log_bprp0_err: torch.Tensor,
+                  log_mg: torch.Tensor = None, mem_prob: torch.Tensor = None) -> torch.Tensor:
+        """Flow NLL with optional per-star multi-sample averaging.
+
+        log_age (B,)    → standard mean over batch (legacy path).
+        log_age (B, K)  → expand other inputs over K, compute per-sample NLL,
+                          then mean over K per star, then mean over B stars.
+                          Avoids implicitly weighting by sample count.
+        """
+        if log_age.dim() == 2:
+            B, K = log_age.shape
+            log_age_f = log_age.reshape(B * K)
+            bprp0_f   = bprp0.unsqueeze(1).expand(B, K).reshape(B * K)
+            berr_f    = log_bprp0_err.unsqueeze(1).expand(B, K).reshape(B * K)
+            mg_f      = (log_mg.unsqueeze(1).expand(B, K).reshape(B * K)
+                         if log_mg is not None else None)
+            z_f       = z.unsqueeze(1).expand(B, K, -1).reshape(B * K, z.shape[-1])
+            mp_f      = (mem_prob.unsqueeze(1).expand(B, K).reshape(B * K)
+                         if mem_prob is not None else None)
+            parts = [log_age_f, bprp0_f, berr_f]
+            if self.use_mg:
+                parts.append(mg_f)
+            context = torch.stack(parts, dim=1)
+            per_sample = self._per_sample_nll(self.flow(context).log_prob(z_f), z_f, mp_f)
+            return per_sample.reshape(B, K).mean(dim=1).mean()
+
+        parts = [log_age, bprp0, log_bprp0_err]
+        if self.use_mg:
+            parts.append(log_mg)
+        context = torch.stack(parts, dim=1)
+        return self._nll_with_outlier(self.flow(context).log_prob(z), z, mem_prob)
 
     def forward(self, x: torch.Tensor, log_age: torch.Tensor,
                 bprp0: torch.Tensor, log_bprp0_err: torch.Tensor,
@@ -239,22 +300,23 @@ class AgePredictorMLP(nn.Module):
             'full'     — NLL + aux L1 + variance reg (default, joint training)
             'aux_only' — aux L1 + variance reg only (encoder pre-training, flow frozen)
             'nll_only' — NLL only (flow training, encoder frozen)
+
+        log_age may be (B,) or (B, K) — see _flow_nll. The aux head is a point
+        estimator, so it always trains against the per-star central age (mean
+        over K when multi-sample); per-sample MC on the aux head would just
+        add noise without changing the L1 minimizer in expectation.
         """
-        z     = self.encoder(x)
-        parts = [log_age, bprp0, log_bprp0_err]
-        if self.use_mg:
-            parts.append(log_mg)
-        context = torch.stack(parts, dim=1)
+        z         = self.encoder(x)
+        aux_target = log_age.mean(dim=1) if log_age.dim() == 2 else log_age
 
         if loss_mode == 'aux_only':
-            aux  = torch.mean(torch.abs(self.aux_age_head(z).squeeze(1) - log_age))
+            aux  = torch.mean(torch.abs(self.aux_age_head(z).squeeze(1) - aux_target))
             loss = aux  # weight is irrelevant when aux is the only loss term
         elif loss_mode == 'nll_only':
-            nll  = self._nll_with_outlier(self.flow(context).log_prob(z), z, mem_prob)
-            return nll
+            return self._flow_nll(z, log_age, bprp0, log_bprp0_err, log_mg, mem_prob)
         else:  # 'full'
-            nll  = self._nll_with_outlier(self.flow(context).log_prob(z), z, mem_prob)
-            aux  = torch.mean(torch.abs(self.aux_age_head(z).squeeze(1) - log_age))
+            nll  = self._flow_nll(z, log_age, bprp0, log_bprp0_err, log_mg, mem_prob)
+            aux  = torch.mean(torch.abs(self.aux_age_head(z).squeeze(1) - aux_target))
             # Scale aux to match NLL magnitude so aux_loss_weight controls relative
             # contribution (1.0 = equal gradient magnitude) regardless of raw scales
             nll_scale = nll.detach().abs().clamp(min=1e-4)
@@ -1276,7 +1338,8 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
                  joint_finetune_epochs=50, finetune_encoder_lr_mult=0.01,
                  finetune_flow_lr_mult=0.1,
                  train_full=False, source=None,
-                 skip_log10=False, age_grid_range=None):
+                 skip_log10=False, age_grid_range=None,
+                 age_err=None, k_age_samples=1):
     """Run k-fold cross-validation.
 
     Args:
@@ -1302,6 +1365,27 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
     # When skip_log10=True the input is treated as already-on-target-scale
     # (e.g. a pre-normalized z-score); the grid range must match.
     y = ages.astype(np.float32) if skip_log10 else np.log10(ages)
+
+    # Per-star age uncertainty propagation. When k_age_samples > 1 we draw
+    # K Gaussian samples around each star's central age (mean=y, std=age_err)
+    # and stack them into an (N, K) array. The model averages NLL per-star
+    # over the K samples before averaging across the batch — this avoids
+    # weighting stars unequally by sample count and keeps the batch-level
+    # loss on the same scale as the single-sample case.
+    if k_age_samples > 1:
+        if age_err is None:
+            raise ValueError('k_age_samples > 1 requires age_err to be provided.')
+        rng = np.random.default_rng(seed)
+        sigma = np.where(np.isnan(age_err), 0.0, np.maximum(age_err, 0.0)).astype(np.float32)
+        noise = rng.standard_normal(size=(len(y), k_age_samples)).astype(np.float32)
+        y = (y[:, None] + sigma[:, None] * noise).astype(np.float32)
+        n_with_err = int(np.sum(sigma > 0))
+        print(f'Drew {k_age_samples} Gaussian age samples per star '
+              f'({n_with_err}/{len(sigma)} have non-zero σ; rest get K identical copies).')
+
+    # Per-star central age (1D), for printable metrics that compare against
+    # the model's point-estimate predictions.
+    y_central = y if y.ndim == 1 else y.mean(axis=1)
 
     if pca_latents is not None:
         X_mean, X_std = pca_latents.mean(axis=0), pca_latents.std(axis=0) + 1e-8
@@ -1444,8 +1528,8 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
         fold_losses.append(train_loss)
 
         val_pred_log = val_stats['median']
-        val_mae  = np.mean(np.abs(val_pred_log - y[val_idx]))  # dex
-        val_corr = np.corrcoef(val_pred_log, y[val_idx])[0, 1]
+        val_mae  = np.mean(np.abs(val_pred_log - y_central[val_idx]))  # dex
+        val_corr = np.corrcoef(val_pred_log, y_central[val_idx])[0, 1]
         print(f'  Fold {fold + 1}/{n_folds}: best_val_nll={train_loss:.4f}  '
               f'val_MAE={val_mae:.3f} dex  val_r={val_corr:.3f}')
 
@@ -1511,13 +1595,13 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
         full_pred_log = full_stats['median']
         if combined_mode:
             host_eval = (source == 1)
-            full_mae_h  = np.mean(np.abs(full_pred_log[host_eval] - y[host_eval]))
-            full_corr_h = np.corrcoef(full_pred_log[host_eval], y[host_eval])[0, 1]
+            full_mae_h  = np.mean(np.abs(full_pred_log[host_eval] - y_central[host_eval]))
+            full_corr_h = np.corrcoef(full_pred_log[host_eval], y_central[host_eval])[0, 1]
             print(f'Full model: train_nll={full_loss:.4f}  '
                   f'host MAE={full_mae_h:.3f} dex  host r={full_corr_h:.3f}')
         else:
-            full_mae  = np.mean(np.abs(full_pred_log - y))
-            full_corr = np.corrcoef(full_pred_log, y)[0, 1]
+            full_mae  = np.mean(np.abs(full_pred_log - y_central))
+            full_corr = np.corrcoef(full_pred_log, y_central)[0, 1]
             print(f'Full model: train_nll={full_loss:.4f}  '
                   f'MAE={full_mae:.3f} dex  r={full_corr:.3f}')
         print(f'Saved full model to {save_dir / "full_model.pt"}')
