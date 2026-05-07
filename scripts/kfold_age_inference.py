@@ -1275,7 +1275,8 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
                  training_stages='joint', encoder_pretrain_epochs=100,
                  joint_finetune_epochs=50, finetune_encoder_lr_mult=0.01,
                  finetune_flow_lr_mult=0.1,
-                 train_full=False, source=None):
+                 train_full=False, source=None,
+                 skip_log10=False, age_grid_range=None):
     """Run k-fold cross-validation.
 
     Args:
@@ -1297,7 +1298,10 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
     # Normalise latent vectors (X).  BPRP0 is kept separate — it goes to the
     # flow as context alongside log10_age, not into the MLP encoder.
     X = latent_vectors
-    y = np.log10(ages)
+    # `ages` are normally linear Myr, log10'd here for the flow context.
+    # When skip_log10=True the input is treated as already-on-target-scale
+    # (e.g. a pre-normalized z-score); the grid range must match.
+    y = ages.astype(np.float32) if skip_log10 else np.log10(ages)
 
     if pca_latents is not None:
         X_mean, X_std = pca_latents.mean(axis=0), pca_latents.std(axis=0) + 1e-8
@@ -1334,7 +1338,8 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
 
     # Age grid for posterior inference
     G = loga_grid_size or LOGA_GRID_DEFAULT_SIZE
-    loga_grid_np = np.linspace(PRIOR_LOGA_MYR[0], PRIOR_LOGA_MYR[1], G)
+    grid_min, grid_max = age_grid_range if age_grid_range is not None else PRIOR_LOGA_MYR
+    loga_grid_np = np.linspace(grid_min, grid_max, G)
     loga_grid_t  = torch.tensor(loga_grid_np, dtype=torch.float32)
 
     # Build fold assignments

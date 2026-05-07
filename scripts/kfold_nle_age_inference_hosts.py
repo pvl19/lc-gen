@@ -40,9 +40,9 @@ from kfold_mlp_age_inference import load_host_latents, aggregate_by_star  # noqa
 from kfold_age_inference import run_kfold_cv  # noqa: E402
 
 
-def plot_results_with_uncertainty(true_log, stats, output_dir: Path):
+def plot_results_with_uncertainty(true_age, stats, output_dir: Path, axis_label: str):
     valid = ~np.isnan(stats['median'])
-    t   = true_log[valid]
+    t   = true_age[valid]
     med = stats['median'][valid]
     p16 = stats['p16'][valid]
     p84 = stats['p84'][valid]
@@ -58,8 +58,8 @@ def plot_results_with_uncertainty(true_log, stats, output_dir: Path):
                 ecolor='gray', elinewidth=0.7, capsize=0)
     lo, hi = float(min(t.min(), med.min())), float(max(t.max(), med.max()))
     ax.plot([lo, hi], [lo, hi], 'k--', alpha=0.5, lw=1)
-    ax.set_xlabel('True log10(age / Myr)')
-    ax.set_ylabel('Predicted log10(age / Myr) — median ± [p16, p84]')
+    ax.set_xlabel(f'True {axis_label}')
+    ax.set_ylabel(f'Predicted {axis_label} — median ± [p16, p84]')
     ax.set_title('K-fold NLE age inference (hosts)\n'
                  f'MAE={mae:.3f}  RMSE={rmse:.3f}  r={r:.3f}  n={len(t)}')
     ax.grid(alpha=0.3)
@@ -157,6 +157,22 @@ def main():
     # lower values soften the inlier assumption.
     mem_prob = np.full(len(star_age), args.p_cluster_mem, dtype=np.float32)
 
+    # st_age_norm (and any other non-st_age column) is already on a
+    # normalized scale — feed it to the flow directly, no log10 transform.
+    skip_log10 = (args.host_age_col != 'st_age')
+    if skip_log10:
+        # Pad the data range by 25% on each side so the posterior grid covers
+        # the tails. Hardcoded to ±0.25 × span — ample for z-scored ages.
+        span = float(star_age.max() - star_age.min())
+        pad  = max(0.25 * span, 0.5)
+        age_grid_range = (float(star_age.min() - pad), float(star_age.max() + pad))
+        age_label = f'age ({args.host_age_col})'
+        print(f'Skipping log10: feeding {args.host_age_col} directly to the flow. '
+              f'Grid range: [{age_grid_range[0]:.2f}, {age_grid_range[1]:.2f}]')
+    else:
+        age_grid_range = None
+        age_label = 'log10(age / Myr)'
+
     # 2. K-fold NLE
     predictions, all_stats, true_ages, _, fold_assignments, fold_losses, _ = run_kfold_cv(
         latent_vectors=star_lat.astype(np.float32),
@@ -193,28 +209,44 @@ def main():
         finetune_encoder_lr_mult=args.finetune_encoder_lr_mult,
         finetune_flow_lr_mult=args.finetune_flow_lr_mult,
         train_full=args.train_full,
+        skip_log10=skip_log10,
+        age_grid_range=age_grid_range,
     )
 
     # 3. Plots + predictions
-    log_ages_true = np.log10(true_ages)
-    overall = plot_results_with_uncertainty(log_ages_true, all_stats, output_dir)
+    true_age_axis = true_ages if skip_log10 else np.log10(true_ages)
+    overall = plot_results_with_uncertainty(true_age_axis, all_stats, output_dir, age_label)
 
-    df_out = pd.DataFrame({
-        'GaiaDR3_ID': star_gids,
-        'true_log10_age_Myr':    log_ages_true,
-        'true_age_Myr':          true_ages,
-        'pred_log10_age_median': all_stats['median'],
-        'pred_log10_age_p16':    all_stats['p16'],
-        'pred_log10_age_p84':    all_stats['p84'],
-        'pred_log10_age_mean':   all_stats['mean'],
-        'pred_log10_age_map':    all_stats['map'],
-        'pred_age_median_Myr':   10 ** all_stats['median'],
-        'pred_age_p16_Myr':      10 ** all_stats['p16'],
-        'pred_age_p84_Myr':      10 ** all_stats['p84'],
-        'BPRP0':                 star_b,
-        'BPRP0_err':             star_be,
-        'fold':                  fold_assignments,
-    })
+    if skip_log10:
+        df_out = pd.DataFrame({
+            'GaiaDR3_ID':                  star_gids,
+            f'true_{args.host_age_col}':   true_ages,
+            f'pred_{args.host_age_col}_median': all_stats['median'],
+            f'pred_{args.host_age_col}_p16':    all_stats['p16'],
+            f'pred_{args.host_age_col}_p84':    all_stats['p84'],
+            f'pred_{args.host_age_col}_mean':   all_stats['mean'],
+            f'pred_{args.host_age_col}_map':    all_stats['map'],
+            'BPRP0':                       star_b,
+            'BPRP0_err':                   star_be,
+            'fold':                        fold_assignments,
+        })
+    else:
+        df_out = pd.DataFrame({
+            'GaiaDR3_ID':            star_gids,
+            'true_log10_age_Myr':    true_age_axis,
+            'true_age_Myr':          true_ages,
+            'pred_log10_age_median': all_stats['median'],
+            'pred_log10_age_p16':    all_stats['p16'],
+            'pred_log10_age_p84':    all_stats['p84'],
+            'pred_log10_age_mean':   all_stats['mean'],
+            'pred_log10_age_map':    all_stats['map'],
+            'pred_age_median_Myr':   10 ** all_stats['median'],
+            'pred_age_p16_Myr':      10 ** all_stats['p16'],
+            'pred_age_p84_Myr':      10 ** all_stats['p84'],
+            'BPRP0':                 star_b,
+            'BPRP0_err':             star_be,
+            'fold':                  fold_assignments,
+        })
 
     # Tag on raw archive ages for reference (whichever of these columns exist
     # in the age CSV — st_age / st_ageerr live in the default file, the _norm
