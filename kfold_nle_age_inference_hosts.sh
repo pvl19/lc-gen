@@ -12,6 +12,7 @@ HOST_METADATA_CSV="final_pretrain/host_all_metadata.csv"
 
 STAR_AGGREGATION="latent_max"   # latent_mean | latent_median | latent_max | latent_mean_std
 USE_MG="false"                   # also include log10(MG_quick) as 4th flow context
+P_CLUSTER_MEM=1.0                # per-star inlier prior; 1.0 = rely on static 5% outlier model
 
 N_FOLDS=10
 SEED=42
@@ -59,6 +60,7 @@ CMD="python scripts/kfold_nle_age_inference_hosts.py \
   --host_metadata_csv ${HOST_METADATA_CSV} \
   --output_dir ${OUTPUT_DIR} \
   --star_aggregation ${STAR_AGGREGATION} \
+  --p_cluster_mem ${P_CLUSTER_MEM} \
   --n_folds ${N_FOLDS} \
   --seed ${SEED} \
   --encoder_type ${ENCODER_TYPE} \

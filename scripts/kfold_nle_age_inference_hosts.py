@@ -84,6 +84,10 @@ def main():
                         choices=['latent_mean', 'latent_median', 'latent_max', 'latent_mean_std'])
     parser.add_argument('--use_mg', action='store_true',
                         help='Include log10(MG_quick) as 4th flow context variable.')
+    parser.add_argument('--p_cluster_mem', type=float, default=1.0,
+                        help='Per-star membership probability fed to the outlier model. '
+                             'Default 1.0 (rely solely on the static 5%% outlier prior). '
+                             'Set <1.0 to soften the assumption that hosts are inliers.')
 
     parser.add_argument('--n_folds', type=int, default=10)
     parser.add_argument('--seed', type=int, default=42)
@@ -145,10 +149,10 @@ def main():
         latents, ages, bprp0, bprp0_err, mg, gaia_ids, method=args.star_aggregation)
     print(f'Final dataset: {len(star_lat)} stars | latent dim: {star_lat.shape[1]}')
 
-    # Hosts have no cluster-membership probability — pass NaN so the outlier
-    # model in AgePredictorMLP._nll_with_outlier falls back to the constant
-    # P_CLUSTER_MEM (0.9). Same convention as predict_ages.
-    mem_prob = np.full(len(star_age), np.nan, dtype=np.float32)
+    # Hosts have no per-star membership probability. Default to 1.0 so the
+    # outlier likelihood is gated entirely by the static P_OUTLIER (5%) prior;
+    # lower values soften the inlier assumption.
+    mem_prob = np.full(len(star_age), args.p_cluster_mem, dtype=np.float32)
 
     # 2. K-fold NLE
     predictions, all_stats, true_ages, _, fold_assignments, fold_losses, _ = run_kfold_cv(
