@@ -215,6 +215,18 @@ def main():
         'BPRP0_err':             star_be,
         'fold':                  fold_assignments,
     })
+
+    # Tag on raw archive ages for reference (whichever of these columns exist
+    # in the age CSV — st_age / st_ageerr live in the default file, the _norm
+    # variants in the normalized file, both for the merged file).
+    archive_cols = ['st_age', 'st_ageerr', 'st_age_norm', 'st_ageerr_norm']
+    df_arch = pd.read_csv(args.host_age_csv)
+    df_arch['GaiaDR3_ID'] = df_arch['GaiaDR3_ID'].astype(str)
+    keep = ['GaiaDR3_ID'] + [c for c in archive_cols if c in df_arch.columns]
+    if len(keep) > 1:
+        df_out = df_out.merge(df_arch[keep].drop_duplicates('GaiaDR3_ID'),
+                              on='GaiaDR3_ID', how='left')
+
     pred_path = output_dir / 'predictions.csv'
     df_out.to_csv(pred_path, index=False)
     print(f'Saved {pred_path}')
