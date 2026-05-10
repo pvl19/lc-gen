@@ -53,8 +53,7 @@ PROBE_TRANSFORMS = {
 
 
 def load_targets(probe: str, gaia_ids: np.ndarray, sectors: np.ndarray,
-                 tic_ids: np.ndarray, moments_csv: Path, combined_csv: Path,
-                 flares_csv: Path) -> np.ndarray:
+                 moments_csv: Path, combined_csv: Path) -> np.ndarray:
     """Return per-row target aligned to (gaia_ids, sectors). NaN where missing."""
     gids = pd.Series(gaia_ids).astype(str).values
     secs = sectors.astype(int)
@@ -68,25 +67,21 @@ def load_targets(probe: str, gaia_ids: np.ndarray, sectors: np.ndarray,
         merged = key.merge(df, on=['GaiaDR3_ID', 'sector'], how='left')
         return merged[col].to_numpy(dtype=np.float64)
 
-    if probe in ('lit_prot', 'tars_prot'):
-        col = 'lit_Prot' if probe == 'lit_prot' else 'tars_Prot'
+    combined_cols = {
+        'lit_prot':   'lit_Prot',
+        'tars_prot':  'tars_Prot',
+        'num_flares': 'num_flares',
+        'total_ed':   'total_ed',
+    }
+    if probe in combined_cols:
+        col = combined_cols[probe]
         df = pd.read_csv(combined_csv, usecols=['GaiaDR3_ID', col])
         df['GaiaDR3_ID'] = df['GaiaDR3_ID'].astype(str)
         df = df.drop_duplicates(subset='GaiaDR3_ID', keep='first')
         key = pd.DataFrame({'GaiaDR3_ID': gids})
         merged = key.merge(df, on='GaiaDR3_ID', how='left')
         y = merged[col].to_numpy(dtype=np.float64)
-        # log10 requires strictly positive Prot
-        y[~np.isfinite(y) | (y <= 0)] = np.nan
-        return y
-
-    if probe in ('num_flares', 'total_ed'):
-        df = pd.read_csv(flares_csv, usecols=['TIC_ID', probe])
-        df['TIC_ID'] = df['TIC_ID'].astype(np.int64)
-        df = df.drop_duplicates(subset='TIC_ID', keep='first')
-        key = pd.DataFrame({'TIC_ID': tic_ids.astype(np.int64)})
-        merged = key.merge(df, on='TIC_ID', how='left')
-        y = merged[probe].to_numpy(dtype=np.float64)
+        # all four targets are strictly positive -> require >0 for log10
         y[~np.isfinite(y) | (y <= 0)] = np.nan
         return y
 
@@ -216,7 +211,6 @@ def main():
     ap.add_argument('--latents', default='final_model/parallel_fixed/e60/latents.npz')
     ap.add_argument('--moments_csv', default='final_pretrain/flux_moments.csv')
     ap.add_argument('--combined_csv', default='data/all_combined_metadata.csv')
-    ap.add_argument('--flares_csv',   default='data/combined_flare_stats.csv')
     ap.add_argument('--output_dir', required=True)
     ap.add_argument('--n_folds', type=int, default=5)
     ap.add_argument('--hidden_dims', type=int, nargs='+', default=[256, 128, 64])
@@ -249,9 +243,8 @@ def main():
     print(f'  latents: {X.shape}')
 
     # ---- load + transform targets ---------------------------------------
-    y_raw = load_targets(args.probe, gaia_ids, sectors, tic_ids,
-                         Path(args.moments_csv), Path(args.combined_csv),
-                         Path(args.flares_csv))
+    y_raw = load_targets(args.probe, gaia_ids, sectors,
+                         Path(args.moments_csv), Path(args.combined_csv))
     valid = np.isfinite(y_raw)
     print(f'  target {args.probe}: {valid.sum()}/{len(y_raw)} non-NaN rows')
 
