@@ -10,6 +10,7 @@ set -euo pipefail
 LATENTS="final_model/parallel_fixed/e60/latents.npz"
 MOMENTS_CSV="final_pretrain/flux_moments.csv"
 COMBINED_CSV="data/all_combined_metadata.csv"
+FLARES_CSV="data/combined_flare_stats.csv"
 OUT_ROOT="output/latent_probes"
 
 N_FOLDS=5
@@ -40,6 +41,7 @@ run_probe() {
         --latents     "$LATENTS" \
         --moments_csv "$MOMENTS_CSV" \
         --combined_csv "$COMBINED_CSV" \
+        --flares_csv  "$FLARES_CSV" \
         --output_dir  "$out" \
         --n_folds     "$N_FOLDS" \
         --hidden_dims  $HIDDEN_DIMS \
@@ -52,7 +54,7 @@ run_probe() {
         --seed        "$SEED"
 }
 
-for probe in flux_skew flux_kurt lit_prot tars_prot; do
+for probe in flux_skew flux_kurt lit_prot tars_prot num_flares total_ed; do
     for baseline in none gaussian shuffle; do
         run_probe "$probe" "$baseline"
     done

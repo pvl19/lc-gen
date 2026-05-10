@@ -43,15 +43,18 @@ from torch.utils.data import DataLoader, TensorDataset
 
 
 PROBE_TRANSFORMS = {
-    'flux_skew': ('asinh',  np.arcsinh, np.sinh, 'asinh(flux_skew)'),
-    'flux_kurt': ('asinh',  np.arcsinh, np.sinh, 'asinh(flux_kurt)'),
-    'lit_prot':  ('log10',  np.log10,   lambda y: 10.0 ** y, 'log10(lit_Prot / d)'),
-    'tars_prot': ('log10',  np.log10,   lambda y: 10.0 ** y, 'log10(tars_Prot / d)'),
+    'flux_skew':  ('asinh', np.arcsinh, np.sinh, 'asinh(flux_skew)'),
+    'flux_kurt':  ('asinh', np.arcsinh, np.sinh, 'asinh(flux_kurt)'),
+    'lit_prot':   ('log10', np.log10,   lambda y: 10.0 ** y, 'log10(lit_Prot / d)'),
+    'tars_prot':  ('log10', np.log10,   lambda y: 10.0 ** y, 'log10(tars_Prot / d)'),
+    'num_flares': ('log10', np.log10,   lambda y: 10.0 ** y, 'log10(num_flares)'),
+    'total_ed':   ('log10', np.log10,   lambda y: 10.0 ** y, 'log10(total_ed)'),
 }
 
 
 def load_targets(probe: str, gaia_ids: np.ndarray, sectors: np.ndarray,
-                 moments_csv: Path, combined_csv: Path) -> np.ndarray:
+                 tic_ids: np.ndarray, moments_csv: Path, combined_csv: Path,
+                 flares_csv: Path) -> np.ndarray:
     """Return per-row target aligned to (gaia_ids, sectors). NaN where missing."""
     gids = pd.Series(gaia_ids).astype(str).values
     secs = sectors.astype(int)
@@ -74,6 +77,16 @@ def load_targets(probe: str, gaia_ids: np.ndarray, sectors: np.ndarray,
         merged = key.merge(df, on='GaiaDR3_ID', how='left')
         y = merged[col].to_numpy(dtype=np.float64)
         # log10 requires strictly positive Prot
+        y[~np.isfinite(y) | (y <= 0)] = np.nan
+        return y
+
+    if probe in ('num_flares', 'total_ed'):
+        df = pd.read_csv(flares_csv, usecols=['TIC_ID', probe])
+        df['TIC_ID'] = df['TIC_ID'].astype(np.int64)
+        df = df.drop_duplicates(subset='TIC_ID', keep='first')
+        key = pd.DataFrame({'TIC_ID': tic_ids.astype(np.int64)})
+        merged = key.merge(df, on='TIC_ID', how='left')
+        y = merged[probe].to_numpy(dtype=np.float64)
         y[~np.isfinite(y) | (y <= 0)] = np.nan
         return y
 
@@ -203,6 +216,7 @@ def main():
     ap.add_argument('--latents', default='final_model/parallel_fixed/e60/latents.npz')
     ap.add_argument('--moments_csv', default='final_pretrain/flux_moments.csv')
     ap.add_argument('--combined_csv', default='data/all_combined_metadata.csv')
+    ap.add_argument('--flares_csv',   default='data/combined_flare_stats.csv')
     ap.add_argument('--output_dir', required=True)
     ap.add_argument('--n_folds', type=int, default=5)
     ap.add_argument('--hidden_dims', type=int, nargs='+', default=[256, 128, 64])
@@ -231,17 +245,20 @@ def main():
         X = z['latents'].astype(np.float32)
     gaia_ids = z['gaia_ids']
     sectors  = z['sectors'] if 'sectors' in z.files else np.zeros(len(X), dtype=np.int64)
+    tic_ids  = z['tic_ids'] if 'tic_ids' in z.files else np.zeros(len(X), dtype=np.int64)
     print(f'  latents: {X.shape}')
 
     # ---- load + transform targets ---------------------------------------
-    y_raw = load_targets(args.probe, gaia_ids, sectors,
-                         Path(args.moments_csv), Path(args.combined_csv))
+    y_raw = load_targets(args.probe, gaia_ids, sectors, tic_ids,
+                         Path(args.moments_csv), Path(args.combined_csv),
+                         Path(args.flares_csv))
     valid = np.isfinite(y_raw)
     print(f'  target {args.probe}: {valid.sum()}/{len(y_raw)} non-NaN rows')
 
     X = X[valid]; y_raw = y_raw[valid]
     gaia_ids = np.asarray(gaia_ids)[valid]
     sectors  = sectors[valid]
+    tic_ids  = tic_ids[valid]
 
     _, fwd, inv, units = PROBE_TRANSFORMS[args.probe]
     y = fwd(y_raw).astype(np.float64)
