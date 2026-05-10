@@ -60,3 +60,8 @@ done
 
 echo
 echo "All probes complete. Outputs under ${OUT_ROOT}/."
+
+python scripts/aggregate_probe_results.py \
+    --root    "$OUT_ROOT" \
+    --out_md  "${OUT_ROOT}/summary.md" \
+    --out_csv "${OUT_ROOT}/summary.csv"
