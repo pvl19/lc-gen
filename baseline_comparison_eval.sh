@@ -35,3 +35,8 @@ python scripts/baseline_comparison.py eval \
   --n-flow-samples ${N_FLOW_SAMPLES} \
   --max-eval-seqs ${MAX_EVAL_SEQS} \
   --log-every ${LOG_EVERY}
+
+# Render NLL / MAE / RMSE vs. k plots from summary.csv.
+python scripts/baseline_comparison.py plot \
+  --summary-csv "${OUT_DIR}/summary.csv" \
+  --out-dir "${OUT_DIR}"

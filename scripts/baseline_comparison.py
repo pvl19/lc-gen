@@ -646,6 +646,87 @@ def cmd_eval(args):
             print(f'    {r["k"]:<4d}  {r["mae"]:7.4f}  {r["rmse"]:7.4f}  {nll}   {c68}   {c95}')
 
 
+# ----------------------------- plot -----------------------------------------
+
+METHOD_STYLES = {
+    'rnn_flow':     {'color': 'C0', 'marker': 'o', 'label': 'RNN + flow'},
+    'mlp_gaussian': {'color': 'C1', 'marker': 's', 'label': 'MLP (Gaussian)'},
+    'window_mean':  {'color': 'C2', 'marker': '^', 'label': 'window mean'},
+    'nn_mean':      {'color': 'C3', 'marker': 'v', 'label': 'NN mean'},
+}
+
+
+def _read_summary(csv_path: Path):
+    rows = []
+    with open(csv_path) as f:
+        header = f.readline().strip().split(',')
+        for line in f:
+            parts = line.strip().split(',')
+            if not parts or parts == ['']:
+                continue
+            row = dict(zip(header, parts))
+            row['k'] = int(row['k'])
+            for col in ('mae', 'rmse', 'nll', 'coverage68', 'coverage95'):
+                row[col] = float(row[col])
+            rows.append(row)
+    return rows
+
+
+def _grouped(rows, metric: str):
+    """Return {method: ([k...], [val...])} keeping only non-NaN entries."""
+    out = {}
+    for r in rows:
+        v = r[metric]
+        if math.isnan(v):
+            continue
+        out.setdefault(r['method'], ([], []))
+        out[r['method']][0].append(r['k'])
+        out[r['method']][1].append(v)
+    for m in out:
+        ks, vs = out[m]
+        order = sorted(range(len(ks)), key=lambda i: ks[i])
+        out[m] = ([ks[i] for i in order], [vs[i] for i in order])
+    return out
+
+
+def cmd_plot(args):
+    import matplotlib.pyplot as plt
+
+    csv_path = Path(args.summary_csv)
+    if not csv_path.exists():
+        raise FileNotFoundError(f'{csv_path} not found -- run `eval` first')
+    rows = _read_summary(csv_path)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    panels = [
+        ('nll', 'NLL (nats/point)', 'nll_vs_k.png'),
+        ('mae', 'MAE',               'mae_vs_k.png'),
+        ('rmse', 'RMSE',             'rmse_vs_k.png'),
+    ]
+    for metric, ylabel, fname in panels:
+        grouped = _grouped(rows, metric)
+        if not grouped:
+            print(f'[plot] no rows for {metric} -- skipping')
+            continue
+        fig, ax = plt.subplots(figsize=(6.5, 4.5))
+        for method, (ks, vs) in sorted(grouped.items()):
+            style = METHOD_STYLES.get(method, {'color': None, 'marker': 'o', 'label': method})
+            ax.plot(ks, vs, marker=style['marker'], color=style['color'],
+                    linewidth=1.5, markersize=6, label=style['label'])
+        ax.set_xscale('log', base=2)
+        ax.set_xlabel('prediction offset k')
+        ax.set_ylabel(ylabel)
+        ax.set_title(f'{ylabel} vs. k on eval-10%')
+        ax.grid(True, which='both', linestyle=':', alpha=0.4)
+        ax.legend(loc='best', fontsize=9)
+        fig.tight_layout()
+        path = out_dir / fname
+        fig.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f'[plot] wrote {path}')
+
+
 # ----------------------------- entry ----------------------------------------
 
 def build_parser():
@@ -701,6 +782,11 @@ def build_parser():
     ep.add_argument('--max-eval-seqs', type=int, default=0)
     ep.add_argument('--log-every', type=int, default=100)
     ep.set_defaults(func=cmd_eval)
+
+    pp = sub.add_parser('plot', help='Plot NLL/MAE/RMSE vs k from summary.csv.')
+    pp.add_argument('--summary-csv', default='output/baseline_comparison/summary.csv')
+    pp.add_argument('--out-dir', default='output/baseline_comparison')
+    pp.set_defaults(func=cmd_plot)
 
     return p
 
