@@ -31,6 +31,9 @@ k-fold cross-validation.
 | `scripts/plot_reconstructions.py` | Flow-based reconstructions at a given offset (random / Gaia ID / TIC ID), output to `output/reconstructions/` |
 | `plot_reconstructions.sh` | Shell wrapper for reconstructions |
 | `output/reconstructions/plot_reconstructions.ipynb` | Interactive notebook mirror of the above (reuses its helpers) |
+| `src/lcgen/models/mlp_baseline.py` | MLP local-window baseline (Gaussian + plumbed NSF heads) |
+| `scripts/baseline_comparison.py` | RNN-vs-baseline comparison: `split` / `train_gaussian` subcommands |
+| `baseline_comparison.sh` | Shell wrapper for the baseline comparison pipeline |
 | `kfold_age_inference.sh` | Shell wrapper for age inference |
 | `slurm_bridges2.sh` | SLURM job script for PSC Bridges-2 |
 | `sync_to_bridges2.sh` | Rsync project to Bridges-2 |
@@ -79,6 +82,7 @@ Current best: 3-stage MLP, bottleneck_dim=4, finetune_encoder_lr_mult=0.001 (r=0
 - `--train_full` flag added to train a deployment model on all labeled stars after k-fold CV.
 - `predict_ages.py` auto-detects `full_model.pt` for deployment; falls back to `kfold_models.pt` ensemble.
 - Rolling checkpoint (`checkpoints/resume/`) saves latest epoch only; best model only saved to output dir at end of training.
+- Baseline-comparison pipeline scaffolded (see `docs/plans/2026-05-12_baseline-comparison.md`). Gaussian-head MLP trainer + chunk-aware H5 loader implemented; eval and plotting commands still to add.
 
 ## Bridges-2 (PSC)
 
