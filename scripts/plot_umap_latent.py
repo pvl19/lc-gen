@@ -248,24 +248,38 @@ def load_model(model_path: str, device: torch.device, hidden_size: int = 64,
     return model
 
 
-def compute_multiscale_features(h_valid: torch.Tensor, n_segments: int = 4) -> torch.Tensor:
+def compute_multiscale_features(h_valid: torch.Tensor, n_segments: int = 4,
+                                minmax_edge_skip: int = 0) -> torch.Tensor:
     """Compute multi-scale temporal features from hidden states.
-    
+
     Args:
         h_valid: (L, H) hidden states for valid timesteps
         n_segments: number of temporal segments for quartile pooling
-        
+        minmax_edge_skip: drop this many leading and trailing timesteps before
+            computing global_min / global_max only. The MinGRU cumulative scan
+            is barely averaged near each stream's start, so a single
+            un-smoothed sample can dominate the per-feature min/max even after
+            `trim_edges` strips raw input. Mean/std/segment/diff aggregators
+            average over many steps and are not affected; they always use the
+            full h_valid.
+
     Returns:
         Feature vector combining multiple aggregation strategies
     """
     L, H = h_valid.shape
     features = []
-    
+
     # 1. Global statistics
     global_mean = h_valid.mean(dim=0)  # (H,)
     global_std = h_valid.std(dim=0)    # (H,)
-    global_max = h_valid.max(dim=0).values  # (H,)
-    global_min = h_valid.min(dim=0).values  # (H,)
+    # min/max are single-timestep extrema -> susceptible to edge bias.
+    m = max(0, int(minmax_edge_skip))
+    if m > 0 and L > 2 * m + 1:
+        h_inner = h_valid[m:L - m, :]
+    else:
+        h_inner = h_valid
+    global_max = h_inner.max(dim=0).values  # (H,)
+    global_min = h_inner.min(dim=0).values  # (H,)
     features.extend([global_mean, global_std, global_max, global_min])
     
     # 2. Temporal segment pooling (quartiles)
@@ -300,7 +314,8 @@ def compute_multiscale_features(h_valid: torch.Tensor, n_segments: int = 4) -> t
 def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length: int = None,
                            batch_size: int = 32, pooling_mode: str = 'multiscale',
                            sample_indices: np.ndarray = None, use_metadata: bool = False,
-                           use_conv_channels: bool = False):
+                           use_conv_channels: bool = False, trim_edges: int = 0,
+                           minmax_edge_skip: int = 0):
     """Extract latent vectors for all light curves in the H5 file.
 
     Args:
@@ -341,6 +356,19 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
         else:
             sorted_indices = None
             lengths = f['length'][:]
+
+        if trim_edges > 0:
+            # Strip leading/trailing `trim_edges` samples from each light curve at
+            # encoding time. Pipeline artifacts at e.g. raw index 7 (TESS scattered
+            # light / thermal settling) leak into the multiscale latent via the GRU
+            # hidden states; trimming them here produces clean re-encoded latents
+            # without retraining the model.
+            min_post = 32
+            n_dropped = int(np.sum(lengths < 2 * trim_edges + min_post))
+            if n_dropped:
+                print(f'  trim_edges={trim_edges}: {n_dropped} light curves shorter '
+                      f'than 2*trim+{min_post}; their post-trim length will be clamped to 0.')
+            lengths = np.maximum(lengths - 2 * trim_edges, 0)
 
         # Metadata is small (one scalar per star per feature) — load it all at once
         if load_metadata and 'metadata' in f:
@@ -394,12 +422,14 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
             else:
                 batch_h5_idx = np.arange(start_idx, end_idx)
 
-            # Pad to the longest actual sequence in this batch (dynamic per batch)
+            # Pad to the longest actual (post-trim) sequence in this batch.
             lengths_batch = lengths[start_idx:end_idx]
             batch_max = int(lengths_batch.max())
-            flux_batch = torch.tensor(f['flux'][batch_h5_idx, :batch_max], dtype=torch.float32, device=device)
-            flux_err_batch = torch.tensor(f['flux_err'][batch_h5_idx, :batch_max], dtype=torch.float32, device=device)
-            time_batch = torch.tensor(f['time'][batch_h5_idx, :batch_max], dtype=torch.float32, device=device)
+            slc_start = trim_edges
+            slc_stop  = trim_edges + batch_max
+            flux_batch = torch.tensor(f['flux'][batch_h5_idx, slc_start:slc_stop], dtype=torch.float32, device=device)
+            flux_err_batch = torch.tensor(f['flux_err'][batch_h5_idx, slc_start:slc_stop], dtype=torch.float32, device=device)
+            time_batch = torch.tensor(f['time'][batch_h5_idx, slc_start:slc_stop], dtype=torch.float32, device=device)
 
             if use_conv_channels and spectra_h5_path is not None:
                 conv_data_batch = {
@@ -445,7 +475,10 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
                 elif pooling_mode == 'final':
                     latent = h_combined[-1, :]
                 elif pooling_mode == 'multiscale':
-                    latent = compute_multiscale_features(h_combined, n_segments=4)
+                    latent = compute_multiscale_features(
+                        h_combined, n_segments=4,
+                        minmax_edge_skip=minmax_edge_skip,
+                    )
                 else:
                     raise ValueError(f"Unknown pooling_mode: {pooling_mode}")
 
@@ -660,6 +693,15 @@ def main():
     parser.add_argument('--use_flow', action='store_true')
     parser.add_argument('--use_metadata', action='store_true')
     parser.add_argument('--use_conv_channels', action='store_true')
+    parser.add_argument('--trim_edges', type=int, default=0,
+                        help='If >0, strip this many samples from each end of every light '
+                             'curve before encoding (removes leading/trailing pipeline artifacts). '
+                             'Only applies to fresh extraction, not --load_latents.')
+    parser.add_argument('--minmax_edge_skip', type=int, default=0,
+                        help='If >0, drop this many leading/trailing hidden-state timesteps '
+                             'before computing global_min / global_max only. Mitigates the '
+                             'MinGRU cumulative-scan edge bias on per-feature extrema. '
+                             'Mean/std/segment/diff stats are unaffected.')
     parser.add_argument('--conv_encoder_type', type=str, default='unet', choices=['lightweight', 'unet'])
     parser.add_argument('--max_length', type=int, default=2048, help='Max sequence length for inference')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for inference')
@@ -771,6 +813,8 @@ def main():
                 sample_indices=sample_indices,
                 use_metadata=args.use_metadata,
                 use_conv_channels=args.use_conv_channels,
+                trim_edges=args.trim_edges,
+                minmax_edge_skip=args.minmax_edge_skip,
             )
 
             ages, bprp0, bprp0_err, mg, mg_err, mem_prob, gaia_ids, tic_ids, sectors = load_ages(
