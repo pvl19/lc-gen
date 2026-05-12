@@ -366,7 +366,7 @@ def cmd_train_gaussian(args):
 
 # ----------------------------- eval -----------------------------------------
 
-EVAL_K_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+EVAL_K_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
 
 NAIVE_METHODS = ('nn_mean', 'window_mean')
 
@@ -787,6 +787,10 @@ def cmd_plot(args):
     if not csv_path.exists():
         raise FileNotFoundError(f'{csv_path} not found -- run `eval` first')
     rows = _read_summary(csv_path)
+    exclude = set(args.exclude_methods or [])
+    if exclude:
+        rows = [r for r in rows if r['method'] not in exclude]
+        print(f'[plot] excluded methods: {sorted(exclude)}')
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -894,6 +898,8 @@ def build_parser():
     pp = sub.add_parser('plot', help='Plot NLL/MAE/RMSE vs k from summary.csv.')
     pp.add_argument('--summary-csv', default='output/baseline_comparison/summary.csv')
     pp.add_argument('--out-dir', default='output/baseline_comparison')
+    pp.add_argument('--exclude-methods', nargs='*', default=['nn_mean'],
+                    help='Methods to omit from the plots (kept in summary.csv).')
     pp.set_defaults(func=cmd_plot)
 
     return p

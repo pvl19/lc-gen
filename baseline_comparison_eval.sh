@@ -12,7 +12,7 @@ OUT_DIR="output/baseline_comparison"
 
 DEVICE="cpu"
 SEED=0
-K_MAX=720
+K_MAX=2048                      # eval-side cap; extends beyond the training K=720 to probe extrapolation
 C=32                            # must match the trained MLP's C
 
 # --- Naive-baseline sigma calibration ---
