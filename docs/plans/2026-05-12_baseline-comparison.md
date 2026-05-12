@@ -1,7 +1,12 @@
 # Baseline comparison: RNN+flow vs. local-window predictors
 
 **Date**: 2026-05-12
-**Goal**: Show that the BiDirectionalMinGRU + NSF flow head predicts flux better than naive local-window baselines (interpolation, mean) and a fair-budget learned baseline (MLP on a local window). Quantify both point accuracy (MAE, RMSE) and probabilistic quality (NLL, coverage) as a function of prediction offset `k`.
+**Goal**: Compare the BiDirectionalMinGRU + NSF flow head against two distinct baseline tiers, on flux prediction as a function of offset `k`:
+1. **Naive (closed-form) baselines** — `nn_mean`, `window_mean`. Zero parameters, no metadata, no learning. Establish "is the model doing anything?" floor. Sigma_k for NLL/coverage is fit offline on training residuals (one number per k, per baseline).
+2. **Fair-budget learned baseline** — local-window MLP with metadata, learned per-point sigma, explicit k input. Architecture ablation: shares ~every fair advantage with the RNN except sequence integration, so RNN-vs-MLP isolates whether long-range integration matters.
+3. **RNN + flow head** — the model under test.
+
+The MLP is **not naive** — it has 50k+ params, metadata, and a learned σ. Don't conflate the two baseline tiers in the writeup.
 
 ## What gets (re)trained
 
@@ -80,7 +85,7 @@ For each method (`rnn_flow`, `mlp_nsf`, `mlp_gaussian`, `nn_mean`, `linear_inter
    - Record: per-point `(μ, σ, target)` (for probabilistic methods) or `(prediction, target)` (for point methods).
 3. Aggregate: per-star MAE, RMSE, NLL (Gaussian for baselines, sample-based for flow), 68%/95% interval coverage.
 
-**Converting point baselines to probabilistic**: for `nn_mean`, `linear_interp`, `window_mean`, fit a single `σ_k` per `k` on the training split's residuals (one number per `k`). Use that fixed `σ_k` at eval time. This gives them an honest NLL without letting them cheat by adapting `σ` per-point.
+**Converting point baselines to probabilistic**: for `nn_mean` and `window_mean`, fit a single `σ_k` per `k` on **training-set residuals** (disjoint from eval-10% and sanity-val) — one number per `(method, k)`. Use that fixed `σ_k` at eval time. This gives the naive baselines an honest probabilistic NLL without letting them cheat by adapting `σ` per-point. Implemented as the `fit_baselines` subcommand; writes `baseline_sigmas.json`.
 
 **Sampling vs. log_prob (flow methods, eval only)**:
 
@@ -105,25 +110,27 @@ The RNN's `bounded_horizon_future_nll` training loss is `log_prob`-based — no 
 
 ```
 output/baseline_comparison/
-├── mlp_gaussian.pt              # MLP context encoder + Gaussian head
-├── mlp_nsf.pt                   # MLP context encoder + NSF head
+├── mlp_gaussian_best.pt         # MLP context encoder + Gaussian head (early-stopped on sanity-val)
+├── mlp_gaussian_last.pt         # last-epoch MLP checkpoint
+├── mlp_gaussian_history.json    # per-epoch train + sanity-val loss; best_epoch
 ├── split.json                   # eval-10% gaia_ids + training gaia_ids (full set)
-├── predictions.parquet          # per-(star, j, k, method): mu, sigma, target
-├── summary.csv                  # per-(method, k): mean MAE, RMSE, NLL, coverage + IQR
+├── baseline_sigmas.json         # per-(method, k) Gaussian sigma for nn_mean / window_mean
+├── summary.csv                  # per-(method, k): MAE, RMSE, NLL, coverage68, coverage95
 ├── mae_vs_k.png
 ├── nll_vs_k.png
-└── coverage_vs_k.png
+└── rmse_vs_k.png
 ```
 
-`predictions.parquet` lets us re-aggregate later without re-running inference.
+The MLP-NSF head is deprioritized — the MLP-Gaussian + naive-baseline-with-σ_k pair already answers the question. See "Decisions (continued)" below.
 
 ## Files to add
 
 | File | Purpose |
 |---|---|
-| `scripts/baseline_comparison.py` | One-script entrypoint. Subcommands: `split`, `train_gaussian`, `train_nsf`, `eval`, `plot`. Each step writes its outputs and can be re-run independently. |
-| `src/lcgen/models/mlp_baseline.py` | Shared context encoder + Gaussian head + NSF head. |
-| `bin/baseline_comparison.sh` (or `baseline_comparison.sh` at repo root, matching existing convention) | Shell wrapper, all params hardcoded. |
+| `scripts/baseline_comparison.py` | One-script entrypoint. Subcommands: `split`, `train_gaussian`, `fit_baselines`, `eval`, `plot`. (`train_nsf` deferred — see decisions below.) |
+| `src/lcgen/models/mlp_baseline.py` | Shared context encoder + Gaussian head + plumbed NSF head. |
+| `baseline_comparison.sh` | Shell wrapper: `split` + `train_gaussian`. |
+| `baseline_comparison_eval.sh` | Shell wrapper: `fit_baselines` + `eval` + `plot`. |
 
 ## Decisions (locked in 2026-05-12)
 
@@ -138,9 +145,16 @@ output/baseline_comparison/
 - **Sampling at training**: none. Both `mlp_nsf` and the existing RNN use NSF `log_prob` as the loss. Sampling is eval-only.
 - **`n_flow_samples` at eval**: 128 (matches the notebook).
 
+## Decisions (2026-05-12, post first eval)
+
+- **Three-tier comparison locked in**: naive (closed-form) / fair-budget learned MLP / RNN+flow. The MLP is explicitly framed as the "architecture ablation" tier, not a naive baseline.
+- **σ_k for naive baselines is fit on a training subsample**, not on eval residuals — keeps the comparison honest. ~500 training stars is enough for stable σ estimates at every k.
+- **NSF-head MLP is deferred indefinitely.** The first eval pass showed `mlp_gaussian` and `window_mean` are essentially tied on MAE/RMSE — meaning the MLP encoder's gain over a window mean is small for point prediction. An NSF head on top would mostly demonstrate flow-vs-Gaussian on the SAME (weak) encoder, which is a different question from "does the RNN architecture matter". Revisit only if there's a specific reason to want it.
+- **Eval n_flow_samples default is 0** (NLL via `log_prob` only). MAE-on-median + coverage for the flow require sampling and cost ~4× the runtime — opt in via the shell-script knob when needed.
+
 ## Remaining open question
 
-- **Coverage runtime** — full resolution is ~200 stars × 10 k-values × ~18k points × 128 samples for the two flow methods. If this is too slow, subsample timesteps per sector at eval (e.g. every 10th point). Decide once we measure.
+- **Coverage runtime for the flow** — sampling 128 draws per (j, k) for the eval-10% would take ~2 hr on CPU. Either accept the cost or sample at a coarser j-grid. Decide if we end up wanting the coverage curves for the writeup.
 
 ## Out of scope
 

@@ -368,6 +368,87 @@ def cmd_train_gaussian(args):
 
 EVAL_K_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
 
+NAIVE_METHODS = ('nn_mean', 'window_mean')
+
+
+def _naive_predict(flux: torch.Tensor, js: torch.Tensor, k: int, C: int,
+                   arange_C: torch.Tensor):
+    """Return {'nn_mean', 'window_mean'} predictions for the given js."""
+    pred_nn = 0.5 * (flux[js - k] + flux[js + k])
+    fwd_idx = js.unsqueeze(1) - k - C + arange_C.unsqueeze(0)
+    bwd_idx = js.unsqueeze(1) + k + arange_C.unsqueeze(0)
+    fwd = flux[fwd_idx].mean(dim=1)
+    bwd = flux[bwd_idx].mean(dim=1)
+    pred_wm = 0.5 * (fwd + bwd)
+    return {'nn_mean': pred_nn, 'window_mean': pred_wm}
+
+
+# ----------------------------- fit_baselines --------------------------------
+
+def cmd_fit_baselines(args):
+    """Fit a per-k Gaussian sigma for each naive baseline on training residuals.
+
+    These baselines are deterministic, so sigma_k is just the residual std. We
+    estimate it on a held-out subset of training stars (disjoint from both eval
+    and sanity-val) so it isn't oracle-fit to the comparison set. Writes
+    baseline_sigmas.json which `eval` loads to compute NLL + coverage.
+    """
+    split = json.loads(Path(args.split_path).read_text())
+    full_index = build_index([Path(p) for p in split['h5_paths']])
+    eval_ids = set(split['eval_gaia_ids'])
+    sanity_ids = set(split['sanity_gaia_ids'])
+    fit_idx = [i for i, e in enumerate(full_index)
+               if e['gaia_id'] not in eval_ids and e['gaia_id'] not in sanity_ids]
+    rng = np.random.default_rng(args.seed)
+    rng.shuffle(fit_idx)
+    if args.fit_stars:
+        fit_idx = fit_idx[:args.fit_stars]
+    print(f'[fit] {len(fit_idx)} training sequences for sigma calibration')
+
+    device = torch.device(args.device)
+    store = SequenceStore(full_index, use_metadata=False, device=device)
+    C = int(args.C)
+    arange_C = torch.arange(C, device=device, dtype=torch.long)
+
+    stats = {m: {k: {'sum_se': 0.0, 'n': 0} for k in EVAL_K_GRID}
+             for m in NAIVE_METHODS}
+
+    for entry, flux, ferr, times, _ in store.iter_chunks(fit_idx, shuffle_chunks=False, shuffle_within=False):
+        L = entry['length']
+        for k in EVAL_K_GRID:
+            j_min = k + C
+            j_max = L - k - C
+            if j_max <= j_min or k > args.K_max:
+                continue
+            n_full = j_max - j_min
+            if args.n_targets_per_seq and args.n_targets_per_seq < n_full:
+                picks = rng.choice(n_full, size=args.n_targets_per_seq, replace=False)
+                picks.sort()
+                js = torch.from_numpy(picks.astype(np.int64) + j_min).to(device)
+            else:
+                js = torch.arange(j_min, j_max, device=device, dtype=torch.long)
+            target = flux[js]
+            preds = _naive_predict(flux, js, k, C, arange_C)
+            for m, pred in preds.items():
+                err = (target - pred)
+                stats[m][k]['sum_se'] += float((err ** 2).sum().item())
+                stats[m][k]['n'] += int(target.numel())
+
+    store.close()
+    sigmas = {}
+    for m, by_k in stats.items():
+        sigmas[m] = {}
+        for k, s in by_k.items():
+            if s['n']:
+                sigmas[m][k] = math.sqrt(s['sum_se'] / s['n'])
+    out_path = Path(args.out_dir) / 'baseline_sigmas.json'
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, 'w') as f:
+        json.dump({'sigmas': sigmas, 'n_fit_stars': len(fit_idx), 'C': C}, f, indent=2)
+    print(f'[fit] wrote {out_path}')
+    for m, by_k in sigmas.items():
+        print(f'  {m}:  ' + '  '.join(f'k={k}: σ={s:.4f}' for k, s in sorted(by_k.items())))
+
 
 def _load_rnn_model(model_path: str, device, num_meta_features: int):
     """Load the trained BiDirectionalMinGRU + flow head."""
@@ -549,6 +630,17 @@ def cmd_eval(args):
         rnn = _load_rnn_model(args.rnn_path, device,
                               num_meta_features=len(METADATA_FEATURES))
 
+    # Optional: per-k sigma for the naive baselines (enables NLL + coverage).
+    baseline_sigmas = {}
+    sigmas_path = Path(args.baseline_sigmas) if args.baseline_sigmas else None
+    if sigmas_path and sigmas_path.exists():
+        payload = json.loads(sigmas_path.read_text())
+        for m, by_k in payload.get('sigmas', {}).items():
+            baseline_sigmas[m] = {int(k): float(s) for k, s in by_k.items()}
+        print(f'[eval] loaded naive-baseline sigmas from {sigmas_path}')
+    elif sigmas_path:
+        print(f'[eval] {sigmas_path} not found -- naive baselines will report MAE/RMSE only')
+
     rng = np.random.default_rng(args.seed)
     acc = _StatAcc()
     arange_C = torch.arange(C, device=device, dtype=torch.long)
@@ -592,17 +684,16 @@ def cmd_eval(args):
                 sigma = torch.exp(0.5 * log_var)
                 acc.add_gaussian('mlp_gaussian', k, target, mu, sigma, seq_id=seq_id)
 
-                # NN-mean (== linear interp midpoint).
-                pred_nn = 0.5 * (flux[js - k] + flux[js + k])
-                acc.add_point('nn_mean', k, target, pred_nn, seq_id=seq_id)
-
-                # Window-mean.
-                fwd_idx = js.unsqueeze(1) - k - C + arange_C.unsqueeze(0)
-                bwd_idx = js.unsqueeze(1) + k + arange_C.unsqueeze(0)
-                fwd = flux[fwd_idx].mean(dim=1)
-                bwd = flux[bwd_idx].mean(dim=1)
-                pred_wm = 0.5 * (fwd + bwd)
-                acc.add_point('window_mean', k, target, pred_wm, seq_id=seq_id)
+                # Naive baselines. If sigma_k is available, route through the
+                # Gaussian accumulator to compute NLL + coverage.
+                preds = _naive_predict(flux, js, k, C, arange_C)
+                for m, pred in preds.items():
+                    sigma_k = baseline_sigmas.get(m, {}).get(k)
+                    if sigma_k is not None:
+                        sigma_t = torch.full_like(pred, float(sigma_k))
+                        acc.add_gaussian(m, k, target, pred, sigma_t, seq_id=seq_id)
+                    else:
+                        acc.add_point(m, k, target, pred, seq_id=seq_id)
 
                 # RNN flow.
                 if rnn_cache is not None:
@@ -764,6 +855,19 @@ def build_parser():
                          '0 = use all valid positions (slow, full signal).')
     tp.set_defaults(func=cmd_train_gaussian)
 
+    fp = sub.add_parser('fit_baselines',
+                        help='Fit per-k Gaussian sigma for naive baselines on training residuals.')
+    fp.add_argument('--split-path', default='output/baseline_comparison/split.json')
+    fp.add_argument('--out-dir', default='output/baseline_comparison')
+    fp.add_argument('--device', default='cpu')
+    fp.add_argument('--seed', type=int, default=0)
+    fp.add_argument('--K-max', type=int, default=720)
+    fp.add_argument('--C', type=int, default=32)
+    fp.add_argument('--fit-stars', type=int, default=500,
+                    help='Subsample of training sequences for sigma calibration (0 = all).')
+    fp.add_argument('--n-targets-per-seq', type=int, default=256)
+    fp.set_defaults(func=cmd_fit_baselines)
+
     ep = sub.add_parser('eval', help='Evaluate baselines on the eval-10% split.')
     ep.add_argument('--split-path', default='output/baseline_comparison/split.json')
     ep.add_argument('--out-dir', default='output/baseline_comparison')
@@ -781,6 +885,10 @@ def build_parser():
                     help='Flow samples per point for MAE/coverage. 0 = NLL only (cheap).')
     ep.add_argument('--max-eval-seqs', type=int, default=0)
     ep.add_argument('--log-every', type=int, default=100)
+    ep.add_argument('--baseline-sigmas',
+                    default='output/baseline_comparison/baseline_sigmas.json',
+                    help='Path to per-k Gaussian sigma for naive baselines. '
+                         'Pass empty string to skip NLL/coverage for them.')
     ep.set_defaults(func=cmd_eval)
 
     pp = sub.add_parser('plot', help='Plot NLL/MAE/RMSE vs k from summary.csv.')
