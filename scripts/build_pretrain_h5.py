@@ -31,8 +31,13 @@ OUT_EXOP = DATA_DIR / 'timeseries_exop_hosts.h5'
 STR_FIELDS = ['GaiaDR3_ID']
 # Numeric metadata fields from CSV
 NUM_FIELDS_CSV = ['Tmag', 'parallax', 'parallax_error', 'G0', 'G0_err', 'BPRP0', 'BPRP0_err']
-# Numeric metadata fields from pickle
-NUM_FIELDS_PICKLE = ['camera', 'ccd', 'mean_flux', 'std_flux']
+# Numeric metadata fields from pickle. mean_flux / std_flux describe the
+# original (outlier-sensitive) z-score normalization; median_flux /
+# iqr_half_flux describe the robust re-normalization written by
+# scripts/robust_renormalize_pickles.py. Old pickles without the robust fields
+# write NaN — downstream code can fall back to mean/std.
+NUM_FIELDS_PICKLE = ['camera', 'ccd', 'mean_flux', 'std_flux',
+                     'median_flux', 'iqr_half_flux']
 # Constant metadata fields
 CADENCE_S = 120.0
 

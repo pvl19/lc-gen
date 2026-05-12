@@ -31,8 +31,8 @@ DEFAULT_METADATA_FIELDS = [
     'G0_err',
     'BPRP0',
     'BPRP0_err',
-    'mean_flux',
-    'std_flux',
+    'median_flux',
+    'iqr_half_flux',
 ]
 
 
