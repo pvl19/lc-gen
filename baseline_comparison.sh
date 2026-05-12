@@ -30,6 +30,13 @@ N_TARGETS_PER_SEQ=1024   # random j-positions sampled per sequence per step (0 =
 MAX_TRAIN_SEQS=0
 MAX_SANITY_SEQS=0
 
+# --- Eval ---
+RNN_PATH="final_model/parallel_fixed/e110/best_model.pt"
+N_EVAL_TARGETS_PER_SEQ=256   # j positions subsampled per (sequence, k)
+N_FLOW_SAMPLES=0             # 0 = NLL only; bump (e.g. 128) for MAE-on-median + coverage
+MAX_EVAL_SEQS=0              # 0 = full eval-10%, else smoke cap
+EVAL_LOG_EVERY=100
+
 mkdir -p "${OUT_DIR}"
 
 # 1. Build deterministic gaia_id split (idempotent — rerunning is fine).
@@ -57,3 +64,17 @@ python scripts/baseline_comparison.py train_gaussian \
   --max-train-seqs ${MAX_TRAIN_SEQS} \
   --max-sanity-seqs ${MAX_SANITY_SEQS} \
   --n-targets-per-seq ${N_TARGETS_PER_SEQ}
+
+# 3. Evaluate all methods on the eval-10% split.
+python scripts/baseline_comparison.py eval \
+  --split-path "${OUT_DIR}/split.json" \
+  --out-dir "${OUT_DIR}" \
+  --mlp-path "${OUT_DIR}/mlp_gaussian_best.pt" \
+  --rnn-path "${RNN_PATH}" \
+  --device "${DEVICE}" \
+  --seed ${SEED} \
+  --K-max ${K_MAX} \
+  --n-eval-targets-per-seq ${N_EVAL_TARGETS_PER_SEQ} \
+  --n-flow-samples ${N_FLOW_SAMPLES} \
+  --max-eval-seqs ${MAX_EVAL_SEQS} \
+  --log-every ${EVAL_LOG_EVERY}

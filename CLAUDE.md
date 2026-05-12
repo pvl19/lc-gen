@@ -82,7 +82,7 @@ Current best: 3-stage MLP, bottleneck_dim=4, finetune_encoder_lr_mult=0.001 (r=0
 - `--train_full` flag added to train a deployment model on all labeled stars after k-fold CV.
 - `predict_ages.py` auto-detects `full_model.pt` for deployment; falls back to `kfold_models.pt` ensemble.
 - Rolling checkpoint (`checkpoints/resume/`) saves latest epoch only; best model only saved to output dir at end of training.
-- Baseline-comparison pipeline scaffolded (see `docs/plans/2026-05-12_baseline-comparison.md`). Gaussian-head MLP trainer + chunk-aware H5 loader implemented; eval and plotting commands still to add.
+- Baseline-comparison pipeline: Gaussian-head MLP trainer + chunk-aware H5 loader + `eval` subcommand comparing `mlp_gaussian`, `rnn_flow`, `nn_mean`, `window_mean` on the eval-10% set (NLL via flow `log_prob`; MAE/coverage via sampled quantiles). Writes `summary.csv`. NSF-head training + plotting still to add. See `docs/plans/2026-05-12_baseline-comparison.md`.
 
 ## Bridges-2 (PSC)
 

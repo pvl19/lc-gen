@@ -364,6 +364,288 @@ def cmd_train_gaussian(args):
     print(f'[done] best epoch {best_epoch} (sanity_nll={best_sanity:.4f})')
 
 
+# ----------------------------- eval -----------------------------------------
+
+EVAL_K_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+
+
+def _load_rnn_model(model_path: str, device, num_meta_features: int):
+    """Load the trained BiDirectionalMinGRU + flow head."""
+    from lcgen.models.simple_min_gru import BiDirectionalMinGRU
+    ckpt = torch.load(model_path, map_location=device, weights_only=False)
+    sd = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
+    has_meta = any(k.startswith('meta_encoder.') for k in sd)
+    has_flow = any(k.startswith('flow.') for k in sd)
+    has_conv = any(k.startswith('ps_encoder.') for k in sd)
+    if not has_meta:
+        num_meta_features = 0
+    if isinstance(ckpt, dict) and 'num_meta_features' in ckpt:
+        num_meta_features = ckpt['num_meta_features']
+    model = BiDirectionalMinGRU(
+        hidden_size=64, direction='bi', mode='parallel',
+        use_flow=has_flow, num_meta_features=num_meta_features,
+        use_conv_channels=has_conv,
+    ).to(device)
+    model.load_state_dict(sd)
+    model.eval()
+    print(f'[rnn] loaded {model_path} (meta={num_meta_features}, conv={has_conv}, flow={has_flow})')
+    return model
+
+
+def _rnn_forward_cache(rnn, flux, ferr, times, meta):
+    """Single forward over a sequence; returns h_fwd, h_bwd, t_enc."""
+    flux_b = flux.unsqueeze(0)
+    ferr_b = ferr.unsqueeze(0)
+    times_b = times.unsqueeze(0)
+    L = flux_b.size(1)
+    mask = torch.ones(1, L, device=flux.device)
+    x_in = torch.stack([flux_b, ferr_b], dim=-1)
+    t_in = times_b.unsqueeze(-1)
+    meta_b = meta.unsqueeze(0) if meta is not None else None
+    out = rnn(x_in, t_in, mask=mask, metadata=meta_b, conv_data=None, return_states=True)
+    return {
+        'h_fwd': out.get('h_fwd_tensor'),
+        'h_bwd': out.get('h_bwd_tensor'),
+        't_enc': out['t_enc'],
+    }
+
+
+def _rnn_flow_predict(rnn, cache, js, k, ferr, target, n_samples: int):
+    """Evaluate flow head at (js, k). Returns (log_prob, samples or None)."""
+    h_fwd = cache['h_fwd']
+    h_bwd = cache['h_bwd']
+    t_enc = cache['t_enc']
+    src_f = h_fwd[0, js - k]
+    src_b = h_bwd[0, js + k]
+    t_tgt = t_enc[0, js]
+    Te = t_tgt.size(-1)
+    flat_in = torch.cat([src_f, src_b, t_tgt], dim=-1)
+    normed = rnn.head_norm(flat_in)
+    if Te > 0:
+        normed = torch.cat([normed[:, :-Te], normed[:, -Te:] * rnn.time_scale], dim=1)
+    ferr_j = ferr[js].unsqueeze(-1)
+    ctx = torch.cat([normed, ferr_j], dim=-1)
+    dist = rnn.flow(ctx)
+    log_prob = dist.log_prob(target.unsqueeze(-1)).view(-1)
+    samples = None
+    if n_samples > 0:
+        s = torch.stack([dist.sample() for _ in range(n_samples)], dim=0).squeeze(-1)
+        samples = s  # (S, N)
+    return log_prob, samples
+
+
+class _StatAcc:
+    """Running sums for MAE / RMSE / NLL / coverage per (method, k)."""
+
+    def __init__(self):
+        self.bins = {}
+
+    def _bin(self, key):
+        s = self.bins.get(key)
+        if s is None:
+            s = {'n': 0, 'sum_ae': 0.0, 'sum_se': 0.0,
+                 'sum_nll': 0.0, 'n_nll': 0,
+                 'n_c68': 0, 'n_c95': 0, 'n_cov': 0, 'seqs': set()}
+            self.bins[key] = s
+        return s
+
+    def add_point(self, method, k, target, pred, seq_id=None):
+        s = self._bin((method, k))
+        err = (target - pred)
+        s['n'] += int(target.numel())
+        s['sum_ae'] += float(err.abs().sum().item())
+        s['sum_se'] += float((err ** 2).sum().item())
+        if seq_id is not None:
+            s['seqs'].add(seq_id)
+
+    def add_gaussian(self, method, k, target, mu, sigma, seq_id=None):
+        s = self._bin((method, k))
+        err = (target - mu)
+        s['n'] += int(target.numel())
+        s['sum_ae'] += float(err.abs().sum().item())
+        s['sum_se'] += float((err ** 2).sum().item())
+        nll = 0.5 * (torch.log(2 * math.pi * sigma ** 2) + (err / sigma) ** 2)
+        s['sum_nll'] += float(nll.sum().item())
+        s['n_nll'] += int(target.numel())
+        z = err / sigma
+        s['n_c68'] += int((z.abs() <= 1.0).sum().item())
+        s['n_c95'] += int((z.abs() <= 1.96).sum().item())
+        s['n_cov'] += int(target.numel())
+        if seq_id is not None:
+            s['seqs'].add(seq_id)
+
+    def add_flow(self, method, k, target, log_prob, samples, seq_id=None):
+        s = self._bin((method, k))
+        s['sum_nll'] += float((-log_prob).sum().item())
+        s['n_nll'] += int(target.numel())
+        if samples is not None:
+            median = samples.quantile(0.5, dim=0)
+            p16 = samples.quantile(0.16, dim=0)
+            p84 = samples.quantile(0.84, dim=0)
+            p025 = samples.quantile(0.025, dim=0)
+            p975 = samples.quantile(0.975, dim=0)
+            err = (target - median)
+            s['n'] += int(target.numel())
+            s['sum_ae'] += float(err.abs().sum().item())
+            s['sum_se'] += float((err ** 2).sum().item())
+            in68 = ((target >= p16) & (target <= p84))
+            in95 = ((target >= p025) & (target <= p975))
+            s['n_c68'] += int(in68.sum().item())
+            s['n_c95'] += int(in95.sum().item())
+            s['n_cov'] += int(target.numel())
+        if seq_id is not None:
+            s['seqs'].add(seq_id)
+
+    def rows(self):
+        out = []
+        for (method, k), s in sorted(self.bins.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+            n = max(s['n'], 1)
+            n_nll = s['n_nll']
+            n_cov = s['n_cov']
+            row = {
+                'method': method,
+                'k': k,
+                'n_points': s['n'],
+                'n_seqs': len(s['seqs']),
+                'mae': s['sum_ae'] / n if s['n'] else float('nan'),
+                'rmse': math.sqrt(s['sum_se'] / n) if s['n'] else float('nan'),
+                'nll': (s['sum_nll'] / n_nll) if n_nll else float('nan'),
+                'coverage68': (s['n_c68'] / n_cov) if n_cov else float('nan'),
+                'coverage95': (s['n_c95'] / n_cov) if n_cov else float('nan'),
+            }
+            out.append(row)
+        return out
+
+
+def cmd_eval(args):
+    split = json.loads(Path(args.split_path).read_text())
+    full_index = build_index([Path(p) for p in split['h5_paths']])
+    eval_ids = set(split['eval_gaia_ids'])
+    eval_idx = [i for i, e in enumerate(full_index) if e['gaia_id'] in eval_ids]
+    if args.max_eval_seqs:
+        eval_idx = eval_idx[:args.max_eval_seqs]
+    print(f'[eval] {len(eval_idx)} eval sequences')
+
+    device = torch.device(args.device)
+    store = SequenceStore(full_index, use_metadata=True, device=device)
+
+    # Load MLP Gaussian.
+    mlp_ckpt = torch.load(args.mlp_path, map_location=device, weights_only=False)
+    cfg = mlp_ckpt['config']
+    C = int(cfg['C'])
+    mlp = MLPGaussianBaseline(
+        C=C,
+        num_meta_features=int(cfg['num_meta_features']),
+        hidden_dims=tuple(cfg['hidden_dims']),
+        context_dim=int(cfg['context_dim']),
+    ).to(device)
+    mlp.load_state_dict(mlp_ckpt['model_state'])
+    mlp.eval()
+    print(f'[mlp] loaded {args.mlp_path} (C={C}, context_dim={cfg["context_dim"]})')
+
+    # Load RNN (optional).
+    rnn = None
+    if args.rnn_path:
+        rnn = _load_rnn_model(args.rnn_path, device,
+                              num_meta_features=len(METADATA_FEATURES))
+
+    rng = np.random.default_rng(args.seed)
+    acc = _StatAcc()
+    arange_C = torch.arange(C, device=device, dtype=torch.long)
+
+    t0 = time.time()
+    seq_count = 0
+    with torch.no_grad():
+        for entry, flux, ferr, times, meta in store.iter_chunks(
+                eval_idx, shuffle_chunks=False, shuffle_within=False):
+            L = entry['length']
+            seq_id = (entry['gaia_id'], entry['sector'])
+
+            rnn_cache = None
+            if rnn is not None:
+                rnn_cache = _rnn_forward_cache(rnn, flux, ferr, times, meta)
+
+            for k in EVAL_K_GRID:
+                j_min = k + C
+                j_max = L - k - C
+                if j_max <= j_min:
+                    continue
+                if k > args.K_max:
+                    continue
+
+                n_full = j_max - j_min
+                if args.n_eval_targets_per_seq and args.n_eval_targets_per_seq < n_full:
+                    picks = rng.choice(n_full, size=args.n_eval_targets_per_seq, replace=False)
+                    picks.sort()
+                    js = torch.from_numpy(picks.astype(np.int64) + j_min).to(device)
+                else:
+                    js = torch.arange(j_min, j_max, device=device, dtype=torch.long)
+
+                target = flux[js]
+
+                # MLP Gaussian.
+                x, _, _, _ = build_context_batch(
+                    flux, ferr, times, meta, k=k, C=C, js=js,
+                )
+                mu, log_var = mlp(x)
+                log_var = log_var.clamp(-10.0, 6.0)
+                sigma = torch.exp(0.5 * log_var)
+                acc.add_gaussian('mlp_gaussian', k, target, mu, sigma, seq_id=seq_id)
+
+                # NN-mean (== linear interp midpoint).
+                pred_nn = 0.5 * (flux[js - k] + flux[js + k])
+                acc.add_point('nn_mean', k, target, pred_nn, seq_id=seq_id)
+
+                # Window-mean.
+                fwd_idx = js.unsqueeze(1) - k - C + arange_C.unsqueeze(0)
+                bwd_idx = js.unsqueeze(1) + k + arange_C.unsqueeze(0)
+                fwd = flux[fwd_idx].mean(dim=1)
+                bwd = flux[bwd_idx].mean(dim=1)
+                pred_wm = 0.5 * (fwd + bwd)
+                acc.add_point('window_mean', k, target, pred_wm, seq_id=seq_id)
+
+                # RNN flow.
+                if rnn_cache is not None:
+                    log_prob, samples = _rnn_flow_predict(
+                        rnn, rnn_cache, js, k, ferr, target,
+                        n_samples=args.n_flow_samples,
+                    )
+                    acc.add_flow('rnn_flow', k, target, log_prob, samples,
+                                 seq_id=seq_id)
+
+            seq_count += 1
+            if args.log_every and seq_count % args.log_every == 0:
+                dt = time.time() - t0
+                rate = seq_count / dt if dt > 0 else 0.0
+                print(f'  [eval] {seq_count}/{len(eval_idx)} seqs  ({rate:.2f} seq/s)')
+
+    store.close()
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows = acc.rows()
+    csv_path = out_dir / 'summary.csv'
+    cols = ['method', 'k', 'n_points', 'n_seqs', 'mae', 'rmse', 'nll',
+            'coverage68', 'coverage95']
+    with open(csv_path, 'w') as f:
+        f.write(','.join(cols) + '\n')
+        for r in rows:
+            f.write(','.join(str(r[c]) for c in cols) + '\n')
+    print(f'[eval] wrote {csv_path} ({len(rows)} rows)')
+    # Pretty-print so the user can read the result immediately.
+    by_method = {}
+    for r in rows:
+        by_method.setdefault(r['method'], []).append(r)
+    for method, rs in sorted(by_method.items()):
+        rs.sort(key=lambda x: x['k'])
+        print(f'  {method}')
+        print(f'    k     MAE      RMSE     NLL       cov68   cov95')
+        for r in rs:
+            nll = '   nan ' if math.isnan(r['nll']) else f'{r["nll"]:7.4f}'
+            c68 = '  nan' if math.isnan(r['coverage68']) else f'{r["coverage68"]:5.3f}'
+            c95 = '  nan' if math.isnan(r['coverage95']) else f'{r["coverage95"]:5.3f}'
+            print(f'    {r["k"]:<4d}  {r["mae"]:7.4f}  {r["rmse"]:7.4f}  {nll}   {c68}   {c95}')
+
+
 # ----------------------------- entry ----------------------------------------
 
 def build_parser():
@@ -401,6 +683,25 @@ def build_parser():
                          '0 = use all valid positions (slow, full signal).')
     tp.set_defaults(func=cmd_train_gaussian)
 
+    ep = sub.add_parser('eval', help='Evaluate baselines on the eval-10% split.')
+    ep.add_argument('--split-path', default='output/baseline_comparison/split.json')
+    ep.add_argument('--out-dir', default='output/baseline_comparison')
+    ep.add_argument('--mlp-path', required=True,
+                    help='Path to mlp_gaussian_best.pt')
+    ep.add_argument('--rnn-path', default=None,
+                    help='Path to the RNN+flow checkpoint (e.g. final_model/parallel_fixed/e110/best_model.pt). '
+                         'If omitted, only MLP + non-learned baselines are evaluated.')
+    ep.add_argument('--device', default='cpu')
+    ep.add_argument('--seed', type=int, default=0)
+    ep.add_argument('--K-max', type=int, default=720)
+    ep.add_argument('--n-eval-targets-per-seq', type=int, default=256,
+                    help='Subsample of valid j per (sequence, k). 0 = all valid positions.')
+    ep.add_argument('--n-flow-samples', type=int, default=0,
+                    help='Flow samples per point for MAE/coverage. 0 = NLL only (cheap).')
+    ep.add_argument('--max-eval-seqs', type=int, default=0)
+    ep.add_argument('--log-every', type=int, default=100)
+    ep.set_defaults(func=cmd_eval)
+
     return p
 
 
@@ -408,6 +709,8 @@ def main():
     args = build_parser().parse_args()
     args.max_train_seqs = args.max_train_seqs if getattr(args, 'max_train_seqs', 0) > 0 else None
     args.max_sanity_seqs = args.max_sanity_seqs if getattr(args, 'max_sanity_seqs', 0) > 0 else None
+    if hasattr(args, 'max_eval_seqs'):
+        args.max_eval_seqs = args.max_eval_seqs if args.max_eval_seqs > 0 else None
     args.func(args)
 
 

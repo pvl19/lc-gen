@@ -129,7 +129,7 @@ def gaussian_nll(mu: torch.Tensor, log_var: torch.Tensor, target: torch.Tensor,
 
 def build_context_batch(flux: torch.Tensor, flux_err: torch.Tensor, times: torch.Tensor,
                         metadata: torch.Tensor, k: int, C: int,
-                        n_targets: int = 0, rng=None):
+                        n_targets: int = 0, rng=None, js: torch.Tensor = None):
     """Build (N_valid, input_dim) context vectors for valid j in one sequence.
 
     Valid j range: [k + C, L - k - C) — positions with full context on both sides.
@@ -145,6 +145,9 @@ def build_context_batch(flux: torch.Tensor, flux_err: torch.Tensor, times: torch
         n_targets: if > 0, randomly subsample this many j positions per sequence.
                    0 means use all valid positions (slower but full signal).
         rng: numpy Generator used for the subsampling; required when n_targets > 0.
+        js: optional explicit (N,) long tensor of j positions. Caller is
+            responsible for ensuring every j lies in the valid range. When
+            provided, n_targets/rng are ignored.
 
     Returns:
         x: (N, input_dim) tensor of context vectors, or None if no valid j.
@@ -164,15 +167,18 @@ def build_context_batch(flux: torch.Tensor, flux_err: torch.Tensor, times: torch
     device = flux.device
     M = 0 if metadata is None else int(metadata.shape[0])
 
-    n_full = j_max - j_min
-    if n_targets and n_targets < n_full:
-        if rng is None:
-            raise ValueError("rng must be provided when n_targets > 0")
-        picks = rng.choice(n_full, size=n_targets, replace=False)
-        picks.sort()
-        js = torch.from_numpy(picks.astype(np.int64)).to(device) + j_min
+    if js is not None:
+        js = js.to(device=device, dtype=torch.long)
     else:
-        js = torch.arange(j_min, j_max, device=device, dtype=torch.long)
+        n_full = j_max - j_min
+        if n_targets and n_targets < n_full:
+            if rng is None:
+                raise ValueError("rng must be provided when n_targets > 0")
+            picks = rng.choice(n_full, size=n_targets, replace=False)
+            picks.sort()
+            js = torch.from_numpy(picks.astype(np.int64)).to(device) + j_min
+        else:
+            js = torch.arange(j_min, j_max, device=device, dtype=torch.long)
     N = int(js.shape[0])
 
     arange_C = torch.arange(C, device=device, dtype=torch.long)
