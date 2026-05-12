@@ -33,7 +33,8 @@ k-fold cross-validation.
 | `output/reconstructions/plot_reconstructions.ipynb` | Interactive notebook mirror of the above (reuses its helpers) |
 | `src/lcgen/models/mlp_baseline.py` | MLP local-window baseline (Gaussian + plumbed NSF heads) |
 | `scripts/baseline_comparison.py` | RNN-vs-baseline comparison: `split` / `train_gaussian` subcommands |
-| `baseline_comparison.sh` | Shell wrapper for the baseline comparison pipeline |
+| `baseline_comparison.sh` | Shell wrapper: split + train Gaussian MLP baseline |
+| `baseline_comparison_eval.sh` | Shell wrapper: eval all methods on the eval-10% split |
 | `kfold_age_inference.sh` | Shell wrapper for age inference |
 | `slurm_bridges2.sh` | SLURM job script for PSC Bridges-2 |
 | `sync_to_bridges2.sh` | Rsync project to Bridges-2 |
