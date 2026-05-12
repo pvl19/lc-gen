@@ -21,11 +21,11 @@ import numpy as np
 import pandas as pd
 
 DATA_DIR = Path('final_pretrain')
-PICKLE_FILES = [DATA_DIR / f'lc_data_p{i}.pickle' for i in range(1, 8)]
-META_CSV = DATA_DIR / 'metadata.csv'
-HOST_META_CSV = DATA_DIR / 'host_all_metadata.csv'
-OUT_PRETRAIN = DATA_DIR / 'timeseries_pretrain.h5'
-OUT_EXOP = DATA_DIR / 'timeseries_exop_hosts.h5'
+DEFAULT_PICKLE_FILES = [DATA_DIR / f'lc_data_p{i}.pickle' for i in range(1, 8)]
+DEFAULT_META_CSV = DATA_DIR / 'metadata.csv'
+DEFAULT_HOST_META_CSV = DATA_DIR / 'host_all_metadata.csv'
+DEFAULT_OUT_PRETRAIN = DATA_DIR / 'timeseries_pretrain.h5'
+DEFAULT_OUT_EXOP = DATA_DIR / 'timeseries_exop_hosts.h5'
 
 # String metadata fields (stored as fixed-length bytes)
 STR_FIELDS = ['GaiaDR3_ID']
@@ -170,23 +170,51 @@ def write_entries(h5_file, index, meta_lookup, host_meta_lookup):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--pickle_dir', type=Path, default=None,
+                    help='Directory containing lc_data_p1..p7.pickle. '
+                         'Default: final_pretrain/. Use final_pretrain_robust/ '
+                         'after running robust_renormalize_pickles.py.')
+    ap.add_argument('--meta_dir', type=Path, default=DATA_DIR,
+                    help='Directory containing metadata.csv + host_all_metadata.csv. '
+                         'Default: final_pretrain/.')
+    ap.add_argument('--out_dir', type=Path, default=None,
+                    help='Directory to write timeseries_*.h5 into. Default: '
+                         'same as --pickle_dir (or final_pretrain/ if neither set).')
+    args = ap.parse_args()
+
+    pickle_dir = args.pickle_dir or DATA_DIR
+    out_dir    = args.out_dir or pickle_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pickle_files = [pickle_dir / f'lc_data_p{i}.pickle' for i in range(1, 8)]
+    meta_csv      = args.meta_dir / 'metadata.csv'
+    host_meta_csv = args.meta_dir / 'host_all_metadata.csv'
+    out_pretrain  = out_dir / 'timeseries_pretrain.h5'
+    out_exop      = out_dir / 'timeseries_exop_hosts.h5'
+
+    print(f'pickle_dir: {pickle_dir}')
+    print(f'meta_dir:   {args.meta_dir}')
+    print(f'out_dir:    {out_dir}')
+
     print('Loading metadata...')
-    meta_df = pd.read_csv(META_CSV)
+    meta_df = pd.read_csv(meta_csv)
     meta_df['TIC_ID'] = meta_df['TIC_ID'].astype(int)
     meta_lookup = {row['TIC_ID']: row for _, row in meta_df.iterrows()}
     print(f'  {len(meta_lookup)} unique TICs in metadata.csv')
 
-    host_meta_df = pd.read_csv(HOST_META_CSV)
+    host_meta_df = pd.read_csv(host_meta_csv)
     host_meta_df['TIC_ID'] = host_meta_df['TIC_ID'].astype(int)
     host_meta_lookup = {row['TIC_ID']: row for _, row in host_meta_df.iterrows()}
     print(f'  {len(host_meta_lookup)} unique TICs in host_all_metadata.csv')
 
     print('\nPass 1: scanning pickle files...')
-    pretrain_index, exop_index = scan_pickles(PICKLE_FILES, meta_lookup, host_meta_lookup)
+    pretrain_index, exop_index = scan_pickles(pickle_files, meta_lookup, host_meta_lookup)
     print(f'  exop_host=0 (pretrain): {len(pretrain_index)}')
     print(f'  exop_host=1 (exop):     {len(exop_index)}')
 
-    for index, out_path in [(pretrain_index, OUT_PRETRAIN), (exop_index, OUT_EXOP)]:
+    for index, out_path in [(pretrain_index, out_pretrain), (exop_index, out_exop)]:
         N = len(index)
         max_len = max(fl for _, _, fl in index)
         print(f'\nPass 2: writing {out_path} ({N} entries, max_len={max_len})...')
@@ -196,7 +224,7 @@ def main():
         print(f'  Done.')
 
     print('\nSummary:')
-    for path in (OUT_PRETRAIN, OUT_EXOP):
+    for path in (out_pretrain, out_exop):
         with h5py.File(path, 'r') as f:
             n = f.attrs['n_samples']
             tics = len(np.unique(f['metadata/tic'][:]))
