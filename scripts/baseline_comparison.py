@@ -515,8 +515,17 @@ def _rnn_flow_predict(rnn, cache, js, k, ferr, target, n_samples: int):
     return log_prob, samples
 
 
+NLL_CLIP = 50.0  # nats; caps individual blowups so a few overconfident points don't dominate the mean
+
+
 class _StatAcc:
-    """Running sums for MAE / RMSE / NLL / coverage per (method, k)."""
+    """Running sums for MAE / RMSE / NLL / coverage per (method, k).
+
+    Tracks two robust NLL summaries alongside the plain mean:
+      - nll_clipped: per-point NLL is capped at NLL_CLIP before averaging
+      - nll_median_seq: per-sequence mean NLL collected and median-ed
+    Useful when a handful of clamped-sigma points blow up the unclipped mean.
+    """
 
     def __init__(self):
         self.bins = {}
@@ -525,10 +534,18 @@ class _StatAcc:
         s = self.bins.get(key)
         if s is None:
             s = {'n': 0, 'sum_ae': 0.0, 'sum_se': 0.0,
-                 'sum_nll': 0.0, 'n_nll': 0,
-                 'n_c68': 0, 'n_c95': 0, 'n_cov': 0, 'seqs': set()}
+                 'sum_nll': 0.0, 'sum_nll_clipped': 0.0, 'n_nll': 0,
+                 'n_c68': 0, 'n_c95': 0, 'n_cov': 0,
+                 'seqs': set(), 'seq_nll_sum': {}, 'seq_nll_n': {}}
             self.bins[key] = s
         return s
+
+    @staticmethod
+    def _record_seq_nll(s, seq_id, nll_sum: float, n: int):
+        if seq_id is None or n == 0:
+            return
+        s['seq_nll_sum'][seq_id] = s['seq_nll_sum'].get(seq_id, 0.0) + nll_sum
+        s['seq_nll_n'][seq_id] = s['seq_nll_n'].get(seq_id, 0) + n
 
     def add_point(self, method, k, target, pred, seq_id=None):
         s = self._bin((method, k))
@@ -542,23 +559,33 @@ class _StatAcc:
     def add_gaussian(self, method, k, target, mu, sigma, seq_id=None):
         s = self._bin((method, k))
         err = (target - mu)
-        s['n'] += int(target.numel())
+        n = int(target.numel())
+        s['n'] += n
         s['sum_ae'] += float(err.abs().sum().item())
         s['sum_se'] += float((err ** 2).sum().item())
         nll = 0.5 * (torch.log(2 * math.pi * sigma ** 2) + (err / sigma) ** 2)
-        s['sum_nll'] += float(nll.sum().item())
-        s['n_nll'] += int(target.numel())
+        nll_sum = float(nll.sum().item())
+        s['sum_nll'] += nll_sum
+        s['sum_nll_clipped'] += float(nll.clamp(max=NLL_CLIP).sum().item())
+        s['n_nll'] += n
         z = err / sigma
         s['n_c68'] += int((z.abs() <= 1.0).sum().item())
         s['n_c95'] += int((z.abs() <= 1.96).sum().item())
-        s['n_cov'] += int(target.numel())
+        s['n_cov'] += n
         if seq_id is not None:
             s['seqs'].add(seq_id)
+            self._record_seq_nll(s, seq_id, nll_sum, n)
 
     def add_flow(self, method, k, target, log_prob, samples, seq_id=None):
         s = self._bin((method, k))
-        s['sum_nll'] += float((-log_prob).sum().item())
-        s['n_nll'] += int(target.numel())
+        nll = -log_prob
+        nll_sum = float(nll.sum().item())
+        n = int(target.numel())
+        s['sum_nll'] += nll_sum
+        s['sum_nll_clipped'] += float(nll.clamp(max=NLL_CLIP).sum().item())
+        s['n_nll'] += n
+        if seq_id is not None:
+            self._record_seq_nll(s, seq_id, nll_sum, n)
         if samples is not None:
             median = samples.quantile(0.5, dim=0)
             p16 = samples.quantile(0.16, dim=0)
@@ -583,6 +610,12 @@ class _StatAcc:
             n = max(s['n'], 1)
             n_nll = s['n_nll']
             n_cov = s['n_cov']
+            seq_means = []
+            for sid in s['seq_nll_n']:
+                sn = s['seq_nll_n'][sid]
+                if sn:
+                    seq_means.append(s['seq_nll_sum'][sid] / sn)
+            nll_median_seq = float(np.median(seq_means)) if seq_means else float('nan')
             row = {
                 'method': method,
                 'k': k,
@@ -591,6 +624,8 @@ class _StatAcc:
                 'mae': s['sum_ae'] / n if s['n'] else float('nan'),
                 'rmse': math.sqrt(s['sum_se'] / n) if s['n'] else float('nan'),
                 'nll': (s['sum_nll'] / n_nll) if n_nll else float('nan'),
+                'nll_clipped': (s['sum_nll_clipped'] / n_nll) if n_nll else float('nan'),
+                'nll_median_seq': nll_median_seq,
                 'coverage68': (s['n_c68'] / n_cov) if n_cov else float('nan'),
                 'coverage95': (s['n_c95'] / n_cov) if n_cov else float('nan'),
             }
@@ -715,26 +750,28 @@ def cmd_eval(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     rows = acc.rows()
     csv_path = out_dir / 'summary.csv'
-    cols = ['method', 'k', 'n_points', 'n_seqs', 'mae', 'rmse', 'nll',
+    cols = ['method', 'k', 'n_points', 'n_seqs', 'mae', 'rmse',
+            'nll', 'nll_clipped', 'nll_median_seq',
             'coverage68', 'coverage95']
     with open(csv_path, 'w') as f:
         f.write(','.join(cols) + '\n')
         for r in rows:
             f.write(','.join(str(r[c]) for c in cols) + '\n')
     print(f'[eval] wrote {csv_path} ({len(rows)} rows)')
-    # Pretty-print so the user can read the result immediately.
     by_method = {}
     for r in rows:
         by_method.setdefault(r['method'], []).append(r)
     for method, rs in sorted(by_method.items()):
         rs.sort(key=lambda x: x['k'])
         print(f'  {method}')
-        print(f'    k     MAE      RMSE     NLL       cov68   cov95')
+        print(f'    k     MAE      RMSE     NLL      NLLclip  NLLmed   cov68   cov95')
         for r in rs:
-            nll = '   nan ' if math.isnan(r['nll']) else f'{r["nll"]:7.4f}'
+            def _fmt(v):
+                return '   nan ' if (isinstance(v, float) and math.isnan(v)) else f'{v:7.4f}'
             c68 = '  nan' if math.isnan(r['coverage68']) else f'{r["coverage68"]:5.3f}'
             c95 = '  nan' if math.isnan(r['coverage95']) else f'{r["coverage95"]:5.3f}'
-            print(f'    {r["k"]:<4d}  {r["mae"]:7.4f}  {r["rmse"]:7.4f}  {nll}   {c68}   {c95}')
+            print(f'    {r["k"]:<4d}  {_fmt(r["mae"])}  {_fmt(r["rmse"])}  {_fmt(r["nll"])}  '
+                  f'{_fmt(r["nll_clipped"])}  {_fmt(r["nll_median_seq"])}  {c68}   {c95}')
 
 
 # ----------------------------- plot -----------------------------------------
@@ -757,8 +794,10 @@ def _read_summary(csv_path: Path):
                 continue
             row = dict(zip(header, parts))
             row['k'] = int(row['k'])
-            for col in ('mae', 'rmse', 'nll', 'coverage68', 'coverage95'):
-                row[col] = float(row[col])
+            for col in ('mae', 'rmse', 'nll', 'nll_clipped', 'nll_median_seq',
+                        'coverage68', 'coverage95'):
+                if col in row:
+                    row[col] = float(row[col])
             rows.append(row)
     return rows
 
@@ -780,6 +819,137 @@ def _grouped(rows, metric: str):
     return out
 
 
+# ----------------------------- linear probe ---------------------------------
+
+PROBE_K_GRID = [16, 64, 256, 512, 720]
+
+
+def _collect_probe_features(rnn, store, indices, k_grid, n_targets, C, rng, device, label):
+    """For each sequence, run RNN once, then for each k pull (h_fwd[j-k], h_bwd[j+k],
+    t_enc[j], ferr[j]) for a random subsample of valid j. Returns dict {k: (X, y)}.
+    """
+    bins = {k: {'X': [], 'y': []} for k in k_grid}
+    t0 = time.time()
+    n = 0
+    with torch.no_grad():
+        for entry, flux, ferr, times, meta in store.iter_chunks(
+                indices, shuffle_chunks=False, shuffle_within=False):
+            L = entry['length']
+            cache = _rnn_forward_cache(rnn, flux, ferr, times, meta)
+            h_fwd = cache['h_fwd'][0]   # (L, Hf)
+            h_bwd = cache['h_bwd'][0]   # (L, Hb)
+            t_enc = cache['t_enc'][0]   # (L, Te)
+            for k in k_grid:
+                j_min = k + C
+                j_max = L - k - C
+                if j_max <= j_min:
+                    continue
+                n_full = j_max - j_min
+                if n_targets and n_targets < n_full:
+                    picks = rng.choice(n_full, size=n_targets, replace=False)
+                    picks.sort()
+                    js = torch.from_numpy(picks.astype(np.int64) + j_min).to(device)
+                else:
+                    js = torch.arange(j_min, j_max, device=device, dtype=torch.long)
+                feat = torch.cat([
+                    h_fwd[js - k], h_bwd[js + k], t_enc[js],
+                    ferr[js].unsqueeze(-1),
+                ], dim=-1).cpu().numpy().astype(np.float32)
+                tgt = flux[js].cpu().numpy().astype(np.float32)
+                bins[k]['X'].append(feat)
+                bins[k]['y'].append(tgt)
+            n += 1
+            if n % 100 == 0:
+                dt = time.time() - t0
+                rate = n / dt if dt else 0.0
+                print(f'  [{label}] {n}/{len(indices)} seqs ({rate:.2f} seq/s)')
+    out = {}
+    for k, v in bins.items():
+        if v['X']:
+            out[k] = (np.concatenate(v['X']), np.concatenate(v['y']))
+    return out
+
+
+def _fit_ridge(X, y, lam):
+    """Closed-form ridge: w = (XᵀX + λI)⁻¹ Xᵀy with bias column."""
+    Xb = np.hstack([X, np.ones((X.shape[0], 1), dtype=X.dtype)])
+    d = Xb.shape[1]
+    A = Xb.T @ Xb + lam * np.eye(d, dtype=Xb.dtype)
+    A[-1, -1] -= lam  # don't regularize bias
+    b = Xb.T @ y
+    w = np.linalg.solve(A, b)
+    return w
+
+
+def _apply_ridge(X, w):
+    Xb = np.hstack([X, np.ones((X.shape[0], 1), dtype=X.dtype)])
+    return Xb @ w
+
+
+def cmd_linear_probe(args):
+    """Linear probe: fit ridge regression on RNN latents → flux(j) per k.
+
+    Diagnoses whether the RNN's hidden state still contains information about
+    flux(j) at large k. If linear-probe MAE is close to the local MLP's MAE,
+    the latent has the info and the flow head is the bottleneck. If much worse,
+    bigger hidden / longer training horizon may help.
+    """
+    split = json.loads(Path(args.split_path).read_text())
+    full_index = build_index([Path(p) for p in split['h5_paths']])
+    eval_ids = set(split['eval_gaia_ids'])
+    sanity_ids = set(split['sanity_gaia_ids'])
+    train_idx = [i for i, e in enumerate(full_index)
+                 if e['gaia_id'] not in eval_ids and e['gaia_id'] not in sanity_ids]
+    eval_idx = [i for i, e in enumerate(full_index) if e['gaia_id'] in eval_ids]
+    rng = np.random.default_rng(args.seed)
+    rng.shuffle(train_idx)
+    if args.train_stars:
+        train_idx = train_idx[:args.train_stars]
+    if args.eval_stars:
+        rng.shuffle(eval_idx)
+        eval_idx = eval_idx[:args.eval_stars]
+    print(f'[probe] train={len(train_idx)}  eval={len(eval_idx)}  k_grid={PROBE_K_GRID}')
+
+    device = torch.device(args.device)
+    store = SequenceStore(full_index, use_metadata=True, device=device)
+    rnn = _load_rnn_model(args.rnn_path, device, num_meta_features=len(METADATA_FEATURES))
+
+    print('[probe] collecting train features...')
+    train_bins = _collect_probe_features(
+        rnn, store, train_idx, PROBE_K_GRID, args.n_targets_per_seq, args.C, rng, device, 'train')
+    print('[probe] collecting eval features...')
+    eval_bins = _collect_probe_features(
+        rnn, store, eval_idx, PROBE_K_GRID, args.n_targets_per_seq, args.C, rng, device, 'eval')
+    store.close()
+
+    rows = []
+    print(f'{"k":>5}  {"d":>4}  {"n_tr":>7}  {"n_ev":>7}  {"MAE":>8}  {"RMSE":>8}')
+    for k in PROBE_K_GRID:
+        if k not in train_bins or k not in eval_bins:
+            continue
+        Xtr, ytr = train_bins[k]
+        Xev, yev = eval_bins[k]
+        w = _fit_ridge(Xtr, ytr, lam=args.ridge_lambda)
+        pred = _apply_ridge(Xev, w)
+        err = yev - pred
+        mae = float(np.mean(np.abs(err)))
+        rmse = float(np.sqrt(np.mean(err ** 2)))
+        print(f'{k:>5d}  {Xtr.shape[1]:>4d}  {len(ytr):>7d}  {len(yev):>7d}  {mae:>8.4f}  {rmse:>8.4f}')
+        rows.append({'method': 'rnn_linear_probe', 'k': k,
+                     'n_train': int(len(ytr)), 'n_eval': int(len(yev)),
+                     'mae': mae, 'rmse': rmse,
+                     'feat_dim': int(Xtr.shape[1])})
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / 'linear_probe.csv'
+    cols = ['method', 'k', 'feat_dim', 'n_train', 'n_eval', 'mae', 'rmse']
+    with open(out_path, 'w') as f:
+        f.write(','.join(cols) + '\n')
+        for r in rows:
+            f.write(','.join(str(r[c]) for c in cols) + '\n')
+    print(f'[probe] wrote {out_path}')
+
+
 def cmd_plot(args):
     import matplotlib.pyplot as plt
 
@@ -795,9 +965,11 @@ def cmd_plot(args):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     panels = [
-        ('nll', 'NLL (nats/point)', 'nll_vs_k.png'),
-        ('mae', 'MAE',               'mae_vs_k.png'),
-        ('rmse', 'RMSE',             'rmse_vs_k.png'),
+        ('nll',            'NLL (nats/point)',          'nll_vs_k.png'),
+        ('nll_clipped',    'NLL clipped @ 50 nats',     'nll_clipped_vs_k.png'),
+        ('nll_median_seq', 'median per-sequence NLL',   'nll_median_seq_vs_k.png'),
+        ('mae',            'MAE',                       'mae_vs_k.png'),
+        ('rmse',           'RMSE',                      'rmse_vs_k.png'),
     ]
     for metric, ylabel, fname in panels:
         grouped = _grouped(rows, metric)
@@ -901,6 +1073,23 @@ def build_parser():
     pp.add_argument('--exclude-methods', nargs='*', default=['nn_mean'],
                     help='Methods to omit from the plots (kept in summary.csv).')
     pp.set_defaults(func=cmd_plot)
+
+    lp = sub.add_parser('linear_probe',
+                        help='Linear probe on RNN latents: ridge regression → flux(j) per k.')
+    lp.add_argument('--split-path', default='output/baseline_comparison/split.json')
+    lp.add_argument('--out-dir', default='output/baseline_comparison')
+    lp.add_argument('--rnn-path', required=True)
+    lp.add_argument('--device', default='cpu')
+    lp.add_argument('--seed', type=int, default=0)
+    lp.add_argument('--C', type=int, default=32,
+                    help='Edge guard so j±k stays away from the boundary.')
+    lp.add_argument('--train-stars', type=int, default=200,
+                    help='Training sequences used to fit the linear head (0 = all).')
+    lp.add_argument('--eval-stars', type=int, default=500,
+                    help='Eval sequences scored (0 = all eval-10%%).')
+    lp.add_argument('--n-targets-per-seq', type=int, default=256)
+    lp.add_argument('--ridge-lambda', type=float, default=1.0)
+    lp.set_defaults(func=cmd_linear_probe)
 
     return p
 
