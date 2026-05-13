@@ -89,7 +89,9 @@ def load_targets(probe: str, gaia_ids: np.ndarray, sectors: np.ndarray,
 
 
 def apply_baseline(X: np.ndarray, baseline: str, rng: np.random.Generator) -> np.ndarray:
-    if baseline == 'none':
+    if baseline in ('none', 'MLP'):
+        # 'MLP' is a tag-only baseline: identical to 'none' but distinguishes
+        # which latent source produced X in the output metadata.
         return X
     if baseline == 'gaussian':
         return rng.standard_normal(X.shape).astype(np.float32)
@@ -207,7 +209,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--probe', required=True, choices=list(PROBE_TRANSFORMS.keys()))
-    ap.add_argument('--baseline', default='none', choices=['none', 'gaussian', 'shuffle'])
+    ap.add_argument('--baseline', default='none',
+                    choices=['none', 'MLP', 'gaussian', 'shuffle'])
     ap.add_argument('--latents', default='final_model/parallel_fixed/e60/latents.npz')
     ap.add_argument('--moments_csv', default='final_pretrain/flux_moments.csv')
     ap.add_argument('--combined_csv', default='data/all_combined_metadata.csv')

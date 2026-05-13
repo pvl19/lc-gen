@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pandas as pd
 
-BASELINES = ['none', 'gaussian', 'shuffle']
+BASELINES = ['none', 'MLP', 'gaussian', 'shuffle']
 
 
 def main():
@@ -54,29 +54,36 @@ def main():
     # Wide table: one row per probe, columns per baseline
     pivot_r   = long.pivot_table(index='probe', columns='baseline', values='r')
     pivot_mae = long.pivot_table(index='probe', columns='baseline', values='mae')
-    n_by_probe = long.groupby('probe')['n'].max()
+    pivot_n   = long.pivot_table(index='probe', columns='baseline', values='n')
     transform_by_probe = long.groupby('probe')['transform'].first()
 
     cols_present = [b for b in BASELINES if b in pivot_r.columns]
     lines = ['# Latent-space probe summary', '',
              'Pearson r and MAE in transformed space (asinh for flux moments, '
-             'log10 for Prot). Baseline columns indicate signal vs. noise: `none` '
-             'uses real latents; `gaussian` uses iid N(0,1); `shuffle` permutes '
-             'real latents row-wise.', '',
-             '| probe | transform | n | ' +
+             'log10 for Prot). Baseline columns: `none` = real RNN latents '
+             '(BiDirectionalMinGRU multiscale-pooled); `MLP` = pooled MLP-baseline '
+             'features (k-averaged, mean+std); `gaussian` = iid N(0,1) noise of the '
+             'same shape; `shuffle` = real latents permuted row-wise. The MLP cache '
+             'covers all sequences in the H5 files, the RNN cache covers a subset, '
+             'hence the per-baseline `n` columns differ.', '',
+             '| probe | transform | ' +
+             ' | '.join(f'n ({b})' for b in cols_present) + ' | ' +
              ' | '.join(f'r ({b})' for b in cols_present) + ' | ' +
              ' | '.join(f'MAE ({b})' for b in cols_present) + ' |',
-             '|' + '---|' * (3 + 2 * len(cols_present))]
+             '|' + '---|' * (2 + 3 * len(cols_present))]
     for probe in pivot_r.index:
-        n = int(n_by_probe.loc[probe])
         tr = transform_by_probe.loc[probe]
+        n_cells   = [f'{int(pivot_n.loc[probe, b])}'
+                     if b in pivot_n.columns and pd.notna(pivot_n.loc[probe, b]) else '—'
+                     for b in cols_present]
         r_cells   = [f'{pivot_r.loc[probe, b]:+.3f}'
                      if b in pivot_r.columns and pd.notna(pivot_r.loc[probe, b]) else '—'
                      for b in cols_present]
         mae_cells = [f'{pivot_mae.loc[probe, b]:.4f}'
                      if b in pivot_mae.columns and pd.notna(pivot_mae.loc[probe, b]) else '—'
                      for b in cols_present]
-        lines.append(f'| {probe} | {tr} | {n} | ' +
+        lines.append(f'| {probe} | {tr} | ' +
+                     ' | '.join(n_cells) + ' | ' +
                      ' | '.join(r_cells) + ' | ' +
                      ' | '.join(mae_cells) + ' |')
 

@@ -113,7 +113,10 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--mlp-path', required=True)
     p.add_argument('--h5-paths', nargs='+', required=True)
-    p.add_argument('--age-csv', required=True)
+    p.add_argument('--age-csv', default=None,
+                   help='If provided, restrict extraction to gaia_ids in this CSV and '
+                        'fill ages/bprp0/mg columns from it. If omitted, extract over '
+                        'all sequences and write NaNs for those columns.')
     p.add_argument('--out-path', required=True)
     p.add_argument('--k-grid', type=int, nargs='+', default=[1, 8, 64, 720])
     p.add_argument('--n-j-per-sector', type=int, default=1024)
@@ -150,16 +153,20 @@ def main():
     print(f'[hook] tapping encoder.net[{last_gelu_idx}] '
           f'(out_features={mlp.encoder.net[last_gelu_idx - 1].weight.shape[0]})')
 
-    # ---- Load age CSV and index labeled sequences ----
-    df = load_age_csv(args.age_csv)
-    print(f'[load] {len(df)} labeled stars in {args.age_csv}')
-
+    # ---- Index sequences (optionally filter by age CSV) ----
     full_index = build_index([Path(p) for p in args.h5_paths])
-    labeled_ids = set(df.index.tolist())
-    labeled_idx = [i for i, e in enumerate(full_index)
-                   if str(e['gaia_id']) in labeled_ids]
-    print(f'[index] {len(labeled_idx)} labeled sequences across H5 files '
-          f'(out of {len(full_index)})')
+    if args.age_csv:
+        df = load_age_csv(args.age_csv)
+        print(f'[load] {len(df)} labeled stars in {args.age_csv}')
+        labeled_ids = set(df.index.tolist())
+        labeled_idx = [i for i, e in enumerate(full_index)
+                       if str(e['gaia_id']) in labeled_ids]
+        print(f'[index] {len(labeled_idx)} labeled sequences across H5 files '
+              f'(out of {len(full_index)})')
+    else:
+        df = None
+        labeled_idx = list(range(len(full_index)))
+        print(f'[index] {len(labeled_idx)} sequences (no age-CSV filter)')
 
     # ---- Iterate and extract ----
     store = SequenceStore(full_index, use_metadata=True, device=device)
@@ -184,14 +191,20 @@ def main():
                 continue
             pooled = pool_mean_std(feats)
             gid = str(entry['gaia_id'])
-            row = df.loc[gid]
             latents.append(pooled)
-            ages.append(float(row.get('age_Myr', np.nan)))
-            bprp0.append(float(row.get('BPRP0', np.nan)))
-            bprp0_err.append(float(row.get('BPRP0_err', np.nan)))
-            mg.append(float(row.get('MG_quick', np.nan)))
-            mg_err.append(float(row.get('MG_quick_err', np.nan)))
-            mem_prob.append(float(row.get('mem_prob_val', np.nan)))
+            if df is not None and gid in df.index:
+                row = df.loc[gid]
+                ages.append(float(row.get('age_Myr', np.nan)))
+                bprp0.append(float(row.get('BPRP0', np.nan)))
+                bprp0_err.append(float(row.get('BPRP0_err', np.nan)))
+                mg.append(float(row.get('MG_quick', np.nan)))
+                mg_err.append(float(row.get('MG_quick_err', np.nan)))
+                mem_prob.append(float(row.get('mem_prob_val', np.nan)))
+            else:
+                ages.append(np.nan)
+                bprp0.append(np.nan); bprp0_err.append(np.nan)
+                mg.append(np.nan); mg_err.append(np.nan)
+                mem_prob.append(np.nan)
             gaia_out.append(gid)
             tic_out.append(int(entry.get('tic', 0)))
             sec_out.append(int(entry.get('sector', 0)))
