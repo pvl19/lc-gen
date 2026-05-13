@@ -74,16 +74,17 @@ Star aggregation modes: `none`, `predict_mean`, `latent_mean`, `latent_median`, 
 
 **Always update `final_model/final_parallel_e10/README.md`** when a new age inference model is trained or tested. The README contains a comparison table with MAE, Pearson r, and key hyperparameters for all runs. Regenerate metrics from the predictions CSVs in each `nf-*` subfolder.
 
-Current best: 3-stage MLP, bottleneck_dim=4, finetune_encoder_lr_mult=0.001 (r=0.705, MAE=0.296 dex).
+Current best: 3-stage MLP encoder, bottleneck_dim=4, multiscale + latent_max aggregation, ChronoFlow subset (r=0.912, MAE=0.139 dex on N=2470 stars). See `final_model/parallel_fixed/e110/age-inference-cfonly-multiscale-latent_max/kfold_metrics.json`.
 
 ## Current status
 
 - Pretraining complete with log-domain parallel scan. Active model checkpoints in `final_model/final_parallel_*`.
-- Best age inference: 3-stage MLP encoder (r=0.705) — significantly better than PCA baseline (r~0.52).
+- Best age inference: r=0.912, MAE=0.139 dex (RNN-pooled multiscale + 3-stage MLP head).
 - `--train_full` flag added to train a deployment model on all labeled stars after k-fold CV.
 - `predict_ages.py` auto-detects `full_model.pt` for deployment; falls back to `kfold_models.pt` ensemble.
 - Rolling checkpoint (`checkpoints/resume/`) saves latest epoch only; best model only saved to output dir at end of training.
-- Baseline-comparison pipeline: Gaussian-head MLP trainer + chunk-aware H5 loader + `eval` subcommand comparing `mlp_gaussian`, `rnn_flow`, `nn_mean`, `window_mean` on the eval-10% set (NLL via flow `log_prob`; MAE/coverage via sampled quantiles). Writes `summary.csv`. NSF-head training + plotting still to add. See `docs/plans/2026-05-12_baseline-comparison.md`.
+- Baseline-comparison pipeline: Gaussian-head MLP trainer + chunk-aware H5 loader + `eval` / `plot` / `fit_baselines` / `linear_probe` subcommands. Compares `mlp_gaussian`, `rnn_flow`, `nn_mean`, `window_mean` on the eval-10% set; reports NLL (mean / clipped / per-seq median) + MAE + RMSE + coverage. See `docs/plans/2026-05-12_baseline-comparison.md`.
+- MLP-pooled age inference comparison: same-budget local-window MLP encoder, pooled mean+std across time, run through the same 3-stage age flow → r=0.848, MAE=0.225 dex on N=2495. RNN-pooled beats it by Δr=0.064, ΔMAE=0.086 dex — recurrence carries age-relevant cross-time structure that local-window pooling can't recover. See `docs/plans/2026-05-12_mlp-pooled-age-inference.md`.
 
 ## Bridges-2 (PSC)
 
