@@ -34,9 +34,16 @@ rsync -avz \
     src/lcgen/utils/trunc_data.py \
     "${REMOTE}:${REMOTE_DIR}/src/lcgen/utils/"
 
-# --- SLURM script ---
+# # --- SLURM script ---
 echo "Syncing SLURM script..."
 rsync -avz slurm_bridges2.sh "${REMOTE}:${REMOTE_DIR}/"
+
+# --- Spectra sidecar files (needed for conv encoder branch) ---
+# echo "Syncing spectra files..."
+# rsync -avz --progress --ignore-existing \
+#     final_pretrain/timeseries_pretrain_spectra.h5 \
+#     final_pretrain/timeseries_exop_hosts_spectra.h5 \
+#     "${REMOTE}:${REMOTE_DIR}/final_pretrain/"
 
 # --- Data (large — skipped if already present with --ignore-existing) ---
 # echo "Syncing data files (this may take a while)..."
