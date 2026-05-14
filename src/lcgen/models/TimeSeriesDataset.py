@@ -36,16 +36,21 @@ class LazyH5Dataset(Dataset):
     """
 
     def __init__(self, h5path, random_seed, min_size, max_size, mask_portion,
-                 num_samples=None, use_metadata=False, metadata_features=None):
+                 num_samples=None, use_metadata=False, metadata_features=None,
+                 use_conv_channels=False, trim_edges=0, min_keep=32):
         self.h5path = str(h5path)
         self.min_size = min_size
         self.max_size = max_size
         self.mask_portion = mask_portion
         self.rng = np.random.default_rng(random_seed)
         self.use_metadata = use_metadata
+        self.use_conv_channels = use_conv_channels
         self.metadata_features = metadata_features or METADATA_FEATURES
         self.num_meta_features = len(self.metadata_features)
+        self.trim_edges = int(trim_edges)
+        self.min_keep = int(min_keep)
         self._h5 = None  # opened lazily per worker process
+        self._spectra_h5 = None  # opened lazily for sidecar spectra file
 
         with h5py.File(self.h5path, 'r') as f:
             n_total = int(f.attrs['n_samples'])
@@ -62,6 +67,25 @@ class LazyH5Dataset(Dataset):
             else:
                 metadata = None
 
+        # Resolve spectra sidecar path (for lazy conv channel loading)
+        self._spectra_path = None
+        if use_conv_channels:
+            stem = self.h5path.rsplit('.h5', 1)[0]
+            spectra_path = stem + '_spectra.h5'
+            if Path(spectra_path).exists():
+                self._spectra_path = spectra_path
+            else:
+                # Check if datasets exist inside the main H5
+                with h5py.File(self.h5path, 'r') as f:
+                    if 'power' in f and 'f_stat' in f and 'acf' in f:
+                        self._spectra_path = self.h5path
+                if self._spectra_path is None:
+                    raise FileNotFoundError(
+                        f'Conv channel data not found for {h5path}. '
+                        f'Expected sidecar at {spectra_path} or power/f_stat/acf '
+                        f'datasets inside {h5path}.'
+                    )
+
         # Subsample if requested
         if num_samples is not None and num_samples < n_total:
             rng = np.random.default_rng(random_seed)
@@ -70,8 +94,22 @@ class LazyH5Dataset(Dataset):
         else:
             idx = np.arange(n_total)
 
+        # Drop samples too short to survive edge trimming with a usable interior.
+        if self.trim_edges > 0:
+            min_required = 2 * self.trim_edges + self.min_keep
+            keep = lengths[idx] >= min_required
+            n_dropped = int((~keep).sum())
+            if n_dropped:
+                print(f'  LazyH5Dataset({Path(self.h5path).name}): trim_edges='
+                      f'{self.trim_edges}, dropped {n_dropped}/{len(idx)} samples '
+                      f'with length < {min_required}')
+            idx = idx[keep]
+
         self.indices = idx
-        self.lengths = lengths[idx]
+        # Stored lengths are POST-trim so downstream code (mask, collate, loss)
+        # operates on the trimmed interior only.
+        self.lengths = (lengths[idx] - 2 * self.trim_edges).astype(np.int32) \
+                       if self.trim_edges > 0 else lengths[idx]
         self.metadata = metadata[idx] if metadata is not None else None
 
     def _get_h5(self):
@@ -79,6 +117,15 @@ class LazyH5Dataset(Dataset):
         if self._h5 is None:
             self._h5 = h5py.File(self.h5path, 'r')
         return self._h5
+
+    def _get_spectra_h5(self):
+        """Return an open h5py handle for the spectra sidecar file."""
+        if self._spectra_h5 is None and self._spectra_path is not None:
+            if self._spectra_path == self.h5path:
+                self._spectra_h5 = self._get_h5()
+            else:
+                self._spectra_h5 = h5py.File(self._spectra_path, 'r')
+        return self._spectra_h5
 
     def __len__(self):
         return len(self.indices)
@@ -109,20 +156,29 @@ class LazyH5Dataset(Dataset):
 
     def __getitem__(self, idx):
         h5_idx = int(self.indices[idx])
-        L = int(self.lengths[idx])
+        L = int(self.lengths[idx])  # already POST-trim
         h5 = self._get_h5()
-        flux     = h5['flux'][h5_idx, :L].astype(np.float32)
-        flux_err = h5['flux_err'][h5_idx, :L].astype(np.float32)
-        time     = h5['time'][h5_idx, :L].astype(np.float32)
+        slc_start = self.trim_edges
+        slc_stop  = self.trim_edges + L
+        flux     = h5['flux'][h5_idx, slc_start:slc_stop].astype(np.float32)
+        flux_err = h5['flux_err'][h5_idx, slc_start:slc_stop].astype(np.float32)
+        time     = h5['time'][h5_idx, slc_start:slc_stop].astype(np.float32)
         mask = self._generate_block_mask(L)
         meta = self.metadata[idx] if (self.use_metadata and self.metadata is not None) \
                else np.zeros(self.num_meta_features, dtype=np.float32)
-        empty = np.zeros(0, dtype=np.float32)
-        return [flux, flux_err, time, mask, L, meta, empty, empty, empty]
+        if self.use_conv_channels and self._spectra_path is not None:
+            sh5 = self._get_spectra_h5()
+            power  = sh5['power'][h5_idx].astype(np.float32)
+            f_stat = sh5['f_stat'][h5_idx].astype(np.float32)
+            acf    = sh5['acf'][h5_idx].astype(np.float32)
+        else:
+            empty = np.zeros(0, dtype=np.float32)
+            power, f_stat, acf = empty, empty, empty
+        return [flux, flux_err, time, mask, L, meta, power, f_stat, acf]
 
 
 class TimeSeriesDataset(Dataset):
-    def __init__(self, h5path, random_seed, min_size, max_size, mask_portion, max_length=16384, num_samples=None, mock_sinusoid=False, mock_noise=0.1, use_metadata=False, metadata_features=None, use_conv_channels=False):
+    def __init__(self, h5path, random_seed, min_size, max_size, mask_portion, max_length=16384, num_samples=None, mock_sinusoid=False, mock_noise=0.1, use_metadata=False, metadata_features=None, use_conv_channels=False, trim_edges=0, min_keep=32):
         self.min_size = min_size
         self.max_size = max_size
         self.mask_portion = mask_portion
@@ -132,6 +188,8 @@ class TimeSeriesDataset(Dataset):
         self.use_conv_channels = use_conv_channels
         self.metadata_features = metadata_features or METADATA_FEATURES
         self.num_meta_features = len(self.metadata_features)
+        self.trim_edges = int(trim_edges)
+        self.min_keep = int(min_keep)
         
         p = Path(h5path)
         if p.exists():
@@ -199,6 +257,29 @@ class TimeSeriesDataset(Dataset):
                 self.power = np.asarray(self.power, dtype=np.float32)
                 self.f_stat = np.asarray(self.f_stat, dtype=np.float32)
                 self.acf = np.asarray(self.acf, dtype=np.float32)
+
+            # Drop samples too short to survive edge trimming with usable interior.
+            if self.trim_edges > 0:
+                min_required = 2 * self.trim_edges + self.min_keep
+                keep = self.lengths >= min_required
+                n_dropped = int((~keep).sum())
+                if n_dropped:
+                    print(f'  TimeSeriesDataset({Path(h5path).name}): trim_edges='
+                          f'{self.trim_edges}, dropped {n_dropped}/{len(self.lengths)} '
+                          f'samples with length < {min_required}')
+                if n_dropped > 0:
+                    self.flux     = self.flux[keep]
+                    self.flux_err = self.flux_err[keep]
+                    self.time     = self.time[keep]
+                    self.lengths  = self.lengths[keep]
+                    if self.metadata is not None:
+                        self.metadata = self.metadata[keep]
+                    if use_conv_channels and self.power is not None:
+                        self.power  = self.power[keep]
+                        self.f_stat = self.f_stat[keep]
+                        self.acf    = self.acf[keep]
+                # Lengths stored POST-trim so downstream code sees the trimmed interior.
+                self.lengths = (self.lengths - 2 * self.trim_edges).astype(np.int32)
         else:
             # Fall back to a synthetic dataset if file is missing (small and fast).
             print(f'Warning: {h5path} not found. Using synthetic data for smoke test.')
@@ -327,12 +408,16 @@ class TimeSeriesDataset(Dataset):
         return mask
 
     def __getitem__(self, idx):
-        actual_length = int(self.lengths[idx])
+        actual_length = int(self.lengths[idx])  # already POST-trim
 
-        # Truncate to actual length — padding is handled dynamically in collate_fn
-        flux = self.flux[idx][:actual_length]
-        flux_err = self.flux_err[idx][:actual_length]
-        time = self.time[idx][:actual_length]
+        # Truncate to actual length — padding is handled dynamically in collate_fn.
+        # When trim_edges > 0 we offset the slice so the first/last trim_edges raw
+        # samples are excluded from the encoder's view.
+        slc_start = self.trim_edges
+        slc_stop  = self.trim_edges + actual_length
+        flux = self.flux[idx][slc_start:slc_stop]
+        flux_err = self.flux_err[idx][slc_start:slc_stop]
+        time = self.time[idx][slc_start:slc_stop]
 
         # Generate block mask over actual data only (all positions real, no padding mask needed)
         mask = self._generate_block_mask(actual_length)

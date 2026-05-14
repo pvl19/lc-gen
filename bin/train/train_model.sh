@@ -34,6 +34,7 @@ python3 src/lcgen/train_simple_rnn.py \
     --min_size 5 \
     --max_size 720 \
     --mask_portion 0.4 \
+    --trim_edges 10 \
     --use_flow \
     --mode parallel \
     --val_split 0.1 \

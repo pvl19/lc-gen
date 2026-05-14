@@ -83,13 +83,16 @@ def load_and_filter_h5_metadata(h5_path: str):
 
 def extract_latents_lazy(ae_model_path, h5_path, valid_indices, tic_ids,
                          hidden_size, direction, mode, pooling_mode,
-                         device, batch_size=32):
+                         device, batch_size=32, trim_edges=0):
     """Extract per-sector multiscale latents, lazy H5 reads grouped by star.
 
     Uses full untruncated sequences with dynamic per-batch padding (pad to the
     longest sequence in each batch, not a global max).
     Metadata is loaded eagerly (small) and passed to every forward call so the
     RNN hidden states match those produced during training.
+
+    `trim_edges` strips the first/last N raw samples from every light curve
+    before encoding — must match the value used at training time.
     """
     from plot_umap_latent import load_model, compute_multiscale_features
 
@@ -103,6 +106,15 @@ def extract_latents_lazy(ae_model_path, h5_path, valid_indices, tic_ids,
     with h5py.File(h5_path, 'r') as f:
         all_lengths = f['length'][valid_indices].astype(int)
         h5_seq_len  = f['flux'].shape[1]  # padded length in H5
+
+        if trim_edges > 0:
+            # Effective lengths after trimming first/last `trim_edges` raw samples.
+            min_post = 32
+            n_short = int(np.sum(all_lengths < 2 * trim_edges + min_post))
+            if n_short:
+                print(f'  trim_edges={trim_edges}: {n_short} sectors shorter than '
+                      f'2*trim+{min_post}; their interior may collapse to 0.')
+            all_lengths = np.maximum(all_lengths - 2 * trim_edges, 0).astype(int)
 
         # Load and standardize metadata eagerly — small array, one row per sector
         meta_grp = f.get('metadata')
@@ -128,14 +140,17 @@ def extract_latents_lazy(ae_model_path, h5_path, valid_indices, tic_ids,
         restore    = np.argsort(sort_order)
         sorted_h5  = h5_idxs[sort_order]
 
-        # Dynamic padding: read only up to the longest sequence in this batch
+        # Dynamic padding: read only up to the longest sequence in this batch.
+        # When trim_edges > 0, batch_lengths are POST-trim and the H5 read offsets
+        # past the leading trim_edges raw samples so the encoder never sees them.
         batch_lengths = all_lengths[all_pos]
         batch_max_len = int(batch_lengths.max())
-        read_len      = min(batch_max_len, h5_seq_len)
+        slc_start = trim_edges
+        slc_stop  = min(trim_edges + batch_max_len, h5_seq_len)
 
-        flux_s     = h5_file['flux'][sorted_h5, :read_len]
-        flux_err_s = h5_file['flux_err'][sorted_h5, :read_len]
-        time_s     = h5_file['time'][sorted_h5, :read_len]
+        flux_s     = h5_file['flux'][sorted_h5, slc_start:slc_stop]
+        flux_err_s = h5_file['flux_err'][sorted_h5, slc_start:slc_stop]
+        time_s     = h5_file['time'][sorted_h5, slc_start:slc_stop]
         lens_s     = all_lengths[all_pos[sort_order]]
 
         flux_b     = torch.tensor(flux_s[restore],     dtype=torch.float32, device=device)
@@ -283,6 +298,10 @@ def main():
     parser.add_argument('--batch_size',   type=int, default=32)
     parser.add_argument('--loga_grid_size', type=int, default=LOGA_GRID_DEFAULT_SIZE)
     parser.add_argument('--nle_batch_size', type=int, default=256)
+    parser.add_argument('--trim_edges', type=int, default=10,
+                        help='Strip first/last N raw samples from each light curve '
+                             'before encoding. Must match the value the AE was trained '
+                             'with. Ignored when --load_latents is used. Default: 10.')
     args = parser.parse_args()
 
     device     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -393,6 +412,7 @@ def main():
             args.ae_model, args.h5_path, valid_indices, tic_ids,
             args.hidden_size, args.direction, args.mode,
             args.pooling_mode, device, args.batch_size,
+            trim_edges=args.trim_edges,
         )
         print(f'  {latents.shape[0]} latents, dim={latents.shape[1]}')
         if args.save_latents:

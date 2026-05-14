@@ -63,6 +63,7 @@ singularity exec --nv --bind /ocean,$HOME \
     --min_size 5 \
     --max_size 256 \
     --mask_portion 0.4 \
+    --trim_edges 10 \
     --use_flow \
     --mode parallel \
     --use_metadata \

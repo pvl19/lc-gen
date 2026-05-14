@@ -43,6 +43,7 @@ k-fold cross-validation.
 ## Conventions
 
 - **Shell scripts: all parameters hardcoded.** Never pass arguments to `.sh` files — all config lives inside the script so parameters are always tracked and reproducible.
+- **`--trim_edges` must match between training and inference.** Default is 10 — strips the first/last 10 raw samples from every light curve before the encoder sees them, to avoid TESS sector-edge artifacts (scattered light, thermal settling). Set in `slurm_bridges2.sh` (training), `plot_umap.sh` (latent extraction), `predict_ages.sh`, `plot_reconstructions.sh`. The model itself is unchanged — only the data slice fed to it. Samples with `length < 2*trim_edges + 32` are dropped at the dataset level. Old checkpoints trained with `trim_edges=0` are NOT compatible with `trim_edges=10` inference (and vice versa) — the edge data is OOD for the model that didn't see it.
 - **Two distinct age-prediction pipelines exist — don't conflate them:**
   1. `MetadataAgePredictor` — uses raw metadata (BPRP0, parallax, etc.) directly, just used for testing
   2. NLE flow in `kfold_age_inference.py` — uses autoencoder latent vectors

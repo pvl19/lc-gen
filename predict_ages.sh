@@ -27,6 +27,9 @@ METADATA_CSV="final_pretrain/host_all_metadata.csv"
 POOLING_MODE="multiscale"
 BATCH_SIZE=32
 NLE_BATCH_SIZE=256
+# Must match the AE training-time value; ignored when LOAD_LATENTS is set
+# (cached latents already had trimming baked in).
+TRIM_EDGES=10
 
 echo "Running exoplanet host age inference:"
 echo "  NLE dir:      ${NLE_DIR}"
@@ -38,7 +41,8 @@ CMD="python scripts/predict_ages.py \
   --output_dir ${OUTPUT_DIR} \
   --pooling_mode ${POOLING_MODE} \
   --batch_size ${BATCH_SIZE} \
-  --nle_batch_size ${NLE_BATCH_SIZE}"
+  --nle_batch_size ${NLE_BATCH_SIZE} \
+  --trim_edges ${TRIM_EDGES}"
 
 if [ -n "${LOAD_LATENTS}" ]; then
   CMD="${CMD} --load_latents ${LOAD_LATENTS}"
