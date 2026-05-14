@@ -23,8 +23,7 @@ Usage:
         --probe flux_skew \\
         --baseline none \\
         --latents final_model/parallel_fixed/e60/latents.npz \\
-        --moments_csv final_pretrain/flux_moments.csv \\
-        --combined_csv data/all_combined_metadata.csv \\
+        --sector_stats_csv data/sector_stats.csv \\
         --output_dir output/latent_probes/flux_skew/
 """
 import argparse
@@ -52,40 +51,46 @@ PROBE_TRANSFORMS = {
 }
 
 
-def load_targets(probe: str, gaia_ids: np.ndarray, sectors: np.ndarray,
-                 moments_csv: Path, combined_csv: Path) -> np.ndarray:
-    """Return per-row target aligned to (gaia_ids, sectors). NaN where missing."""
-    gids = pd.Series(gaia_ids).astype(str).values
-    secs = sectors.astype(int)
+PROBE_TO_COLUMN = {
+    'flux_skew':  'flux_skew',
+    'flux_kurt':  'flux_kurt',
+    'lit_prot':   'lit_Prot',
+    'tars_prot':  'tars_Prot',
+    'num_flares': 'num_flares',
+    'total_ed':   'total_flare_ed',
+}
 
-    if probe in ('flux_skew', 'flux_kurt'):
-        col = probe  # column name matches probe name
-        df = pd.read_csv(moments_csv, usecols=['GaiaDR3_ID', 'sector', col])
-        df['GaiaDR3_ID'] = df['GaiaDR3_ID'].astype(str)
-        df = df.drop_duplicates(subset=['GaiaDR3_ID', 'sector'], keep='first')
-        key = pd.DataFrame({'GaiaDR3_ID': gids, 'sector': secs})
-        merged = key.merge(df, on=['GaiaDR3_ID', 'sector'], how='left')
-        return merged[col].to_numpy(dtype=np.float64)
+# Probes whose targets must be strictly positive (log10 transform requires it).
+POSITIVE_PROBES = {'lit_prot', 'tars_prot', 'num_flares', 'total_ed'}
 
-    combined_cols = {
-        'lit_prot':   'lit_Prot',
-        'tars_prot':  'tars_Prot',
-        'num_flares': 'num_flares',
-        'total_ed':   'total_ed',
-    }
-    if probe in combined_cols:
-        col = combined_cols[probe]
-        df = pd.read_csv(combined_csv, usecols=['GaiaDR3_ID', col])
-        df['GaiaDR3_ID'] = df['GaiaDR3_ID'].astype(str)
-        df = df.drop_duplicates(subset='GaiaDR3_ID', keep='first')
-        key = pd.DataFrame({'GaiaDR3_ID': gids})
-        merged = key.merge(df, on='GaiaDR3_ID', how='left')
-        y = merged[col].to_numpy(dtype=np.float64)
-        # all four targets are strictly positive -> require >0 for log10
+
+def load_targets(probe: str, tic_ids: np.ndarray, sectors: np.ndarray,
+                 sector_stats_csv: Path) -> np.ndarray:
+    """Return per-row target aligned to (tic_ids, sectors). NaN where missing.
+
+    All six probe targets are now sourced from a single per-(tic_id, sector) CSV
+    (data/sector_stats.csv). num_flares and total_ed are per-sector counts;
+    lit_prot/tars_prot/flux_skew/flux_kurt are also keyed per sector but are
+    typically constant per star (rotation periods) or already per-sector.
+    """
+    if probe not in PROBE_TO_COLUMN:
+        raise ValueError(f'unknown probe {probe}')
+    col = PROBE_TO_COLUMN[probe]
+
+    df = pd.read_csv(sector_stats_csv, usecols=['tic_id', 'sector', col])
+    df['tic_id'] = df['tic_id'].astype(np.int64)
+    df['sector'] = df['sector'].astype(np.int64)
+    df = df.drop_duplicates(subset=['tic_id', 'sector'], keep='first')
+
+    key = pd.DataFrame({
+        'tic_id': np.asarray(tic_ids).astype(np.int64),
+        'sector': np.asarray(sectors).astype(np.int64),
+    })
+    merged = key.merge(df, on=['tic_id', 'sector'], how='left')
+    y = merged[col].to_numpy(dtype=np.float64)
+    if probe in POSITIVE_PROBES:
         y[~np.isfinite(y) | (y <= 0)] = np.nan
-        return y
-
-    raise ValueError(f'unknown probe {probe}')
+    return y
 
 
 def apply_baseline(X: np.ndarray, baseline: str, rng: np.random.Generator) -> np.ndarray:
@@ -212,8 +217,8 @@ def main():
     ap.add_argument('--baseline', default='none',
                     choices=['none', 'MLP', 'gaussian', 'shuffle'])
     ap.add_argument('--latents', default='final_model/parallel_fixed/e60/latents.npz')
-    ap.add_argument('--moments_csv', default='final_pretrain/flux_moments.csv')
-    ap.add_argument('--combined_csv', default='data/all_combined_metadata.csv')
+    ap.add_argument('--sector_stats_csv', default='data/sector_stats.csv',
+                    help='Per-(tic_id, sector) target CSV with all probe columns.')
     ap.add_argument('--output_dir', required=True)
     ap.add_argument('--n_folds', type=int, default=5)
     ap.add_argument('--hidden_dims', type=int, nargs='+', default=[256, 128, 64])
@@ -246,8 +251,8 @@ def main():
     print(f'  latents: {X.shape}')
 
     # ---- load + transform targets ---------------------------------------
-    y_raw = load_targets(args.probe, gaia_ids, sectors,
-                         Path(args.moments_csv), Path(args.combined_csv))
+    y_raw = load_targets(args.probe, tic_ids, sectors,
+                         Path(args.sector_stats_csv))
     valid = np.isfinite(y_raw)
     print(f'  target {args.probe}: {valid.sum()}/{len(y_raw)} non-NaN rows')
 
@@ -329,6 +334,7 @@ def main():
     (out_dir / 'metrics.json').write_text(json.dumps(overall, indent=2))
     pd.DataFrame({
         'GaiaDR3_ID': gaia_ids,
+        'tic_id': tic_ids,
         'sector': sectors,
         'fold': fold_assign,
         'y_true_raw': y_raw,

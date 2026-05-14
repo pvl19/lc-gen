@@ -8,8 +8,7 @@
 set -euo pipefail
 
 LATENTS="final_model/parallel_fixed/e60/latents.npz"
-MOMENTS_CSV="final_pretrain/flux_moments.csv"
-COMBINED_CSV="data/all_combined_metadata.csv"
+SECTOR_STATS_CSV="data/sector_stats.csv"
 OUT_ROOT="output/latent_probes"
 
 N_FOLDS=5
@@ -37,10 +36,9 @@ run_probe() {
     python scripts/kfold_latent_probe.py \
         --probe       "$probe" \
         --baseline    "$baseline" \
-        --latents     "$LATENTS" \
-        --moments_csv "$MOMENTS_CSV" \
-        --combined_csv "$COMBINED_CSV" \
-        --output_dir  "$out" \
+        --latents          "$LATENTS" \
+        --sector_stats_csv "$SECTOR_STATS_CSV" \
+        --output_dir       "$out" \
         --n_folds     "$N_FOLDS" \
         --hidden_dims  $HIDDEN_DIMS \
         --dropout     "$DROPOUT" \
