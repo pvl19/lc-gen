@@ -42,9 +42,9 @@
 MODEL_PATH=${1:-"final_model/parallel_fixed/e110/best_model.pt"}
 VERSION=${2:-"default"}
 POOLING_MODE=${3:-"multiscale"}
-STAR_AGGREGATION=${4:-"predict_mean"}
+STAR_AGGREGATION=${4:-"latent_max"}
 USE_METADATA=${5:-"true"}
-USE_CONV=${6:-"true"}
+USE_CONV=${6:-"false"}
 CONV_TYPE=${7:-"unet"}
 REQUIRE_PROT=${8:-"false"}
 H5_PATH=${9:-"final_pretrain/timeseries_pretrain.h5"}
@@ -57,9 +57,9 @@ USE_MG_ONLY=${14:-"false"}  # true to swap (BPRP0, BPRP0_err) for (MG, MG_err); 
 # Optional subset filter — keep only stars where SUBSET_COL is one of SUBSET_VAL.
 # Leave SUBSET_COL empty to train on all labeled stars.
 # Example: SUBSET_COL="ref"  SUBSET_VAL="ChronoFlow"  SUBSET_CSV="final_pretrain/metadata.csv"
-SUBSET_COL=""
-SUBSET_VAL=""
-SUBSET_CSV=""   # CSV with SUBSET_COL joined on GaiaDR3_ID; defaults to --age_csv if blank
+SUBSET_COL="ref"
+SUBSET_VAL="ChronoFlow"
+SUBSET_CSV="final_pretrain/metadata.csv"   # CSV with SUBSET_COL joined on GaiaDR3_ID; defaults to --age_csv if blank
 
 MLP_ENCODER_HIDDEN="128 64"
 AUX_LOSS_WEIGHT=1.0
@@ -75,7 +75,7 @@ TRAIN_FULL="true"               # train a final model on ALL stars after k-fold 
 # H5 files to use for global PCA + normalization (all stars, no age filter)
 PCA_H5_PATHS="final_pretrain/timeseries_pretrain.h5 final_pretrain/timeseries_exop_hosts.h5"
 
-OUTPUT_DIR="final_model/parallel_fixed/e110/age-inference-${POOLING_MODE}-${STAR_AGGREGATION}"
+OUTPUT_DIR="final_model/parallel_fixed/e110/age-inference-cfonly-${POOLING_MODE}-${STAR_AGGREGATION}"
 
 echo "Running k-fold age inference:"
 echo "  Model:            ${MODEL_PATH:-'(from cache)'}"

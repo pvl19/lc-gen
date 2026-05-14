@@ -20,7 +20,7 @@ P_CLUSTER_MEM=1.0                # per-star inlier prior; 1.0 = rely on static 5
 # nle: 1D-or-bottleneck flow models p(z | age, colours); posterior via Bayes on grid.
 # npe: 1D age flow conditioned on (bottleneck ∥ colours) — direct posterior, no Bayes flip.
 #      NPE requires ENCODER_TYPE=mlp or linear (PCA-only NPE is not supported).
-PREDICTION_MODE="nle"
+PREDICTION_MODE="npe"
 
 N_FOLDS=10
 SEED=42
