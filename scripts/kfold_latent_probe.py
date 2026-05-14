@@ -64,29 +64,42 @@ PROBE_TO_COLUMN = {
 POSITIVE_PROBES = {'lit_prot', 'tars_prot', 'num_flares', 'total_ed'}
 
 
-def load_targets(probe: str, tic_ids: np.ndarray, sectors: np.ndarray,
-                 sector_stats_csv: Path) -> np.ndarray:
-    """Return per-row target aligned to (tic_ids, sectors). NaN where missing.
+def load_targets(probe: str, tic_ids: np.ndarray, gaia_ids: np.ndarray,
+                 sectors: np.ndarray, sector_stats_csv: Path) -> np.ndarray:
+    """Return per-row target aligned to (tic_ids/gaia_ids, sectors).
 
-    All six probe targets are now sourced from a single per-(tic_id, sector) CSV
-    (data/sector_stats.csv). num_flares and total_ed are per-sector counts;
-    lit_prot/tars_prot/flux_skew/flux_kurt are also keyed per sector but are
-    typically constant per star (rotation periods) or already per-sector.
+    Sourced from a single per-(tic_id, gaia_id, sector) CSV
+    (data/sector_stats.csv). Prefers tic_id as the key; falls back to gaia_id
+    when the latents file has no usable tic_ids (e.g. the MLP-pooled cache
+    stores tic_ids as zeros).
     """
     if probe not in PROBE_TO_COLUMN:
         raise ValueError(f'unknown probe {probe}')
     col = PROBE_TO_COLUMN[probe]
 
-    df = pd.read_csv(sector_stats_csv, usecols=['tic_id', 'sector', col])
-    df['tic_id'] = df['tic_id'].astype(np.int64)
-    df['sector'] = df['sector'].astype(np.int64)
-    df = df.drop_duplicates(subset=['tic_id', 'sector'], keep='first')
+    tic_arr = np.asarray(tic_ids)
+    use_tic = np.issubdtype(tic_arr.dtype, np.integer) and (tic_arr != 0).any()
+    join_col = 'tic_id' if use_tic else 'gaia_id'
+    print(f'  load_targets: joining on {join_col}')
 
-    key = pd.DataFrame({
-        'tic_id': np.asarray(tic_ids).astype(np.int64),
-        'sector': np.asarray(sectors).astype(np.int64),
-    })
-    merged = key.merge(df, on=['tic_id', 'sector'], how='left')
+    df = pd.read_csv(sector_stats_csv, usecols=[join_col, 'sector', col])
+    df['sector'] = df['sector'].astype(np.int64)
+    df = df.drop_duplicates(subset=[join_col, 'sector'], keep='first')
+
+    if join_col == 'tic_id':
+        df['tic_id'] = df['tic_id'].astype(np.int64)
+        key = pd.DataFrame({
+            'tic_id': tic_arr.astype(np.int64),
+            'sector': np.asarray(sectors).astype(np.int64),
+        })
+    else:
+        df['gaia_id'] = df['gaia_id'].astype(str)
+        key = pd.DataFrame({
+            'gaia_id': pd.Series(gaia_ids).astype(str).values,
+            'sector': np.asarray(sectors).astype(np.int64),
+        })
+
+    merged = key.merge(df, on=[join_col, 'sector'], how='left')
     y = merged[col].to_numpy(dtype=np.float64)
     if probe in POSITIVE_PROBES:
         y[~np.isfinite(y) | (y <= 0)] = np.nan
@@ -251,7 +264,7 @@ def main():
     print(f'  latents: {X.shape}')
 
     # ---- load + transform targets ---------------------------------------
-    y_raw = load_targets(args.probe, tic_ids, sectors,
+    y_raw = load_targets(args.probe, tic_ids, gaia_ids, sectors,
                          Path(args.sector_stats_csv))
     valid = np.isfinite(y_raw)
     print(f'  target {args.probe}: {valid.sum()}/{len(y_raw)} non-NaN rows')
