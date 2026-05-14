@@ -561,6 +561,35 @@ class AgePredictorNPE(nn.Module):
 # Data loading
 # ---------------------------------------------------------------------------
 
+def _concat_sectors_with_time(h_list, t_list):
+    """Stitch per-sector hidden states / times into a single continuous trajectory.
+
+    Each sector's stored time array starts at 0 (build_pretrain_h5 resets
+    `time -= time[0]` per sector). To run the time-aware pool on a cross-sector
+    concatenation we need a monotonically increasing global time axis. We
+    offset each subsequent sector by the previous sector's t_max plus the
+    median within-sector cadence of that sector, so the inter-sector boundary
+    looks like one regular cadence step rather than a discontinuity. The real
+    multi-month TESS gap between sectors is *not* represented — pooling
+    treats the concatenated stream as if observations were contiguous, which
+    matches what the original sample-indexed pool implicitly did.
+    """
+    t_parts = []
+    offset = 0.0
+    for t in t_list:
+        if t.numel() == 0:
+            t_parts.append(t)
+            continue
+        t_shifted = t - t[0] + offset
+        t_parts.append(t_shifted)
+        if t.numel() > 1:
+            dt_med = (t[1:] - t[:-1]).median().item()
+        else:
+            dt_med = 0.0
+        offset = float(t_shifted[-1].item()) + max(dt_med, 1e-6)
+    return torch.cat(h_list, dim=0), torch.cat(t_parts, dim=0)
+
+
 def extract_latents_by_star(model, h5_path: str, device: torch.device,
                              sample_indices: np.ndarray, tic_ids_sorted: np.ndarray,
                              max_length: int = None, pooling_mode: str = 'multiscale',
@@ -702,7 +731,7 @@ def extract_latents_by_star(model, h5_path: str, device: torch.device,
                           conv_data=conv_data_batch, return_states=True)
             h_fwd = out.get('h_fwd_tensor')
             h_bwd = out.get('h_bwd_tensor')
-            del out, flux_b, ferr_b, time_b, x_in, t_in, mask, meta_batch, conv_data_batch
+            del out, flux_b, ferr_b, x_in, t_in, mask, meta_batch, conv_data_batch
 
             h_fwd_split = torch.split(h_fwd, star_sizes, dim=0) if h_fwd is not None else [None] * len(star_buffer)
             h_bwd_split = torch.split(h_bwd, star_sizes, dim=0) if h_bwd is not None else [None] * len(star_buffer)
@@ -711,6 +740,7 @@ def extract_latents_by_star(model, h5_path: str, device: torch.device,
             offset = 0
             for (pos, _), hf, hb in zip(star_buffer, h_fwd_split, h_bwd_split):
                 h_sectors = [] if compute_cross_sector else None
+                t_sectors = [] if compute_cross_sector else None
                 for j in range(len(pos)):
                     vlen = int(lens_b[offset + j])
                     if hf is not None and hb is not None:
@@ -719,28 +749,35 @@ def extract_latents_by_star(model, h5_path: str, device: torch.device,
                         h = hf[j, :vlen, :]
                     else:
                         h = hb[j, :vlen, :]
+                    t = time_b[offset + j, :vlen]
 
                     if pooling_mode == 'mean':
                         latent = h.mean(dim=0)
                     elif pooling_mode == 'final':
                         latent = h[-1, :]
                     elif pooling_mode == 'multiscale':
-                        latent = compute_multiscale_features(h, n_segments=4)
+                        latent = compute_multiscale_features(h, t, n_segments=4)
                     else:
                         raise ValueError(f'Unknown pooling_mode: {pooling_mode}')
 
                     per_sector_latents[pos[j]] = latent.cpu().numpy()
                     if compute_cross_sector:
                         h_sectors.append(h)
-                    del h, latent
+                        t_sectors.append(t)
+                    del h, t, latent
 
                 if compute_cross_sector:
-                    h_all = torch.cat(h_sectors, dim=0)
-                    cross_sector_latents.append(compute_multiscale_features(h_all, n_segments=4).cpu().numpy())
-                    del h_sectors, h_all
+                    # Cross-sector pooling: stitch all sectors end-to-end on a
+                    # synthetic continuous time axis. Each subsequent sector is
+                    # offset by the previous sector's t_max plus the median
+                    # within-sector cadence, so the inter-sector boundary looks
+                    # like one regular cadence step (no discontinuity injected).
+                    h_all, t_all = _concat_sectors_with_time(h_sectors, t_sectors)
+                    cross_sector_latents.append(compute_multiscale_features(h_all, t_all, n_segments=4).cpu().numpy())
+                    del h_sectors, t_sectors, h_all, t_all
                 offset += len(pos)
 
-            del h_fwd_split, h_bwd_split
+            del h_fwd_split, h_bwd_split, time_b
 
         for tic in unique_tics:
             pos = tic_to_pos[tic]
@@ -1215,6 +1252,7 @@ def extract_cross_sector_latents(model, h5_path: str, device: torch.device,
 
             # Collect valid hidden states from every sector of this star
             h_segments = []
+            t_segments = []
             for j in range(B):
                 vlen = lens_b[j]
                 if h_fwd is not None and h_bwd is not None:
@@ -1224,9 +1262,10 @@ def extract_cross_sector_latents(model, h5_path: str, device: torch.device,
                 else:
                     h = h_bwd[j, :vlen, :]
                 h_segments.append(h)
+                t_segments.append(time_b[j, :vlen])
 
-            h_all  = torch.cat(h_segments, dim=0)  # (total_valid_timesteps, hidden)
-            latent = compute_multiscale_features(h_all, n_segments=4)
+            h_all, t_all = _concat_sectors_with_time(h_segments, t_segments)
+            latent = compute_multiscale_features(h_all, t_all, n_segments=4)
             star_latents.append(latent.cpu().numpy())
 
             if (i + 1) % 250 == 0:

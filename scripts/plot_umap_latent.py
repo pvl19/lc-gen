@@ -248,65 +248,116 @@ def load_model(model_path: str, device: torch.device, hidden_size: int = 64,
     return model
 
 
-def compute_multiscale_features(h_valid: torch.Tensor, n_segments: int = 4,
+def compute_multiscale_features(h_valid: torch.Tensor, t_valid: torch.Tensor,
+                                n_segments: int = 4,
                                 minmax_edge_skip: int = 0) -> torch.Tensor:
-    """Compute multi-scale temporal features from hidden states.
+    """Compute multi-scale temporal features from hidden states (time-aware).
+
+    Pool operators are defined in physical time rather than sample index:
+    global mean/std are weighted by Voronoi-style time duration per sample,
+    segments split [t_min, t_max] into equal-time bins, and the difference
+    aggregators operate on rates Δh/Δt rather than per-step Δh. This removes
+    the sampling-rate / sector-length bias the original sample-indexed pool
+    was injecting into the latent.
+
+    Order statistics (global_max / global_min) are kept as plain extrema —
+    they carry useful signal and a fully length-invariant version requires
+    truncation to a common time window (Route B), not just reweighting.
 
     Args:
-        h_valid: (L, H) hidden states for valid timesteps
-        n_segments: number of temporal segments for quartile pooling
+        h_valid: (L, H) hidden states for valid timesteps.
+        t_valid: (L,) physical time for each hidden state. Must be monotonic.
+            Units are arbitrary but must match across the dataset (e.g. days).
+        n_segments: number of equal-time segments for segment pooling.
         minmax_edge_skip: drop this many leading and trailing timesteps before
             computing global_min / global_max only. The MinGRU cumulative scan
             is barely averaged near each stream's start, so a single
             un-smoothed sample can dominate the per-feature min/max even after
-            `trim_edges` strips raw input. Mean/std/segment/diff aggregators
-            average over many steps and are not affected; they always use the
-            full h_valid.
+            `trim_edges` strips raw input.
 
     Returns:
-        Feature vector combining multiple aggregation strategies
+        Feature vector of shape (12*H,):
+        [glob_mean, glob_std, glob_max, glob_min,
+         seg0..seg(n_segments-1), first_h, last_h, diff_mean, diff_std].
     """
     L, H = h_valid.shape
+    device, dtype = h_valid.device, h_valid.dtype
+    eps = torch.finfo(dtype).eps
     features = []
 
-    # 1. Global statistics
-    global_mean = h_valid.mean(dim=0)  # (H,)
-    global_std = h_valid.std(dim=0)    # (H,)
-    # min/max are single-timestep extrema -> susceptible to edge bias.
+    # Voronoi time weights: each sample carries half the gap to each neighbour;
+    # endpoints get the inner half-gap only. Reduces to uniform 1/L weights for
+    # regularly sampled sequences, so this is a strict generalization.
+    if L == 1:
+        w = torch.ones(1, device=device, dtype=dtype)
+    else:
+        dt = (t_valid[1:] - t_valid[:-1]).to(dtype).clamp_min(eps)   # (L-1,)
+        w = torch.empty(L, device=device, dtype=dtype)
+        w[0]  = 0.5 * dt[0]
+        w[-1] = 0.5 * dt[-1]
+        if L > 2:
+            w[1:-1] = 0.5 * (dt[1:] + dt[:-1])
+        w = w.clamp_min(0.0)
+    w_sum = w.sum().clamp_min(eps)
+    w_col = w.unsqueeze(1)
+
+    # 1. Global statistics — time-weighted.
+    global_mean = (w_col * h_valid).sum(dim=0) / w_sum
+    centered    = h_valid - global_mean.unsqueeze(0)
+    global_var  = (w_col * centered.pow(2)).sum(dim=0) / w_sum
+    global_std  = global_var.clamp_min(0.0).sqrt()
+
     m = max(0, int(minmax_edge_skip))
     if m > 0 and L > 2 * m + 1:
         h_inner = h_valid[m:L - m, :]
     else:
         h_inner = h_valid
-    global_max = h_inner.max(dim=0).values  # (H,)
-    global_min = h_inner.min(dim=0).values  # (H,)
+    global_max = h_inner.max(dim=0).values
+    global_min = h_inner.min(dim=0).values
     features.extend([global_mean, global_std, global_max, global_min])
-    
-    # 2. Temporal segment pooling (quartiles)
-    # Split sequence into n_segments and compute mean for each
-    segment_size = max(1, L // n_segments)
+
+    # 2. Temporal segment pooling — equal-TIME bins of [t_min, t_max], not
+    # equal-sample quartiles. A 60-day sector's seg3 now covers days 45-60 and
+    # a 30-day sector's seg3 covers days 22.5-30, but the *time-weighted mean*
+    # inside each bin is rate-invariant — that's what makes the pool stop
+    # confusing length structure with content.
+    t_min = t_valid[0]
+    t_max = t_valid[-1]
+    span  = (t_max - t_min).clamp_min(eps)
+    edges = t_min + span * torch.linspace(0.0, 1.0, n_segments + 1,
+                                          device=device, dtype=t_valid.dtype)
     for seg_idx in range(n_segments):
-        start = seg_idx * segment_size
-        end = min((seg_idx + 1) * segment_size, L) if seg_idx < n_segments - 1 else L
-        if start < L:
-            seg_mean = h_valid[start:end, :].mean(dim=0)
-            features.append(seg_mean)
+        lo = edges[seg_idx]
+        hi = edges[seg_idx + 1]
+        # Closed on the right of the final bin so t_max is included.
+        in_bin = (t_valid >= lo) & (t_valid < hi) if seg_idx < n_segments - 1 \
+                 else (t_valid >= lo) & (t_valid <= hi)
+        if in_bin.any():
+            ws = w[in_bin]
+            denom = ws.sum().clamp_min(eps)
+            seg_mean = (ws.unsqueeze(1) * h_valid[in_bin, :]).sum(dim=0) / denom
         else:
-            # If sequence is shorter than expected, pad with zeros
-            features.append(torch.zeros(H, device=h_valid.device))
-    
-    # 3. First and last hidden states (capture beginning/end of light curve)
-    features.append(h_valid[0, :])   # first
-    features.append(h_valid[-1, :])  # last
-    
-    # 4. Temporal derivative statistics (how hidden states change over time)
+            seg_mean = torch.zeros(H, device=device, dtype=dtype)
+        features.append(seg_mean)
+
+    # 3. First / last hidden states (anchored at t_min, t_max).
+    features.append(h_valid[0, :])
+    features.append(h_valid[-1, :])
+
+    # 4. Temporal-derivative statistics — RATE Δh/Δt, unweighted mean/std.
+    # Each per-step pair (Δh_i, Δt_i) contributes one observation. A 5-day
+    # mid-sector gap contributes Δh / 5 days = a *small* rate, not the large
+    # per-step jump it used to be — and dense within-sector samples dominate
+    # the aggregate by count, so the gap-boundary spike is naturally absorbed.
     if L > 1:
-        h_diff = h_valid[1:, :] - h_valid[:-1, :]  # (L-1, H)
-        diff_mean = h_diff.mean(dim=0)
-        diff_std = h_diff.std(dim=0)
+        dt_step = (t_valid[1:] - t_valid[:-1]).to(dtype).clamp_min(eps)
+        rates = (h_valid[1:, :] - h_valid[:-1, :]) / dt_step.unsqueeze(1)
+        diff_mean = rates.mean(dim=0)
+        diff_std  = rates.std(dim=0) if rates.shape[0] > 1 else torch.zeros(H, device=device, dtype=dtype)
         features.extend([diff_mean, diff_std])
     else:
-        features.extend([torch.zeros(H, device=h_valid.device), torch.zeros(H, device=h_valid.device)])
+        features.extend([torch.zeros(H, device=device, dtype=dtype),
+                         torch.zeros(H, device=device, dtype=dtype)])
     
     return torch.cat(features, dim=0)
 
@@ -469,6 +520,7 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
                     h_combined = h_bwd[i, :valid_len, :]
                 else:
                     raise ValueError("No hidden states returned by model")
+                t_combined = time_batch[i, :valid_len]
 
                 if pooling_mode == 'mean':
                     latent = h_combined.mean(dim=0)
@@ -476,7 +528,7 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
                     latent = h_combined[-1, :]
                 elif pooling_mode == 'multiscale':
                     latent = compute_multiscale_features(
-                        h_combined, n_segments=4,
+                        h_combined, t_combined, n_segments=4,
                         minmax_edge_skip=minmax_edge_skip,
                     )
                 else:

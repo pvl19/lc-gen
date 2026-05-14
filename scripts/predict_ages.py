@@ -181,8 +181,9 @@ def extract_latents_lazy(ae_model_path, h5_path, valid_indices, tic_ids,
                 h = torch.cat([hf[j, :vlen, :], hb[j, :vlen, :]], dim=-1) \
                     if (hf is not None and hb is not None) else \
                     (hf[j, :vlen, :] if hf is not None else hb[j, :vlen, :])
+                t = time_b[offset + j, :vlen]
                 if pooling_mode == 'multiscale':
-                    latent = compute_multiscale_features(h, n_segments=4)
+                    latent = compute_multiscale_features(h, t, n_segments=4)
                 elif pooling_mode == 'mean':
                     latent = h.mean(dim=0)
                 else:
