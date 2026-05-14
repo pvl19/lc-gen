@@ -11,7 +11,7 @@ LOAD_LATENTS=""
 # SAVE_LATENTS works in both modes: one path per H5 file (fresh extraction) or
 # one per LOAD_LATENTS entry (re-saves each cache in canonical format with ages
 # filled from CSV — useful for normalizing predict_ages.py format caches).
-SAVE_LATENTS="final_model/parallel_fixed/e110_trim10/latents_pretrain.npz final_model/parallel_fixed/e110_trim10/latents_hosts.npz"
+SAVE_LATENTS="final_model/parallel_fixed/e110_edgeskip_minmax/latents_pretrain.npz final_model/parallel_fixed/e110_edgeskip_minmax/latents_hosts.npz"
 MODEL_PATH="final_model/parallel_fixed/e110/best_model.pt"
 H5_PATHS="final_pretrain/timeseries_pretrain.h5 final_pretrain/timeseries_exop_hosts.h5"
 
@@ -26,7 +26,7 @@ TRIM_EDGES=10
 # min/max even after trim_edges. Mean/std/segment/diff stats are unaffected.
 MINMAX_EDGE_SKIP=100
 
-OUTPUT_DIR="final_model/parallel_fixed/e110_trim10/umap"
+OUTPUT_DIR="final_model/parallel_fixed/e110_edgeskip_minmax/umap"
 
 CMD="python scripts/plot_umap_latent.py \
   --age_csv_path final_pretrain/metadata.csv final_pretrain/host_all_metadata.csv \
