@@ -7,7 +7,7 @@
 #   2. Update --epochs to your new target (e.g., 50 or 100)
 #   3. Training will continue from where it left off
 #
-#SBATCH --job-name=lcgen-final-parallel-v2
+#SBATCH --job-name=final-warm-restart
 #### Change account to your allocation (e.g., abc123p)
 #SBATCH --account=phy260003p
 #SBATCH --partition=GPU-shared
@@ -103,11 +103,15 @@ time -p singularity exec --nv --bind /ocean,$LOCAL,$HOME \
     --batch_size 64 \
     --hidden_size 64 \
     --output_name model.pt \
-    --epochs 50 \
-    --lr 1e-3 \
+    --epochs 150 \
+    --fresh_scheduler \
+    --pct_start 0.2 \
+    --lr 1e-4 \
+    --lr_div_factor 2.0 \
     --min_size 5 \
     --max_size 720 \
-    --mask_portion 0.4 \
+    --mask_portion 0.5 \
+    --trim_edges 10 \
     --use_flow \
     --use_metadata \
     --mode parallel \
@@ -116,7 +120,7 @@ time -p singularity exec --nv --bind /ocean,$LOCAL,$HOME \
     --num_workers 4 \
     --K 720 \
     --k_spacing log \
-    --patience 10 \
+    --patience 25 \
     --min_delta 0.0 \
     --save_every 1 \
     --checkpoint_copy_dir $PROJECT_DIR/checkpoints/resume \

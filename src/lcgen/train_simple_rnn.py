@@ -21,6 +21,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import Dataset, DataLoader, random_split, ConcatDataset
 import datetime
+import copy
 
 import sys
 from pathlib import Path as _P
@@ -98,7 +99,8 @@ def validate(model, val_loader, device, args):
                 for k_val in args.val_k_values:
                     loss, stats, per_k_mean = bounded_horizon_future_nll(
                         h_fwd, h_bwd, t_enc, model, flux, flux_err,
-                        mask=mask, metadata=metadata, K=args.K, k_spacing=args.k_spacing, fixed_k=k_val
+                        mask=mask, metadata=metadata, K=args.K, k_spacing=args.k_spacing, fixed_k=k_val,
+                        times=times,
                     )
                     k_losses.append(loss.item())
                 # Average across k values
@@ -107,7 +109,8 @@ def validate(model, val_loader, device, args):
                 # Use random k sampling (same as training)
                 loss, stats, per_k_mean = bounded_horizon_future_nll(
                     h_fwd, h_bwd, t_enc, model, flux, flux_err,
-                    mask=mask, metadata=metadata, K=args.K, k_spacing=args.k_spacing
+                    mask=mask, metadata=metadata, K=args.K, k_spacing=args.k_spacing,
+                    times=times,
                 )
                 batch_loss = loss.item()
 
@@ -118,7 +121,7 @@ def validate(model, val_loader, device, args):
     return avg_val_loss
 
 def _save_rolling_checkpoint(
-    model, optimizer, epoch,
+    model, optimizer, scheduler, epoch,
     previous_train_losses, train_epoch_losses,
     previous_val_losses, val_epoch_losses,
     k_stats_per_epoch, output_path, persistent_dir,
@@ -136,6 +139,7 @@ def _save_rolling_checkpoint(
     torch.save({
         'model_state_dict':     model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
         'epoch': epoch,
         'num_meta_features':    model.num_meta_features,
     }, ckpt_path)
@@ -164,6 +168,31 @@ def _save_rolling_checkpoint(
         print(f'  → Copied checkpoint to {persistent_dir}')
 
 
+def _save_best_checkpoint(
+    model, optimizer, scheduler, epoch, best_val_loss,
+    output_path, persistent_dir,
+):
+    """Write best_model.pt whenever a new best val loss is hit, and mirror to
+    persistent storage so it survives a SLURM timeout."""
+    import shutil
+
+    best_path = output_path / 'best_model.pt'
+    torch.save({
+        'model_state_dict':     model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+        'epoch':                epoch,
+        'best_val_loss':        best_val_loss,
+        'num_meta_features':    model.num_meta_features,
+    }, best_path)
+
+    if persistent_dir is not None:
+        shutil.copy2(best_path, persistent_dir / 'best_model.pt')
+        print(f'  → Copied best_model.pt (epoch {epoch}, val {best_val_loss:.6f}) to {persistent_dir}')
+    else:
+        print(f'  → Wrote best_model.pt (epoch {epoch}, val {best_val_loss:.6f})')
+
+
 def train(args):
     rank, world_size, device = setup_ddp()
     is_main = (rank == 0)
@@ -186,6 +215,8 @@ def train(args):
             num_samples=args.num_samples,
             use_metadata=args.use_metadata,
             metadata_features=None,
+            use_conv_channels=args.use_conv_channels,
+            trim_edges=args.trim_edges,
         )
         for path in args.input
     ]
@@ -246,7 +277,7 @@ def train(args):
         else:  # unet
             conv_config = {
                 'encoder_type': 'unet',
-                'input_length': 16000,
+                'input_length': 2500,
                 'encoder_dims': [4, 8, 16, 32],
                 'num_layers': 4,
                 'activation': 'gelu'
@@ -285,6 +316,7 @@ def train(args):
     start_epoch = 0
     previous_train_losses = []
     previous_val_losses = []
+    scheduler_state_to_load = None
 
     if args.resume_from:
         print(f"\n{'='*60}")
@@ -304,6 +336,9 @@ def train(args):
         if 'optimizer_state_dict' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             print(f"✓ Loaded optimizer state from checkpoint")
+
+        # Stash scheduler state if present; applied after scheduler creation below
+        scheduler_state_to_load = checkpoint.get('scheduler_state_dict')
 
         # Load previous losses from the checkpoint directory (REQUIRED for resume)
         checkpoint_dir = checkpoint_path.parent
@@ -338,7 +373,35 @@ def train(args):
 
     # Calculate remaining epochs for scheduler
     remaining_epochs = args.epochs - start_epoch
-    scheduler = OneCycleLR(optimizer, max_lr=args.lr, steps_per_epoch=len(train_loader), epochs=remaining_epochs, pct_start=0.3, div_factor=10.0, final_div_factor=1000.0)
+
+    # Build the OneCycleLR over `--scheduler_epochs` if given, otherwise over
+    # `--epochs`. This lets short runs (e.g. 25 epochs) follow the early portion
+    # of a longer LR curve (e.g. 150 epochs) without retuning the schedule.
+    # With --fresh_scheduler, build a NEW cycle over remaining_epochs only and
+    # ignore any prior scheduler state — used for warm restarts after a plateau.
+    if args.fresh_scheduler:
+        sched_epochs = remaining_epochs
+        print(f'[scheduler] --fresh_scheduler: building new OneCycleLR over {sched_epochs} remaining epochs '
+              f'(max_lr={args.lr}, pct_start={args.pct_start})')
+    else:
+        sched_epochs = args.scheduler_epochs if args.scheduler_epochs is not None else args.epochs
+        if args.scheduler_epochs is not None and args.scheduler_epochs != args.epochs:
+            print(f'[scheduler] OneCycleLR built over {sched_epochs} epochs but training will run for {args.epochs} epochs')
+
+    scheduler = OneCycleLR(optimizer, max_lr=args.lr, steps_per_epoch=len(train_loader), epochs=sched_epochs, pct_start=args.pct_start, div_factor=args.lr_div_factor, final_div_factor=1000.0)
+
+    if args.fresh_scheduler:
+        print('✓ --fresh_scheduler: skipping scheduler state load/replay (warm restart)')
+    elif scheduler_state_to_load is not None:
+        scheduler.load_state_dict(scheduler_state_to_load)
+        print(f'✓ Loaded scheduler state; OneCycleLR resumes at step {scheduler.last_epoch} of {scheduler.total_steps}')
+    elif args.resume_from and start_epoch > 0:
+        replay_steps = start_epoch * len(train_loader)
+        print(f'⚠ No scheduler state in checkpoint; replaying {replay_steps} OneCycleLR steps to reach the resume position')
+        for _ in range(replay_steps):
+            scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f'✓ OneCycleLR caught up to step {scheduler.last_epoch} of {scheduler.total_steps}; current LR = {current_lr:.3e}')
 
     if remaining_epochs <= 0:
         print('No epochs requested, exiting.')
@@ -428,7 +491,7 @@ def train(args):
             # Pass mask so loss is only computed on valid (unmasked) predictions.
             # Pass metadata so the head can use stellar properties for predictions.
             loss_start = time_module.time()
-            loss, stats, per_k_mean = bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=mask, metadata=metadata, K=args.K, k_spacing=args.k_spacing)
+            loss, stats, per_k_mean = bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=mask, metadata=metadata, K=args.K, k_spacing=args.k_spacing, times=times)
 
             # Track sampled k value for this batch
             if 'sampled_k' in stats:
@@ -494,12 +557,20 @@ def train(args):
                     if val_loss < (best_val_loss - args.min_delta):
                         best_val_loss = val_loss
                         epochs_without_improvement = 0
+                        # Deep-copy: state_dict() returns references to live
+                        # tensors, so in-place optimizer updates on later epochs
+                        # would overwrite the "best" snapshot we captured here.
                         best_model_state = {
-                            'model_state_dict': raw_model.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
+                            'model_state_dict': {k: v.detach().clone().cpu() for k, v in raw_model.state_dict().items()},
+                            'optimizer_state_dict': copy.deepcopy(optimizer.state_dict()),
                             'epoch': epoch + 1
                         }
                         print(f'  → New best validation loss: {best_val_loss:.6f}')
+                        # Persist best model to disk immediately so it survives a timeout
+                        _save_best_checkpoint(
+                            raw_model, optimizer, scheduler, epoch + 1, best_val_loss,
+                            output_path, persistent_dir,
+                        )
                     else:
                         epochs_without_improvement += 1
                         print(f'  → No improvement for {epochs_without_improvement} epoch(s) (best: {best_val_loss:.6f})')
@@ -509,7 +580,7 @@ def train(args):
                             print(f'Best validation loss: {best_val_loss:.6f} at epoch {epoch+1-args.patience}')
                             stopped_early = True
                             _save_rolling_checkpoint(
-                                raw_model, optimizer, epoch + 1,
+                                raw_model, optimizer, scheduler, epoch + 1,
                                 previous_train_losses, train_epoch_losses,
                                 previous_val_losses, val_epoch_losses,
                                 k_stats_per_epoch, output_path, persistent_dir,
@@ -529,7 +600,7 @@ def train(args):
         # ---- Per-epoch rolling checkpoint (rank 0 only) ----
         if is_main and not stopped_early and args.save_every > 0 and (epoch + 1) % args.save_every == 0:
             _save_rolling_checkpoint(
-                raw_model, optimizer, epoch + 1,
+                raw_model, optimizer, scheduler, epoch + 1,
                 previous_train_losses, train_epoch_losses,
                 previous_val_losses, val_epoch_losses,
                 k_stats_per_epoch, output_path, persistent_dir,
@@ -596,7 +667,19 @@ def parse_args():
     p.add_argument('--num_samples', type=int, default=None)
     p.add_argument('--epochs', type=int, default=3)
     p.add_argument('--batch_size', type=int, default=16)
-    p.add_argument('--lr', type=float, default=1e-3)
+    p.add_argument('--lr', type=float, default=1e-3, help='OneCycleLR peak learning rate (max_lr).')
+    p.add_argument('--lr_div_factor', type=float, default=10.0,
+                   help='OneCycleLR div_factor: initial LR = max_lr / div_factor. Set to 1 to skip cold-start and hold near max_lr during warmup.')
+    p.add_argument('--scheduler_epochs', type=int, default=None,
+                   help='Build OneCycleLR over this many epochs even though training only runs for --epochs. '
+                        'Useful for short test runs that should follow the early portion of a longer LR schedule. '
+                        'Defaults to --epochs.')
+    p.add_argument('--pct_start', type=float, default=0.3,
+                   help='OneCycleLR pct_start: fraction of the cycle spent ramping up to max_lr. Default 0.3.')
+    p.add_argument('--fresh_scheduler', action='store_true',
+                   help='When resuming, build a NEW OneCycleLR over the remaining epochs and skip loading/'
+                        'replaying any prior scheduler state. Use for warm restarts after a plateau: pair with '
+                        'a lower --lr (e.g. 50%% of the original peak) and shorter --pct_start (e.g. 0.1-0.2).')
     p.add_argument('--hidden_size', type=int, default=64)
     p.add_argument('--output_dir', type=str, default='output/simple_rnn')
     p.add_argument('--output_name', type=str, default='simple_min_gru_default_output.pt')
@@ -605,6 +688,11 @@ def parse_args():
     p.add_argument('--min_size', type=int, default=2)
     p.add_argument('--max_size', type=int, default=100)
     p.add_argument('--mask_portion', type=float, default=0.2)
+    p.add_argument('--trim_edges', type=int, default=10,
+                   help='Strip the first/last N samples from every light curve before '
+                        'they reach the encoder. Avoids TESS sector-boundary artifacts '
+                        '(scattered light, thermal settling). Samples shorter than '
+                        '2*trim_edges+32 are dropped. Use 0 to disable.')
     p.add_argument('--mock_sinusoid', action='store_true')
     p.add_argument('--mock_noise', type=float, default=0.1)
     p.add_argument('--mode', type=str, default='sequential', choices=['sequential', 'parallel'])

@@ -50,11 +50,22 @@ def _sample_k_value(K: int, L: int, spacing: str = 'dense'):
         raise ValueError(f"Unknown k_spacing: {spacing}. Choose 'dense' or 'log'.")
 
 
-def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=None, metadata=None, K: int = 128, k_spacing: str = 'dense', fixed_k: int = None):
+def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=None, metadata=None, K: int = 128, k_spacing: str = 'dense', fixed_k: int = None, times=None):
     """
     Compute the average NLL loss for predictions at a single randomly sampled horizon k.
     Each batch samples one k value according to k_spacing strategy, dramatically speeding
     up training by computing only one prediction per timestep instead of K predictions.
+
+    Masked-target denoising: when `mask` is provided, block-masked positions are NOT
+    excluded from the loss — they are trained as denoising targets. The forward and
+    backward source hidden states are re-routed to the nearest unmasked positions
+    (i.e. the nearest real observation on each side). For a target at position j with
+    horizon k:
+      - forward source = h_fwd[i_f] where i_f = max{i <= j-k : mask[i] == 1}
+      - backward source = h_bwd[i_b] where i_b = min{i >= j+k : mask[i] == 1}
+    If j-k is already unmasked, i_f == j-k (identical to the unmasked-case behavior).
+    Padded positions (past the real sequence length) are detected via `times == 0`
+    and remain excluded from the loss.
 
     Args:
         h_fwd: (B, L, H) tensor of forward hidden states (one per timestep)
@@ -70,15 +81,17 @@ def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=
            training and inference match.
         flux: (B, L) ground-truth flux values
         flux_err: (B, L) measurement errors (used by recon_loss)
-        mask: (B, L) optional mask where 1=observed, 0=masked. If provided,
-              predictions are only computed for unmasked targets, and source
-              hidden states must come from unmasked positions.
+        mask: (B, L) optional mask where 1=observed, 0=masked. Used to re-route
+              source hidden states; masked targets still contribute to the loss.
         metadata: (B, num_meta_features) optional stellar metadata tensor. If provided
                   and the model has a meta_encoder, the metadata embedding will be
                   included in the head input (same as in model.forward).
         K: maximum horizon (int)
         k_spacing: how to sample k value - 'dense' (uniform) or 'log' (log-normal)
         fixed_k: if provided, use this specific k value instead of sampling
+        times: (B, L) optional raw time tensor used to identify padded positions
+               (padded positions have time == 0 due to zero-padding in collate_fn).
+               If None, no padding exclusion is performed.
 
     Returns:
         loss: scalar tensor (average NLL across valid predictions at sampled k)
@@ -116,19 +129,44 @@ def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=
     # Time encodings at target positions
     t_tgt = t_enc[:, k:L-k, :]        # (B, n_targets, Te)
 
+    # Build source-remap tables from the block mask. For each position i in
+    # [0, L), fwd_remap[i] is the nearest unmasked index <= i (falling back
+    # to 0 if none exists), and bwd_remap[i] is the nearest unmasked index
+    # >= i (falling back to L-1 if none exists). When mask is None (or all
+    # ones), these are identity, so the gather is equivalent to the old
+    # fixed-offset slicing h_fwd[:, :n_targets] / h_bwd[:, 2*k:].
+    idx_row = torch.arange(L, device=device).unsqueeze(0).expand(B, L)
+    if mask is not None:
+        masked_idx_fwd = torch.where(mask > 0.5, idx_row, torch.full_like(idx_row, -1))
+        fwd_remap, _ = torch.cummax(masked_idx_fwd, dim=1)
+        fwd_remap = torch.clamp(fwd_remap, min=0)
+        masked_idx_bwd = torch.where(mask > 0.5, idx_row, torch.full_like(idx_row, L))
+        bwd_flipped, _ = torch.cummin(masked_idx_bwd.flip(dims=[1]), dim=1)
+        bwd_remap = bwd_flipped.flip(dims=[1])
+        bwd_remap = torch.clamp(bwd_remap, max=L - 1)
+    else:
+        fwd_remap = idx_row
+        bwd_remap = idx_row
+
+    # Source indices for each target: default fwd = j-k, bwd = j+k (where
+    # j ranges over [k, L-k)). After remapping, these may shift to nearby
+    # unmasked positions if the default source falls inside a mask block.
+    fwd_idx_slice = fwd_remap[:, :n_targets].long()                 # (B, n_targets)
+    bwd_idx_slice = bwd_remap[:, 2*k:].long()                       # (B, n_targets)
+
     # Build head input: [hidden_states, time_enc] — matches model.forward exactly.
     # Metadata is NOT included here; it already influences the hidden states via
     # the RNN input path in model.forward. Adding it again would change the head
     # input size relative to what head_norm and the flow were initialized for.
     if getattr(model, 'direction', None) == 'bi' and h_bwd is not None:
-        src_f = h_fwd[:, :n_targets, :]       # (B, n_targets, H)
-        src_b = h_bwd[:, 2*k:, :]             # (B, n_targets, H)
+        src_f = torch.gather(h_fwd, dim=1, index=fwd_idx_slice.unsqueeze(-1).expand(-1, -1, H))
+        src_b = torch.gather(h_bwd, dim=1, index=bwd_idx_slice.unsqueeze(-1).expand(-1, -1, H))
         inputs_k = torch.cat([src_f, src_b, t_tgt], dim=-1)   # (B, n_targets, 2H+Te)
-        flat_in = inputs_k.view(-1, 2 * H + Te)
+        flat_in = inputs_k.reshape(-1, 2 * H + Te)
     else:
-        h_src = h_fwd[:, :n_targets, :]       # (B, n_targets, H)
-        inputs_k = torch.cat([h_src, t_tgt], dim=-1)          # (B, n_targets, H+Te)
-        flat_in = inputs_k.view(-1, H + Te)
+        src_f = torch.gather(h_fwd, dim=1, index=fwd_idx_slice.unsqueeze(-1).expand(-1, -1, H))
+        inputs_k = torch.cat([src_f, t_tgt], dim=-1)          # (B, n_targets, H+Te)
+        flat_in = inputs_k.reshape(-1, H + Te)
 
     # Apply head normalization and the same time-conditioning used in
     # `model.forward` before calling the head so training/inference match.
@@ -147,21 +185,29 @@ def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=
     flux_tgt = flux[:, k:L-k]                 # (B, n_targets)
     ferr_tgt = flux_err[:, k:L-k]             # (B, n_targets)
 
-    # Compute validity mask for predictions
+    # Compute validity mask for predictions.
     # A prediction is valid if:
-    # 1. The target position is unmasked (we have ground truth to compare against)
-    # 2. The forward source position (j-k) is unmasked
-    # 3. The backward source position (j+k) is unmasked (for bidirectional)
-    if mask is not None:
-        mask_fwd_src = mask[:, :n_targets]     # (B, n_targets) - mask at forward source positions
-        mask_tgt = mask[:, k:L-k]              # (B, n_targets) - mask at target positions
-        if getattr(model, 'direction', None) == 'bi' and h_bwd is not None:
-            mask_bwd_src = mask[:, 2*k:]       # (B, n_targets) - mask at backward source positions
-            valid = (mask_fwd_src * mask_tgt * mask_bwd_src)
-        else:
-            valid = (mask_fwd_src * mask_tgt)
+    # 1. The target position is NOT padding (we have real ground truth).
+    #    Block-masked targets ARE included — the mask only zeroes the RNN's
+    #    input view of flux/flux_err; the raw flux passed here is untouched.
+    # 2. The remapped forward source actually landed on an unmasked position
+    #    (the cummax/cummin clamps to 0/L-1 if the sequence has no unmasked
+    #    predecessor / successor — those edge cases are still excluded).
+    # 3. Same for the backward source (for bidirectional).
+    if times is not None:
+        pad_valid = (times.to(device) != 0).float()     # 1 = real sample, 0 = padded
     else:
-        valid = torch.ones_like(flux_tgt, device=device)
+        pad_valid = torch.ones(B, L, device=device)
+    tgt_valid = pad_valid[:, k:L-k]
+    if mask is not None:
+        fwd_src_valid = torch.gather(mask, dim=1, index=fwd_idx_slice)
+        if getattr(model, 'direction', None) == 'bi' and h_bwd is not None:
+            bwd_src_valid = torch.gather(mask, dim=1, index=bwd_idx_slice)
+            valid = tgt_valid * fwd_src_valid * bwd_src_valid
+        else:
+            valid = tgt_valid * fwd_src_valid
+    else:
+        valid = tgt_valid
 
     # If the model exposes a conditional flow (zuko) named `flow`, use it
     # to compute per-prediction negative log-likelihoods. The flow will

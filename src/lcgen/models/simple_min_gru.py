@@ -39,7 +39,10 @@ class minGRUCell(nn.Module):
 
     @staticmethod
     def log_g(x):
-        return torch.where(x >= 0, (F.relu(x)+0.5).log(), 5 -F.softplus(-x))
+        # log of g(x) where g(x) = relu(x)+0.5 for x>=0 and sigmoid(x) for x<0.
+        # log(sigmoid(x)) = -softplus(-x). The two branches are continuous at x=0
+        # (both give log(0.5) ≈ -0.693).
+        return torch.where(x >= 0, (F.relu(x)+0.5).log(), -F.softplus(-x))
 
     @staticmethod
     def parallel_scan_log(log_coeffs, log_values):
@@ -106,7 +109,11 @@ class minGRUCell(nn.Module):
         k = self.W_z(x)                                               # (B, T, H)
         log_z      = -F.softplus(-k)                                  # log sigmoid(k)
         log_coeffs = -F.softplus(k)                                   # log(1 - sigmoid(k))
-        log_h_0    = minGRUCell.log_g(h_0)                            # (B, 1, H)
+        # Treat h_0 as the literal initial hidden state (not a pre-activation),
+        # matching the sequential `step` convention. h_0 is expected to be >= 0
+        # (typically zeros). log(0) = -inf contributes 0 to logsumexp, which is
+        # exactly what we want for a zero initial state.
+        log_h_0    = h_0.clamp_min(torch.finfo(h_0.dtype).tiny).log() # (B, 1, H)
         log_h_tilde = minGRUCell.log_g(self.W_h(x))                  # (B, T, H)
         return minGRUCell.parallel_scan_log(
             log_coeffs, torch.cat([log_h_0, log_z + log_h_tilde], dim=1)
@@ -322,6 +329,12 @@ class BiDirectionalMinGRU(nn.Module):
 
         B, L, _ = x.shape
 
+        # Preserve the original (pre-mask) flux_err so the reconstruction head
+        # can always condition the flow on the real measurement error, even at
+        # masked positions. This matches the training-time loss, which uses
+        # the unmasked flux_err in the flow context.
+        flux_err_unmasked = x[..., 1].clone()  # (B, L)
+
         # Apply mask to input: zero out flux and flux_err at masked positions
         # but keep time encoding so the RNN knows the timestamp
         if mask is not None:
@@ -462,7 +475,7 @@ class BiDirectionalMinGRU(nn.Module):
                     h_hidden = h_bi[:, :-nt]
                     h_time = h_bi[:, -nt:] * self.time_scale
                     h_bi = torch.cat([h_hidden, h_time], dim=1)
-                meas_err_t = x[:, ti, 1]
+                meas_err_t = flux_err_unmasked[:, ti]
                 if self.flow is not None:
                     ctx = torch.cat([h_bi, meas_err_t.unsqueeze(1)], dim=1)
                     dist = self.flow(ctx)
