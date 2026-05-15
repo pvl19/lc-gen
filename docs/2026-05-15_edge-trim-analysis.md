@@ -124,7 +124,7 @@ the evidence base for whichever choice the next training run adopts.
 Any change to `trim_edges` invalidates the current cached latents and
 checkpoints (see `CLAUDE.md` for the compatibility note).
 
-## Reproducing
+## Reproducing the sector-edge analysis
 
 ```bash
 python3 tests/edge_trim_analysis.py
@@ -135,3 +135,124 @@ Knobs at the top of the script: `N_CHUNKS`, `N_EDGE`, `SEED`. Reading
 gzip decompression dominates wall time. Do **not** switch to random
 row indexing without a chunk-cache strategy — it makes the script
 unrunnable.
+
+---
+
+## Mid-sector downlink-gap analysis (full population)
+
+The same statistical machinery, applied to the trailing/leading edges of
+the segments on either side of the mid-sector data downlink. Run on every
+curve in both files (`tests/downlink_gap_analysis.py`); wall time was
+129 s for `timeseries_pretrain.h5` and 44 s for `timeseries_exop_hosts.h5`.
+
+### Method
+
+For each curve:
+1. Find the largest `Δt` in the valid region.
+2. Require the gap to be > 0.2 days (TESS downlinks are ~1–4 d; normal
+   cadence is ~0.0014 d) **and** unambiguous (second-largest gap must
+   be < 50% of the largest).
+3. Require ≥ 40 valid samples on each side of the gap.
+4. Aggregate flux per position with col 0 = sample closest to the gap,
+   on both the "BEFORE" (trailing edge of pre-gap segment, reversed)
+   and "AFTER" (leading edge of post-gap segment) sides.
+
+### Population stats
+
+| file | total | kept | gap size median (d) | gap pos median (frac) |
+|---|---|---|---|---|
+| `timeseries_pretrain.h5` | 40,662 | 34,576 (85%) | 2.44 (p10–p90: 1.16–4.86) | 0.50 (tight) |
+| `timeseries_exop_hosts.h5` | 19,969 | 12,568 (63%) | 2.08 (p10–p90: 0.93–4.88) | 0.50 (tight) |
+
+The downlink sits almost exactly mid-sector for both files. Exop hosts
+have a higher ambiguous-gap rate (37%), consistent with that population
+having more multi-sector concatenations.
+
+### Results — `timeseries_pretrain.h5` (N=34,576)
+
+**BEFORE gap** (col 0 = closest to gap, looking backwards):
+
+| pos | 0 | 1 | 5 | 10 | 15 | 20 | 25 | 30 | 35 | 39 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `mean(f²)` | **0.66*** | 1.51 | 1.41 | 1.49 | 1.57 | 1.59 | 1.43 | 1.47 | 1.45 | 1.50 |
+| `median\|f\|` | 0.43* | 0.72 | 0.70 | 0.70 | 0.70 | 0.69 | 0.69 | 0.70 | 0.70 | 0.71 |
+| `P(\|f\|>3)` | 0.002* | 0.014 | 0.011 | 0.011 | 0.009 | 0.008 | 0.009 | 0.009 | 0.008 | 0.008 |
+
+**AFTER gap** (col 0 = closest to gap, looking forward):
+
+| pos | 0 | 1 | 5 | 10 | 15 | 20 | 25 | 30 | 31 | 35 | 39 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `mean(f²)` | **0.69*** | 1.53 | 1.43 | 1.49 | 1.72 | 1.63 | 1.71 | 2.27 | **2.28** | 1.93 | 1.89 |
+| `median\|f\|` | 0.42* | 0.74 | 0.69 | 0.70 | 0.71 | 0.70 | 0.69 | 0.70 | 0.70 | 0.70 | 0.70 |
+| `P(\|f\|>3)` | 0.002* | 0.013 | 0.011 | 0.010 | 0.010 | 0.010 | 0.009 | 0.008 | 0.010 | 0.008 | 0.009 |
+
+`*` Position 0 is anomalously **low** (`mean(f²) ≈ 0.66`) on every cut.
+This is a preprocessing artifact, not a physical signal — most likely
+the boundary sample on each side of the gap is zero-imputed (z-normed
+data with zeros pulls `mean(f²)` and `median|f|` toward zero). It is
+**not** a sample that survived a real shutter exposure adjacent to the
+downlink. Treat pos 0 as junk; the real artifact behaviour starts at
+pos 1.
+
+`timeseries_exop_hosts.h5` (N=12,568) is qualitatively the same shape;
+post-gap `mean(f²)` plateaus higher at ~1.7 across all 40 positions
+without a clean recovery within the window.
+
+### Interpretation
+
+1. **Downlink edges are not clean.** From position 1 onward, `mean(f²)`
+   sits at **~1.4–1.7** on both sides — a persistent **+40–70% variance
+   excess** that does not decay across the 40-cadence (~80 min) window we
+   sampled. `median|f|` recovers to within ~5% of Gaussian by pos 1, so
+   the inflation is again **outlier-tail-driven** (`P(|f|>3) ≈ 4–6× the
+   Gaussian rate at pos 1, settling to ~3× by pos 30`).
+
+2. **Asymmetric "settling bump" on the AFTER side.** `mean(f²)` rises
+   from ~1.5 at pos 5 to a peak of **2.28 at pos ~31** in pretrain, then
+   relaxes back. ~31 cadences ≈ 1 hour after the downlink — same
+   timescale as the secondary bump we saw at the start of a sector. This
+   is consistent with a fine-pointing / thermal recovery transient
+   following the downlink slew, not with the immediate post-shutter-open
+   sample.
+
+3. **`flux_err` is again uninformative** — flat at ~0.79 (pretrain) /
+   ~0.90 (exop hosts) across the entire window.
+
+4. **Sector-edge vs. downlink comparison.**
+   - Sector start: extreme spike at the outermost samples (`mean(f²) ≈ 4`),
+     decaying to ~2 by pos 10, ~1.5 by pos 25.
+   - Sector end: ~1.4 plateau, much milder.
+   - Downlink (either side): ~1.5 plateau across the full 40-pos window
+     (after the pos-0 imputation marker), with a delayed +30-cadence
+     bump on the AFTER side.
+
+   So the downlink behaves more like a "second sector end + second sector
+   start" with the worst part being **a delayed transient**, not the
+   sample immediately adjacent to the gap.
+
+### Implications for `trim_edges`
+
+`trim_edges` only operates at the outer ends of each curve — it does
+**not** touch the downlink. The findings above mean the encoder is
+seeing a mid-sector region with persistent +50% variance inflation on
+both sides of the downlink, plus a +130% bump ~1 h after the gap on
+the AFTER side. Cleaning that would require either:
+
+- masking a window around the largest `Δt` per curve, or
+- a gap-aware encoder that conditions on the irregular time axis (which
+  the model already does, but only at the per-step time-encoding level —
+  it does not currently mask out the settling transient).
+
+Neither change is being made in this commit; the doc is the evidence
+base for whichever route the next training run takes. If only one knob
+is touched, **adding a downlink-aware mask of ~32 cadences on the AFTER
+side** would have higher impact than changing `trim_edges` from 10 to 20.
+
+## Reproducing the downlink analysis
+
+```bash
+python3 tests/downlink_gap_analysis.py
+```
+
+Knobs: `MIN_GAP_DAYS=0.2`, `AMBIG_RATIO=0.5`, `N_EDGE=40`. Wall ~3 min
+total on a warm SSD; processes one chunk at a time (~150 MB peak RSS).
