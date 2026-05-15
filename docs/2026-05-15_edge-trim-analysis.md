@@ -207,46 +207,75 @@ without a clean recovery within the window.
    the inflation is again **outlier-tail-driven** (`P(|f|>3) ≈ 4–6× the
    Gaussian rate at pos 1, settling to ~3× by pos 30`).
 
-2. **Asymmetric "settling bump" on the AFTER side.** `mean(f²)` rises
-   from ~1.5 at pos 5 to a peak of **2.28 at pos ~31** in pretrain, then
-   relaxes back. ~31 cadences ≈ 1 hour after the downlink — same
-   timescale as the secondary bump we saw at the start of a sector. This
-   is consistent with a fine-pointing / thermal recovery transient
-   following the downlink slew, not with the immediate post-shutter-open
-   sample.
+2. **Mild asymmetry: the AFTER side runs ~10–30% higher than BEFORE.**
+   At matched offsets, post-downlink `mean(f²)` is consistently above
+   pre-downlink (BEFORE `mean(f²) ≈ 1.4–1.6`, AFTER `mean(f²) ≈ 1.6–1.9`).
+   This is consistent with the post-downlink window being structurally
+   heavier-tailed than pre-downlink steady-state. There is **no
+   time-locked settling transient** — see the next point.
 
-3. **`flux_err` is again uninformative** — flat at ~0.79 (pretrain) /
+3. **The aggregate `mean(f²)` "peak" at pos ~31 in the AFTER row is a
+   sampling artifact, not a real bump.** A follow-up check
+   (`/tmp/bump_position_check.py`, run on a 4-chunk sample of pretrain,
+   N=822 curves) computed the per-curve `argmax(f²)` in a 60-cadence
+   post-gap window and histogrammed the positions. The distribution is
+   approximately uniform — every 5-cadence bin has 45–86 curves against
+   a uniform-null expectation of 70 per bin, with no enrichment around
+   pos 31. Per-curve bump amplitudes are very heavy-tailed (median
+   max(f²) is 11.5× the curve median; 99th percentile is **80×**), so
+   a small number of curves with single huge excursions at random
+   positions are enough to jitter the per-position aggregate by ±0.5
+   units. **An earlier draft of this doc claimed a "fine-pointing
+   recovery transient at ~1 h post-downlink." That was wrong** — the
+   peak is a heavy-tail artifact and would land at a different position
+   if a different sample of curves were drawn.
+
+4. **`flux_err` is again uninformative** — flat at ~0.79 (pretrain) /
    ~0.90 (exop hosts) across the entire window.
 
-4. **Sector-edge vs. downlink comparison.**
+5. **Sector-edge vs. downlink comparison.**
    - Sector start: extreme spike at the outermost samples (`mean(f²) ≈ 4`),
      decaying to ~2 by pos 10, ~1.5 by pos 25.
    - Sector end: ~1.4 plateau, much milder.
    - Downlink (either side): ~1.5 plateau across the full 40-pos window
-     (after the pos-0 imputation marker), with a delayed +30-cadence
-     bump on the AFTER side.
+     (after the pos-0 imputation marker), AFTER side ~20% higher than
+     BEFORE on average, no time-locked transient.
 
-   So the downlink behaves more like a "second sector end + second sector
-   start" with the worst part being **a delayed transient**, not the
-   sample immediately adjacent to the gap.
+   So the downlink behaves more like "two sector ends back-to-back" —
+   no immediate spike, just persistent heavy-tail noise on both sides.
 
 ### Implications for `trim_edges`
 
 `trim_edges` only operates at the outer ends of each curve — it does
 **not** touch the downlink. The findings above mean the encoder is
 seeing a mid-sector region with persistent +50% variance inflation on
-both sides of the downlink, plus a +130% bump ~1 h after the gap on
-the AFTER side. Cleaning that would require either:
+both sides of the downlink, slightly worse on the AFTER side. Cleaning
+that would require either:
 
 - masking a window around the largest `Δt` per curve, or
 - a gap-aware encoder that conditions on the irregular time axis (which
   the model already does, but only at the per-step time-encoding level —
-  it does not currently mask out the settling transient).
+  it does not currently downweight or mask the post-downlink heavy-tail
+  region).
 
 Neither change is being made in this commit; the doc is the evidence
-base for whichever route the next training run takes. If only one knob
-is touched, **adding a downlink-aware mask of ~32 cadences on the AFTER
-side** would have higher impact than changing `trim_edges` from 10 to 20.
+base for whichever route the next training run takes.
+
+What a defensible mid-sector trim would look like:
+
+- **The pos-0 zero marker on each side is free to drop** — preprocessing
+  appears to insert a zero-valued boundary sample at every large gap.
+  This is junk pretending to be a measurement.
+- **Beyond pos 0 there is no clean knee.** The heavy-tail behaviour
+  persists for at least 80 min on the AFTER side without an obvious
+  decay; there is no "trim N=K and you skip the worst" because the
+  per-curve maxima land at roughly random positions throughout the
+  window. Trimming further would still help in expectation (it removes
+  more of the heavy-tail noise) but yields steadily diminishing returns
+  rather than crossing a threshold.
+- **A symmetric drop of ~5–10 cadences on each side** would catch the
+  worst per-position averages while keeping cost low (~20 cadences ≈
+  40 min lost out of typical ~30 d sectors).
 
 ## Reproducing the downlink analysis
 
