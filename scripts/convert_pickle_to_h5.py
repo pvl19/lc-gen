@@ -34,9 +34,18 @@ def main():
         data = pickle.load(f)
 
     print(f'Loading metadata: {args.meta_csv}')
-    meta_df = pd.read_csv(args.meta_csv)
-    meta_df['GaiaDR3_ID'] = meta_df['GaiaDR3_ID'].astype(str)
-    tic_to_gaia = dict(zip(meta_df['TIC_ID'], meta_df['GaiaDR3_ID']))
+    # Force int64 on both ID columns. If GaiaDR3_ID is inferred as float64 (e.g.
+    # because pandas saw a NaN row, or the CSV was re-exported through Excel),
+    # `astype(str)` produces scientific notation and silently loses precision
+    # (Gaia IDs need 19 digits, float64 carries ~16). Int64 → str via Python int
+    # never produces sci notation.
+    meta_df = pd.read_csv(args.meta_csv, dtype={'GaiaDR3_ID': 'Int64', 'TIC_ID': 'Int64'})
+    if meta_df['GaiaDR3_ID'].isna().any() or meta_df['TIC_ID'].isna().any():
+        raise ValueError(
+            f'{args.meta_csv} has NaN/non-integer values in GaiaDR3_ID or TIC_ID — '
+            f'cannot safely join. Clean the CSV before re-running.')
+    meta_df['GaiaDR3_ID'] = meta_df['GaiaDR3_ID'].astype('int64').astype(str)
+    tic_to_gaia = dict(zip(meta_df['TIC_ID'].astype('int64'), meta_df['GaiaDR3_ID']))
 
     # Filter to entries with a known Gaia ID
     entries = []
@@ -73,6 +82,10 @@ def main():
         time_arr[i, :L]     = time[:L]
         length_arr[i]        = L
 
+        if 'e' in gaia_id.lower() or not gaia_id.isdigit():
+            raise ValueError(
+                f'GaiaDR3_ID for TIC {tic} is not a plain integer string: "{gaia_id}". '
+                f'Refusing to write a precision-lossy ID.')
         gaia_arr[i]      = gaia_id.encode('utf-8')
         tic_arr[i]       = tic
         sector_arr[i]    = int(val['sector'])
