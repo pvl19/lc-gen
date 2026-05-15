@@ -198,84 +198,97 @@ pos 1.
 post-gap `mean(f²)` plateaus higher at ~1.7 across all 40 positions
 without a clean recovery within the window.
 
-### Interpretation
+### Interpretation (revised after per-curve check)
 
-1. **Downlink edges are not clean.** From position 1 onward, `mean(f²)`
-   sits at **~1.4–1.7** on both sides — a persistent **+40–70% variance
-   excess** that does not decay across the 40-cadence (~80 min) window we
-   sampled. `median|f|` recovers to within ~5% of Gaussian by pos 1, so
-   the inflation is again **outlier-tail-driven** (`P(|f|>3) ≈ 4–6× the
-   Gaussian rate at pos 1, settling to ~3× by pos 30`).
+The aggregate-vs-Gaussian numbers above are **misleading** for the
+downlink question. Once gap-edge variance is compared to the **same
+curve's own interior**, the apparent "+40–70% inflation" disappears.
 
-2. **Mild asymmetry: the AFTER side runs ~10–30% higher than BEFORE.**
-   At matched offsets, post-downlink `mean(f²)` is consistently above
-   pre-downlink (BEFORE `mean(f²) ≈ 1.4–1.6`, AFTER `mean(f²) ≈ 1.6–1.9`).
-   This is consistent with the post-downlink window being structurally
-   heavier-tailed than pre-downlink steady-state. There is **no
-   time-locked settling transient** — see the next point.
+A follow-up check (`tests/interior_baseline_check.py`, 4 chunks of
+pretrain, N=821 curves) extracted, for each curve:
+- the gap-edge windows (pos 1..39 on each side, skipping the zero marker), and
+- a per-curve interior baseline (centre 50% of each sub-segment, ≥50
+  samples from sector ends and from the gap).
 
-3. **The aggregate `mean(f²)` "peak" at pos ~31 in the AFTER row is a
-   sampling artifact, not a real bump.** A follow-up check
-   (`/tmp/bump_position_check.py`, run on a 4-chunk sample of pretrain,
-   N=822 curves) computed the per-curve `argmax(f²)` in a 60-cadence
-   post-gap window and histogrammed the positions. The distribution is
-   approximately uniform — every 5-cadence bin has 45–86 curves against
-   a uniform-null expectation of 70 per bin, with no enrichment around
-   pos 31. Per-curve bump amplitudes are very heavy-tailed (median
-   max(f²) is 11.5× the curve median; 99th percentile is **80×**), so
-   a small number of curves with single huge excursions at random
-   positions are enough to jitter the per-position aggregate by ±0.5
-   units. **An earlier draft of this doc claimed a "fine-pointing
-   recovery transient at ~1 h post-downlink." That was wrong** — the
-   peak is a heavy-tail artifact and would land at a different position
-   if a different sample of curves were drawn.
+Results:
+
+```
+                              median   mean    p25    p75
+whole-curve mean(f²)          1.022   1.870   0.948  1.057
+pre-gap interior              1.001   2.150   0.926  1.056
+pre-gap edge (pos 1..39)      0.992   2.646   0.663  1.328
+post-gap interior             0.991   2.564   0.913  1.063
+post-gap edge (pos 1..39)     1.041   1.224   0.680  1.513
+
+per-curve edge/interior ratio:
+  BEFORE  median=0.98   p75=1.35
+  AFTER   median=1.04   p75=1.51
+```
+
+For the typical (median) curve, the gap edge sits at the same variance
+as that curve's own interior (ratio ≈ 1.0 on both sides). Both interior
+and edge sit at `mean(f²) ≈ 1.0` — exactly what per-curve z-norm
+predicts. The aggregate `mean(f²) ≈ 1.5` we saw at the gap edges in the
+per-position tables is a **heavy-tailed-aggregate artifact**: a minority
+of curves have very heavy tails everywhere (interior aggregate
+`mean(f²)` is 2.1–2.6, well above the median's 1.0), and that minority
+dominates the across-curve average at every position — gap-edge or
+interior alike. It is not evidence of a downlink-localised effect.
+
+What this means for the actual findings:
+
+1. **The pos-0 zero marker on each side is the only clean per-curve
+   downlink artifact.** Preprocessing appears to insert a zero-valued
+   boundary sample at every large gap. It is junk pretending to be a
+   measurement, and dropping it is free.
+
+2. **Mild asymmetry remains, but it is small.** The AFTER side has a
+   median edge/interior ratio of 1.04 vs 0.98 on the BEFORE side, and
+   25% of curves have AFTER-edge variance > 1.25× interior vs 19% on
+   BEFORE. So the post-downlink window is *slightly* heavier-tailed
+   than the pre-downlink window for a minority of curves, but not by
+   an amount that should drive a uniform trimming policy.
+
+3. **The aggregate `mean(f²)` "peak" at pos ~31 in the AFTER row is
+   not a real time-locked transient.** A separate check
+   (`tests/bump_position_check.py`, N=822) computed per-curve
+   `argmax(f²)` in a 60-cadence post-gap window and histogrammed the
+   positions. The distribution is approximately uniform — every
+   5-cadence bin has 45–86 curves against a uniform-null expectation
+   of 70 per bin, with no enrichment around pos 31. Per-curve bump
+   amplitudes are very heavy-tailed (median max(f²) is 11.5× the
+   curve median; 99th percentile is **80×**), so a small number of
+   curves with single huge excursions at random positions jitter the
+   per-position aggregate by ±0.5 units. **Earlier drafts of this
+   doc claimed a "fine-pointing recovery transient at ~1 h
+   post-downlink." That was wrong.**
 
 4. **`flux_err` is again uninformative** — flat at ~0.79 (pretrain) /
    ~0.90 (exop hosts) across the entire window.
 
-5. **Sector-edge vs. downlink comparison.**
-   - Sector start: extreme spike at the outermost samples (`mean(f²) ≈ 4`),
-     decaying to ~2 by pos 10, ~1.5 by pos 25.
-   - Sector end: ~1.4 plateau, much milder.
-   - Downlink (either side): ~1.5 plateau across the full 40-pos window
-     (after the pos-0 imputation marker), AFTER side ~20% higher than
-     BEFORE on average, no time-locked transient.
+5. **Sector-edge vs. downlink comparison (revised).**
+   - Sector start: real per-curve excess (the outer samples of curves
+     have variance well above the same curves' interior — see the
+     sector-edge analysis above).
+   - Sector end: similar but milder.
+   - Downlink: **no per-curve excess** beyond the pos-0 zero marker.
 
-   So the downlink behaves more like "two sector ends back-to-back" —
-   no immediate spike, just persistent heavy-tail noise on both sides.
+   So the sector edges are a real artifact requiring trimming; the
+   downlink is not.
 
-### Implications for `trim_edges`
+### Implications for trimming
 
-`trim_edges` only operates at the outer ends of each curve — it does
-**not** touch the downlink. The findings above mean the encoder is
-seeing a mid-sector region with persistent +50% variance inflation on
-both sides of the downlink, slightly worse on the AFTER side. Cleaning
-that would require either:
-
-- masking a window around the largest `Δt` per curve, or
-- a gap-aware encoder that conditions on the irregular time axis (which
-  the model already does, but only at the per-step time-encoding level —
-  it does not currently downweight or mask the post-downlink heavy-tail
-  region).
-
-Neither change is being made in this commit; the doc is the evidence
-base for whichever route the next training run takes.
-
-What a defensible mid-sector trim would look like:
-
-- **The pos-0 zero marker on each side is free to drop** — preprocessing
-  appears to insert a zero-valued boundary sample at every large gap.
-  This is junk pretending to be a measurement.
-- **Beyond pos 0 there is no clean knee.** The heavy-tail behaviour
-  persists for at least 80 min on the AFTER side without an obvious
-  decay; there is no "trim N=K and you skip the worst" because the
-  per-curve maxima land at roughly random positions throughout the
-  window. Trimming further would still help in expectation (it removes
-  more of the heavy-tail noise) but yields steadily diminishing returns
-  rather than crossing a threshold.
-- **A symmetric drop of ~5–10 cadences on each side** would catch the
-  worst per-position averages while keeping cost low (~20 cadences ≈
-  40 min lost out of typical ~30 d sectors).
+- **`trim_edges` (sector-edge trim) is doing real work.** The earlier
+  per-curve sector-edge effect is real (start much worse than end);
+  recommendations from that section stand.
+- **No mid-sector / downlink trim is justified** by the data, beyond
+  optionally dropping the pos-0 zero marker on each side of any large
+  gap. Even that is not strictly necessary if the encoder is robust
+  to a single zero-valued sample bracketed by an irregular `Δt`.
+- A gap-aware mask of any width would not measurably improve the
+  per-curve variance distribution near the downlink, because that
+  distribution is already indistinguishable from the curve's own
+  interior at the median.
 
 ## Reproducing the downlink analysis
 
