@@ -77,52 +77,81 @@ Two single-curve outliers (start pos 7: `mean(f²)`=884; end pos 17:
 `mean(f²)`=10.9) inflate isolated cells and should be ignored — the
 median/`P(|f|>3)` columns are robust to them.
 
-## Interpretation
+## Interpretation (revised after per-curve check)
 
-1. **`trim_edges=10` clears the bulk of the artifact but not the tail.**
-   By position 10 the median is back to ~Gaussian (`median|f|` within ~15%
-   of baseline), but the variance is still ~2× interior at the start and
-   ~1.5× at the end. The excess is driven by **outlier tails**: `P(|f|>3)`
-   is still ~10× the Gaussian rate at position 10.
+The aggregate-vs-Gaussian numbers above are misleading the same way the
+downlink ones were — the cross-curve average is dominated by a
+heavy-tailed minority, not by all curves having a uniform problem. A
+follow-up per-curve check (`tests/sector_edge_per_curve_check.py`,
+4 chunks of pretrain, N=1024) compared each curve's first/last N
+samples to its own interior (centre 50% of each sub-segment, ≥50
+samples from sector ends and any large gap):
 
-2. **Asymmetry is real.** At the same position offset, the start edge
-   carries 2–3× the variance excess of the end edge. Scattered light at
-   the start of a sector is the worse problem; trailing-edge thermal
-   settling is mild by comparison.
+```
+                              median   mean    p25    p75
+interior mean(f²)             1.004   2.140   0.940  1.057
 
-3. **Secondary artifact ~30 samples in.** `mean(f²)` rebounds to 2.6–3.7
-   at start positions 31–35 in `timeseries_pretrain.h5`. ~30 cadences ≈
-   1 hour into the sector — likely a recurring instrumental feature
-   (post-momentum-dump? post-fine-pointing?). A simple uniform trim
-   wouldn't cleanly remove it; would need a per-sector mask informed by
-   the TESS data-release notes if it matters downstream.
+per-curve edge/interior ratios:
+  first 5  / interior         0.983   2.383   0.468  2.086
+  first 10 / interior         1.060   2.226   0.567  1.903
+  first 20 / interior         1.041   1.979   0.633  1.754
+  first 40 / interior         1.066   1.714   0.683  1.589
+  last 10  / interior         0.867   1.674   0.462  1.520
+  last 40  / interior         0.989   1.415   0.629  1.440
 
-4. **`flux_err` is uninformative for edge detection.** It sits at
-   ~0.86–0.89 across all positions in both edges, indistinguishable from
-   interior. The artifact lives in the flux excursions, not the reported
-   uncertainty.
+fraction of curves with start-edge > k * interior:
+  k=1.50    first10: 0.345    first20: 0.315
+  k=2.00    first10: 0.229    first20: 0.206
+  k=3.00    first10: 0.128    first20: 0.116
+  k=5.00    first10: 0.066    first20: 0.055
+```
 
-## Recommendation
+What this actually tells us:
 
-`trim_edges=10` is the rough floor — it cleans the median but leaves
-heavy outlier tails the encoder still has to absorb. Defensible options:
+1. **For the median curve, sector edges are fine.** First-40 / interior
+   median ratio is 1.07; last-40 is 0.99. The typical curve does not
+   have elevated variance at either end. The "+50–300%" reported in
+   the aggregate per-position tables above is the heavy-tailed
+   minority dragging up the cross-curve mean.
 
-- **Bump to `trim_edges=20`** (single-knob change). Cuts start-edge
-  variance excess from ~2× to ~1.5× and outlier rate from ~3% to ~2%.
-  Negligible data loss given median length ≈15k. Recommended if any
-  bump is made.
-- **Asymmetric trim (e.g. 25 leading, 10 trailing)** would be the
-  cleanest match to the data, but requires changing
-  `LazyH5Dataset` / `TimeSeriesDataset` to accept a tuple instead of a
-  scalar. Worth doing if edge artifacts turn out to drive any
-  observed UMAP or age-inference behaviour.
-- **Status quo (`trim_edges=10`)** is fine if the encoder is observed
-  to be robust to the residual edge inflation in downstream metrics.
+2. **A meaningful minority does have elevated edges, more so at the
+   start.** ~35% of curves have first-10 variance >1.5× their own
+   interior; 23% are >2×; 13% are >3×; **7% are >5×**. End-edge
+   fractions are roughly 25% smaller across all thresholds.
 
-No change is being made to the default in this commit — this note is
-the evidence base for whichever choice the next training run adopts.
-Any change to `trim_edges` invalidates the current cached latents and
-checkpoints (see `CLAUDE.md` for the compatibility note).
+3. **Marginal benefit of `trim_edges=10 → 20` is small in this metric.**
+   Fraction of curves with edge >1.5× interior drops from 35% to 31%
+   at the start; >2× drops from 23% to 21%. The original aggregate
+   plot suggested a much bigger payoff than per-curve numbers support.
+
+4. **The aggregate "secondary artifact at start pos 31–35" is the same
+   class of heavy-tail-aggregate artifact as the post-downlink "bump"
+   at pos 31** (see downlink section below for the per-curve refutation
+   of that one). A small number of curves with single huge excursions
+   at random positions are enough to jitter the per-position aggregate
+   noticeably. The earlier "post-momentum-dump? post-fine-pointing?"
+   speculation should be ignored.
+
+5. **`flux_err` is uninformative for edge detection.** Flat at
+   ~0.86–0.89 across all positions in both edges, indistinguishable
+   from interior. The artifact (such as it is) lives in flux excursions
+   in a minority of curves, not in the reported uncertainty.
+
+## Decision
+
+**Keep `trim_edges=10`.** It does real work for the heavy-tailed
+minority of curves where the first/last several samples really are
+several times their own interior, and that minority is concentrated
+in the very first cadences. Bumping to 20 would help that minority
+slightly more (~3 percentage points fewer curves with edge >1.5×
+interior at the start), but the marginal cost (asymmetric trim choice,
+re-running training, invalidating cached latents per `CLAUDE.md`) is
+not justified by the data.
+
+No code change is made in this commit — this note is the evidence
+base. If a future pass wants to reduce sensitivity to the heavy-tailed
+minority further, asymmetric trim (~25 leading / ~10 trailing) would
+be the most defensible single change.
 
 ## Reproducing the sector-edge analysis
 
