@@ -250,7 +250,10 @@ def load_model(model_path: str, device: torch.device, hidden_size: int = 64,
 
 def compute_multiscale_features(h_valid: torch.Tensor, t_valid: torch.Tensor,
                                 n_segments: int = 4,
-                                minmax_edge_skip: int = 0) -> torch.Tensor:
+                                minmax_edge_skip: int = 0,
+                                diff_weight_mode: str = 'unweighted',
+                                minmax_quantile: float = 0.0,
+                                subtract_temporal_mean: bool = False) -> torch.Tensor:
     """Compute multi-scale temporal features from hidden states (time-aware).
 
     Pool operators are defined in physical time rather than sample index:
@@ -260,9 +263,11 @@ def compute_multiscale_features(h_valid: torch.Tensor, t_valid: torch.Tensor,
     the sampling-rate / sector-length bias the original sample-indexed pool
     was injecting into the latent.
 
-    Order statistics (global_max / global_min) are kept as plain extrema —
-    they carry useful signal and a fully length-invariant version requires
-    truncation to a common time window (Route B), not just reweighting.
+    Order statistics (global_max / global_min) default to plain extrema. With
+    `minmax_quantile > 0` they switch to symmetric quantiles (e.g. 5th/95th)
+    which are robust to single-step encoder spikes — useful when sectors with
+    large mid-sector data gaps produce post-gap settling artifacts that the
+    raw min/max picks up.
 
     Args:
         h_valid: (L, H) hidden states for valid timesteps.
@@ -274,6 +279,31 @@ def compute_multiscale_features(h_valid: torch.Tensor, t_valid: torch.Tensor,
             is barely averaged near each stream's start, so a single
             un-smoothed sample can dominate the per-feature min/max even after
             `trim_edges` strips raw input.
+        diff_weight_mode: 'unweighted' (default; keeps the existing behavior
+            of an unweighted mean over per-step rates Δh/Δt) or 'dt_inverse'
+            (weight each rate sample by 1/Δt so dense within-sector pairs
+            dominate the aggregate and the single rate sample spanning a
+            large mid-sector gap is suppressed). 'dt_inverse' reduces to the
+            unweighted mean for uniformly-sampled sequences.
+        minmax_quantile: 0.0 (default) uses literal min/max. A value q in
+            (0, 0.5) replaces them with the q-th and (1-q)-th sample-rank
+            quantiles via torch.quantile. Stable against single-step outliers
+            from post-gap settling in long sequences. Note: this is rank-based
+            (unweighted) rather than time-weighted — at small q the percentile
+            cut already absorbs outlier-step bias, and the unweighted form is
+            ~10× faster than a per-feature time-weighted sort.
+        subtract_temporal_mean: when True, subtract the Voronoi-time-weighted
+            per-sample mean from h_valid before computing every block except
+            diff_* (rates are already invariant to a constant offset). The
+            glob_mean block then becomes exactly zero by construction and is
+            emitted as a zero vector to preserve output dimensionality. This
+            removes the L-drift signal that scales with sequence length —
+            60-day sectors had glob_mean z≈+5σ relative to 27-day sectors
+            because the MinGRU cumulative scan reaches a different equilibrium
+            at 2× the timesteps. Centring the hidden state per sample erases
+            that drift but keeps the *spread* and *shape* signals (glob_std,
+            glob_max, glob_min, seg*, first_h, last_h become deviations from
+            sample mean rather than absolute values).
 
     Returns:
         Feature vector of shape (12*H,):
@@ -307,13 +337,33 @@ def compute_multiscale_features(h_valid: torch.Tensor, t_valid: torch.Tensor,
     global_var  = (w_col * centered.pow(2)).sum(dim=0) / w_sum
     global_std  = global_var.clamp_min(0.0).sqrt()
 
+    # Optional centring: every downstream block (seg, first/last, glob_max/min)
+    # then sees deviations from the per-sample weighted mean. diff_* uses
+    # first differences and is already offset-invariant — no change needed.
+    if subtract_temporal_mean:
+        h_pool = centered
+        # glob_mean is the quantity we just removed → emit zeros for it.
+        global_mean = torch.zeros_like(global_mean)
+    else:
+        h_pool = h_valid
+
     m = max(0, int(minmax_edge_skip))
     if m > 0 and L > 2 * m + 1:
-        h_inner = h_valid[m:L - m, :]
+        h_inner = h_pool[m:L - m, :]
+        w_inner = w[m:L - m]
     else:
-        h_inner = h_valid
-    global_max = h_inner.max(dim=0).values
-    global_min = h_inner.min(dim=0).values
+        h_inner = h_pool
+        w_inner = w
+
+    q = float(minmax_quantile)
+    if q > 0.0:
+        qs = torch.tensor([q, 1.0 - q], device=device, dtype=dtype)
+        quantiles = torch.quantile(h_inner, qs, dim=0)                # (2, H)
+        global_min = quantiles[0]
+        global_max = quantiles[1]
+    else:
+        global_max = h_inner.max(dim=0).values
+        global_min = h_inner.min(dim=0).values
     features.extend([global_mean, global_std, global_max, global_min])
 
     # 2. Temporal segment pooling — equal-TIME bins of [t_min, t_max], not
@@ -335,25 +385,42 @@ def compute_multiscale_features(h_valid: torch.Tensor, t_valid: torch.Tensor,
         if in_bin.any():
             ws = w[in_bin]
             denom = ws.sum().clamp_min(eps)
-            seg_mean = (ws.unsqueeze(1) * h_valid[in_bin, :]).sum(dim=0) / denom
+            seg_mean = (ws.unsqueeze(1) * h_pool[in_bin, :]).sum(dim=0) / denom
         else:
             seg_mean = torch.zeros(H, device=device, dtype=dtype)
         features.append(seg_mean)
 
     # 3. First / last hidden states (anchored at t_min, t_max).
-    features.append(h_valid[0, :])
-    features.append(h_valid[-1, :])
+    features.append(h_pool[0, :])
+    features.append(h_pool[-1, :])
 
-    # 4. Temporal-derivative statistics — RATE Δh/Δt, unweighted mean/std.
-    # Each per-step pair (Δh_i, Δt_i) contributes one observation. A 5-day
-    # mid-sector gap contributes Δh / 5 days = a *small* rate, not the large
-    # per-step jump it used to be — and dense within-sector samples dominate
-    # the aggregate by count, so the gap-boundary spike is naturally absorbed.
+    # 4. Temporal-derivative statistics — RATE Δh/Δt.
+    # Each per-step pair (Δh_i, Δt_i) contributes one observation. The default
+    # 'unweighted' mean treats every step equally; this still produces a
+    # length-anomalous mean when a single rate sample spans a large mid-sector
+    # gap because, even though that rate is bounded by 1/Δt, count-based mean
+    # weights it as 1/L_pairs — heavy enough to shift the aggregate for stars
+    # whose gap creates a coordinated Δh sign across features.
+    # 'dt_inverse' weights each rate by 1/Δt, so dense within-sector pairs
+    # dominate and the long-Δt boundary sample is suppressed by ~Δt_typ/Δt.
     if L > 1:
         dt_step = (t_valid[1:] - t_valid[:-1]).to(dtype).clamp_min(eps)
         rates = (h_valid[1:, :] - h_valid[:-1, :]) / dt_step.unsqueeze(1)
-        diff_mean = rates.mean(dim=0)
-        diff_std  = rates.std(dim=0) if rates.shape[0] > 1 else torch.zeros(H, device=device, dtype=dtype)
+        if diff_weight_mode == 'dt_inverse':
+            w_d = (1.0 / dt_step).unsqueeze(1)                        # (L-1, 1)
+            w_d_sum = w_d.sum().clamp_min(eps)
+            diff_mean = (w_d * rates).sum(dim=0) / w_d_sum
+            if rates.shape[0] > 1:
+                centered = rates - diff_mean.unsqueeze(0)
+                diff_var = (w_d * centered.pow(2)).sum(dim=0) / w_d_sum
+                diff_std = diff_var.clamp_min(0.0).sqrt()
+            else:
+                diff_std = torch.zeros(H, device=device, dtype=dtype)
+        elif diff_weight_mode == 'unweighted':
+            diff_mean = rates.mean(dim=0)
+            diff_std  = rates.std(dim=0) if rates.shape[0] > 1 else torch.zeros(H, device=device, dtype=dtype)
+        else:
+            raise ValueError(f"Unknown diff_weight_mode: {diff_weight_mode!r}")
         features.extend([diff_mean, diff_std])
     else:
         features.extend([torch.zeros(H, device=device, dtype=dtype),
@@ -366,7 +433,11 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
                            batch_size: int = 32, pooling_mode: str = 'multiscale',
                            sample_indices: np.ndarray = None, use_metadata: bool = False,
                            use_conv_channels: bool = False, trim_edges: int = 0,
-                           minmax_edge_skip: int = 0):
+                           minmax_edge_skip: int = 0,
+                           diff_weight_mode: str = 'unweighted',
+                           minmax_quantile: float = 0.0,
+                           subtract_temporal_mean: bool = False,
+                           apply_head_norm: bool = False):
     """Extract latent vectors for all light curves in the H5 file.
 
     Args:
@@ -509,6 +580,32 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
 
             h_fwd = out.get('h_fwd_tensor')  # (B, L, H)
             h_bwd = out.get('h_bwd_tensor')  # (B, L, H)
+            t_enc = out.get('t_enc')         # (B, L, num_time_enc_dims)
+
+            if apply_head_norm:
+                if not hasattr(model, 'head_norm') or model.head_norm is None:
+                    raise ValueError("apply_head_norm=True but model has no head_norm module")
+                if t_enc is None:
+                    raise ValueError("apply_head_norm requires t_enc in model output")
+                # Reconstruct the exact tensor head_norm was trained to normalize:
+                # [h_fwd ‖ h_bwd ‖ t_enc] per timestep. Then slice off the hidden parts.
+                H = model.hidden_size
+                if h_fwd is not None and h_bwd is not None:
+                    h_bi = torch.cat([h_fwd, h_bwd, t_enc], dim=-1)
+                elif h_fwd is not None:
+                    h_bi = torch.cat([h_fwd, t_enc], dim=-1)
+                elif h_bwd is not None:
+                    h_bi = torch.cat([h_bwd, t_enc], dim=-1)
+                else:
+                    raise ValueError("No hidden states returned by model")
+                h_bi = model.head_norm(h_bi)
+                if h_fwd is not None and h_bwd is not None:
+                    h_fwd = h_bi[..., :H]
+                    h_bwd = h_bi[..., H:2 * H]
+                elif h_fwd is not None:
+                    h_fwd = h_bi[..., :H]
+                else:
+                    h_bwd = h_bi[..., :H]
 
             for i in range(B):
                 valid_len = lengths_batch[i]
@@ -530,6 +627,9 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
                     latent = compute_multiscale_features(
                         h_combined, t_combined, n_segments=4,
                         minmax_edge_skip=minmax_edge_skip,
+                        diff_weight_mode=diff_weight_mode,
+                        minmax_quantile=minmax_quantile,
+                        subtract_temporal_mean=subtract_temporal_mean,
                     )
                 else:
                     raise ValueError(f"Unknown pooling_mode: {pooling_mode}")
@@ -754,6 +854,33 @@ def main():
                              'before computing global_min / global_max only. Mitigates the '
                              'MinGRU cumulative-scan edge bias on per-feature extrema. '
                              'Mean/std/segment/diff stats are unaffected.')
+    parser.add_argument('--diff_weight_mode', type=str, default='unweighted',
+                        choices=['unweighted', 'dt_inverse'],
+                        help="How to aggregate per-step rates Δh/Δt in the diff_mean/diff_std "
+                             "blocks. 'unweighted' (default) is the existing equal-count mean. "
+                             "'dt_inverse' weights each rate sample by 1/Δt so dense within-sector "
+                             "pairs dominate and the long-Δt rate sample spanning a mid-sector "
+                             "gap is suppressed.")
+    parser.add_argument('--minmax_quantile', type=float, default=0.0,
+                        help='If >0, replace global_min / global_max with time-weighted '
+                             'quantiles at q and 1-q (e.g. 0.05 -> 5th/95th percentile). '
+                             'Robust against single-step encoder spikes near data-gap boundaries.')
+    parser.add_argument('--subtract_temporal_mean', action='store_true',
+                        help='Subtract per-sample Voronoi-time-weighted mean from hidden '
+                             'states before pooling. Removes the L-dependent drift in '
+                             'glob_mean / seg / first_h / last_h that caused 60-day sectors '
+                             '(s97/s98) to form an isolated UMAP island. diff_* are unchanged '
+                             '(rates are offset-invariant); glob_mean output becomes zero.')
+    parser.add_argument('--apply_head_norm', action=argparse.BooleanOptionalAction, default=True,
+                        help='Apply model.head_norm (the LayerNorm seen by the reconstruction '
+                             'head during pretraining) to the per-timestep hidden states '
+                             'before pooling. Restores train/extract consistency: '
+                             'pretraining normalizes [h_fwd ‖ h_bwd ‖ t_enc] per-timestep '
+                             'before the head, but the return_states=True path returns raw '
+                             'unnormalized hidden states. With this flag we apply head_norm '
+                             'to the same 136-D vector and slice off the first 2*H features. '
+                             'NOTE: this is per-timestep feature-norm only; it does not address '
+                             'sequence-length drift. Use --no-apply_head_norm to disable.')
     parser.add_argument('--conv_encoder_type', type=str, default='unet', choices=['lightweight', 'unet'])
     parser.add_argument('--max_length', type=int, default=2048, help='Max sequence length for inference')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for inference')
@@ -867,6 +994,10 @@ def main():
                 use_conv_channels=args.use_conv_channels,
                 trim_edges=args.trim_edges,
                 minmax_edge_skip=args.minmax_edge_skip,
+                diff_weight_mode=args.diff_weight_mode,
+                minmax_quantile=args.minmax_quantile,
+                subtract_temporal_mean=args.subtract_temporal_mean,
+                apply_head_norm=args.apply_head_norm,
             )
 
             ages, bprp0, bprp0_err, mg, mg_err, mem_prob, gaia_ids, tic_ids, sectors = load_ages(
