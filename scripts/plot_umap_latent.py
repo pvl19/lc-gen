@@ -432,6 +432,7 @@ def compute_multiscale_features(h_valid: torch.Tensor, t_valid: torch.Tensor,
 def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length: int = None,
                            batch_size: int = 32, pooling_mode: str = 'multiscale',
                            sample_indices: np.ndarray = None, use_metadata: bool = False,
+                           zero_metadata: bool = False,
                            use_conv_channels: bool = False, trim_edges: int = 0,
                            minmax_edge_skip: int = 0,
                            diff_weight_mode: str = 'unweighted',
@@ -505,6 +506,15 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
                     raw[feat] = np.zeros(n, dtype=np.float32)
             standardizer = MetadataStandardizer(fields=metadata_features)
             metadata_all = standardizer.transform(raw)
+            if zero_metadata:
+                # Diagnostic: withhold the metadata signal while keeping the
+                # meta-encoder path dimensionally intact. meta_encoder(0) is a
+                # constant embedding for every star, so per-star latent
+                # variation comes purely from the light curve. NOTE: the model
+                # was trained with real metadata, so this is out-of-distribution.
+                metadata_all = np.zeros_like(metadata_all)
+                print('  --zero_metadata: standardized metadata zeroed '
+                      '(metadata signal withheld; OOD for a metadata-trained model)')
         else:
             metadata_all = None
 
@@ -844,6 +854,12 @@ def main():
     parser.add_argument('--mode', type=str, default='parallel', choices=['sequential', 'parallel'])
     parser.add_argument('--use_flow', action='store_true')
     parser.add_argument('--use_metadata', action='store_true')
+    parser.add_argument('--zero_metadata', action='store_true',
+                        help='Diagnostic: zero the standardized metadata tensor before '
+                             'encoding (requires --use_metadata). Withholds the metadata '
+                             'signal while keeping the meta-encoder dimensionally intact. '
+                             'Used to probe whether the latent encodes sector via the '
+                             'light curve alone (Route B) vs. via metadata (Route A).')
     parser.add_argument('--use_conv_channels', action='store_true')
     parser.add_argument('--trim_edges', type=int, default=0,
                         help='If >0, strip this many samples from each end of every light '
@@ -991,6 +1007,7 @@ def main():
                 pooling_mode=args.pooling_mode,
                 sample_indices=sample_indices,
                 use_metadata=args.use_metadata,
+                zero_metadata=args.zero_metadata,
                 use_conv_channels=args.use_conv_channels,
                 trim_edges=args.trim_edges,
                 minmax_edge_skip=args.minmax_edge_skip,
