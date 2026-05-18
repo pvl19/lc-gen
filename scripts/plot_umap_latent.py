@@ -227,8 +227,13 @@ def load_model(model_path: str, device: torch.device, hidden_size: int = 64,
         use_conv_channels = False
 
     # Override from saved config if present (newer checkpoints only)
+    meta_use_mask = False
     if isinstance(ckpt, dict):
         num_meta_features = ckpt.get('num_meta_features', num_meta_features)
+        # Newer checkpoints store whether the metadata encoder uses an explicit
+        # binary mask channel (DOROTHY-style masking). Old checkpoints lack the
+        # key -> False, matching their use_mask=False meta encoder.
+        meta_use_mask = ckpt.get('meta_use_mask', False)
 
     model = BiDirectionalMinGRU(
         hidden_size=hidden_size,
@@ -238,13 +243,14 @@ def load_model(model_path: str, device: torch.device, hidden_size: int = 64,
         num_meta_features=num_meta_features,
         use_conv_channels=use_conv_channels,
         conv_config=conv_config,
+        meta_use_mask=meta_use_mask,
     ).to(device)
 
     model.load_state_dict(sd)
     model.eval()
     print(f'Loaded model from {model_path} '
           f'(hidden={hidden_size}, direction={direction}, num_meta={num_meta_features}, '
-          f'conv={use_conv_channels}, flow={use_flow})')
+          f'meta_use_mask={meta_use_mask}, conv={use_conv_channels}, flow={use_flow})')
     return model
 
 

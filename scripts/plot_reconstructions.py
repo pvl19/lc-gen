@@ -75,6 +75,7 @@ def load_model(model_path, device, hidden_size=64, direction='bi', mode='paralle
         use_conv_channels = False
     if isinstance(ckpt, dict) and 'num_meta_features' in ckpt:
         num_meta_features = ckpt['num_meta_features']
+    meta_use_mask = ckpt.get('meta_use_mask', False) if isinstance(ckpt, dict) else False
 
     model = BiDirectionalMinGRU(
         hidden_size=hidden_size,
@@ -84,6 +85,7 @@ def load_model(model_path, device, hidden_size=64, direction='bi', mode='paralle
         num_meta_features=num_meta_features,
         use_conv_channels=use_conv_channels,
         conv_config=conv_config,
+        meta_use_mask=meta_use_mask,
     ).to(device)
     model.load_state_dict(sd)
     model.eval()

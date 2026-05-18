@@ -32,7 +32,9 @@ OUTPUT_DIR="$PROJECT_DIR/output/$SLURM_JOBID-$SLURM_JOB_NAME"
 #### OPTIONAL: Set to resume training from a previous checkpoint
 #### Example: RESUME_FROM="checkpoints/resume/model.pt"
 #### Leave empty ("") for fresh training
-RESUME_FROM="checkpoints/resume/model.pt"
+#### Cleared for the final run: Changes 1/3 (recurrence gating + metadata
+#### mask channel) make old checkpoints incompatible — this MUST be a fresh run.
+RESUME_FROM=""
 
 # Define container
 CONTAINER="/ocean/containers/ngc/pytorch/delete/pytorch_24.11-py3.sif"
@@ -109,16 +111,20 @@ time -p singularity exec --nv --bind /ocean,$LOCAL,$HOME \
     --lr 1e-4 \
     --lr_div_factor 2.0 \
     --min_size 5 \
-    --max_size 720 \
+    --max_size 2880 \
     --mask_portion 0.5 \
     --trim_edges 10 \
     --use_flow \
     --use_metadata \
+    --meta_use_mask \
+    --meta_block_mask_prob 0.15 \
+    --meta_keep_min 0.3 \
+    --meta_keep_max 1.0 \
     --mode parallel \
     --val_split 0.1 \
     --val_k_values 1,2,4,8 \
     --num_workers 4 \
-    --K 720 \
+    --K 2880 \
     --k_spacing log \
     --patience 25 \
     --min_delta 0.0 \

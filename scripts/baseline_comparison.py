@@ -462,10 +462,11 @@ def _load_rnn_model(model_path: str, device, num_meta_features: int):
         num_meta_features = 0
     if isinstance(ckpt, dict) and 'num_meta_features' in ckpt:
         num_meta_features = ckpt['num_meta_features']
+    meta_use_mask = ckpt.get('meta_use_mask', False) if isinstance(ckpt, dict) else False
     model = BiDirectionalMinGRU(
         hidden_size=64, direction='bi', mode='parallel',
         use_flow=has_flow, num_meta_features=num_meta_features,
-        use_conv_channels=has_conv,
+        use_conv_channels=has_conv, meta_use_mask=meta_use_mask,
     ).to(device)
     model.load_state_dict(sd)
     model.eval()

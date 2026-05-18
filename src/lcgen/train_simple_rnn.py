@@ -31,6 +31,7 @@ from lcgen.models.simple_min_gru import SimpleMinGRU, BiDirectionalMinGRU
 from lcgen.utils.trunc_data import extract_data
 from lcgen.utils.loss import recon_loss, bounded_horizon_future_nll
 from lcgen.utils.run_log import log_run_args
+from lcgen.utils.metadata_masking import DynamicMetadataMasking
 from lcgen.models.TimeSeriesDataset import TimeSeriesDataset, LazyH5Dataset, collate_fn
 
 
@@ -142,6 +143,7 @@ def _save_rolling_checkpoint(
         'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
         'epoch': epoch,
         'num_meta_features':    model.num_meta_features,
+        'meta_use_mask':        model.meta_use_mask,
     }, ckpt_path)
 
     # Write losses_per_epoch.npz
@@ -184,6 +186,7 @@ def _save_best_checkpoint(
         'epoch':                epoch,
         'best_val_loss':        best_val_loss,
         'num_meta_features':    model.num_meta_features,
+        'meta_use_mask':        model.meta_use_mask,
     }, best_path)
 
     if persistent_dir is not None:
@@ -284,7 +287,20 @@ def train(args):
             }
             print(f"Using UNET conv encoder (slower but richer multi-scale features)")
 
-    raw_model = BiDirectionalMinGRU(hidden_size=args.hidden_size, direction=args.direction, mode=args.mode, use_flow=args.use_flow, num_meta_features=num_meta_features, use_conv_channels=args.use_conv_channels, conv_config=conv_config).to(device)
+    raw_model = BiDirectionalMinGRU(hidden_size=args.hidden_size, direction=args.direction, mode=args.mode, use_flow=args.use_flow, num_meta_features=num_meta_features, use_conv_channels=args.use_conv_channels, conv_config=conv_config, meta_use_mask=args.meta_use_mask).to(device)
+
+    # DOROTHY-style train-time metadata masking. Active only with --use_metadata
+    # AND --meta_use_mask (the explicit mask channel is the masking mechanism).
+    meta_masker = None
+    if args.use_metadata and args.meta_use_mask:
+        meta_masker = DynamicMetadataMasking(
+            p_block=args.meta_block_mask_prob,
+            p_keep_min=args.meta_keep_min,
+            p_keep_max=args.meta_keep_max,
+        )
+        if is_main:
+            print(f'Metadata masking: p_block={args.meta_block_mask_prob}, '
+                  f'p_keep~U({args.meta_keep_min},{args.meta_keep_max})')
 
     # Compile before DDP so the compiler sees the full model graph.
     # dynamic=True avoids recompilation when padded sequence length varies across batches.
@@ -461,6 +477,13 @@ def train(args):
             mask = mask.to(device)
             metadata = metadata.to(device) if args.use_metadata else None
 
+            # DOROTHY-style metadata masking — TRAIN ONLY (the validation loop
+            # always sees full, unmasked metadata so its loss stays comparable).
+            meta_mask = None
+            meta_block_drop = None
+            if metadata is not None and meta_masker is not None:
+                metadata, meta_mask, meta_block_drop = meta_masker(metadata)
+
             # Move conv_data to device if present
             if conv_data is not None:
                 conv_data = {k: v.to(device) for k, v in conv_data.items()}
@@ -474,7 +497,8 @@ def train(args):
             # Request hidden states for multi-step supervision
             # Pass mask so the model zeros out masked flux/flux_err in RNN input
             forward_start = time_module.time()
-            out = model(x_in, t_in, mask=mask, metadata=metadata, conv_data=conv_data, return_states=True)
+            out = model(x_in, t_in, mask=mask, metadata=metadata, meta_mask=meta_mask,
+                        meta_block_drop=meta_block_drop, conv_data=conv_data, return_states=True)
             recon = out['reconstructed']  # (B, L, 1)
 
             # Extract forward/backward hidden states and time encodings
@@ -625,6 +649,7 @@ def train(args):
             'optimizer_state_dict': optimizer.state_dict(),
             'epoch': len(all_train_losses),
             'num_meta_features': raw_model.num_meta_features,
+            'meta_use_mask': raw_model.meta_use_mask,
         }
         torch.save(checkpoint_dict, model_path)
         if stopped_early:
@@ -701,6 +726,17 @@ def parse_args():
                    help="How to sample k offset value per batch: 'dense' (uniform 1..K), 'log' (log-uniform 1..K)")
     p.add_argument('--use_metadata', action='store_true',
                    help='Use stellar metadata (G_0, BP_0, RP_0, parallax + uncertainties) as model input')
+    p.add_argument('--meta_use_mask', action='store_true',
+                   help='Give the metadata encoder an explicit binary validity-mask channel '
+                        '(input dim doubles). Required for DOROTHY-style metadata masking.')
+    p.add_argument('--meta_block_mask_prob', type=float, default=0.0,
+                   help='Train-time probability of dropping the WHOLE metadata encoder for a '
+                        'star (DOROTHY-style block masking). Active only with --meta_use_mask.')
+    p.add_argument('--meta_keep_min', type=float, default=0.3,
+                   help='Lower bound of the per-batch field keep-probability U(min,max) for '
+                        'DOROTHY-style per-field metadata masking.')
+    p.add_argument('--meta_keep_max', type=float, default=1.0,
+                   help='Upper bound of the per-batch field keep-probability U(min,max).')
     p.add_argument('--use_conv_channels', action='store_true',
                    help='Use convolutional encoders for power spectrum, f-statistic, and ACF as additional model input')
     p.add_argument('--conv_encoder_type', type=str, default='unet', choices=['lightweight', 'unet'],

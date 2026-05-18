@@ -54,12 +54,18 @@ class minGRUCell(nn.Module):
         log_h = a_star + log_h0_plus_b_star
         return torch.exp(log_h)[:, 1:]
 
-    def step(self, x_t, h_prev=None):
+    def step(self, x_t, h_prev=None, mask_t=None):
         if h_prev is None:
             h_prev = x_t.new_zeros(x_t.shape[0], self.W_h.out_features)
         z = torch.sigmoid(self.W_z(x_t))
         h_tilde = torch.tanh(self.W_h(x_t))
         h = (1.0 - z) * h_prev + z * h_tilde
+        if mask_t is not None:
+            # Hard recurrence gating: at gated steps (mask_t == 0) force the
+            # update gate to 0 so h = h_prev — the masked/padded step passes
+            # the state through unchanged and contributes nothing.
+            keep = (mask_t > 0.5).unsqueeze(-1)  # (B, 1)
+            h = torch.where(keep, h, h_prev)
         return h
     
     def parallel_scan(self, a, b):
@@ -95,9 +101,14 @@ class minGRUCell(nn.Module):
         
         return torch.stack(h_list, dim=1)  # (B, T, H)
     
-    def step_parallel(self, x, h_0):
+    def step_parallel(self, x, h_0, mask=None):
         # x: (batch_size, seq_len, input_size)
         # h_0: (batch_size, 1, hidden_size)
+        # mask: (batch_size, seq_len) optional, 1 = keep, 0 = gated. At gated
+        #   steps the update gate is forced to 0 (log_z -> large negative so the
+        #   value contributes 0; log_coeffs -> 0 so the state is carried), giving
+        #   h_t = h_{t-1}. The gated step contributes nothing to the recurrence
+        #   and receives ~zero gradient.
         #
         # Uses the log-domain parallel scan: two cumulative ops (cumsum +
         # logcumsumexp) instead of a T-step Python loop. The loop creates T
@@ -109,6 +120,12 @@ class minGRUCell(nn.Module):
         k = self.W_z(x)                                               # (B, T, H)
         log_z      = -F.softplus(-k)                                  # log sigmoid(k)
         log_coeffs = -F.softplus(k)                                   # log(1 - sigmoid(k))
+        if mask is not None:
+            # Hard recurrence gating. Use a large finite negative (not -inf) so
+            # all downstream arithmetic stays finite: exp(-1e9) underflows to 0.
+            keep = (mask > 0.5).unsqueeze(-1)                         # (B, T, 1)
+            log_z      = torch.where(keep, log_z, log_z.new_full((), -1e9))
+            log_coeffs = torch.where(keep, log_coeffs, log_coeffs.new_zeros(()))
         # Treat h_0 as the literal initial hidden state (not a pre-activation),
         # matching the sequential `step` convention. h_0 is expected to be >= 0
         # (typically zeros). log(0) = -inf contributes 0 to logsumexp, which is
@@ -132,6 +149,7 @@ class BiDirectionalMinGRU(nn.Module):
         use_conv_channels: bool = False,
         conv_config: dict = None,
         meta_dropout: float = 0.1,
+        meta_use_mask: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -139,6 +157,10 @@ class BiDirectionalMinGRU(nn.Module):
         self.direction = direction
         self.mode = mode
         self.use_conv_channels = use_conv_channels
+        # When True the metadata encoder takes an explicit binary validity mask
+        # channel (input dim doubles, 13 -> 26). Required for DOROTHY-style
+        # metadata masking; old checkpoints were trained with False.
+        self.meta_use_mask = meta_use_mask
 
         num_time_enc_dims = 8
         self.num_time_enc_dims = num_time_enc_dims
@@ -161,7 +183,7 @@ class BiDirectionalMinGRU(nn.Module):
                 latent_dim=meta_emb_dim,
                 hidden_dims=[128, 128, 128],
                 dropout=meta_dropout,
-                use_mask=False,
+                use_mask=meta_use_mask,
             )
         else:
             meta_emb_dim = 0
@@ -299,16 +321,25 @@ class BiDirectionalMinGRU(nn.Module):
             # small NSF: 2 transforms, small hidden networks
             self.flow = zuko.flows.NSF(1, flow_context_dim, transforms=2, hidden_features=[64, 64])
 
-    def forward(self, x, t, mask=None, metadata=None, conv_data=None, return_states: bool = False, flow_mode: str = 'mean'):
+    def forward(self, x, t, mask=None, metadata=None, meta_mask=None,
+                meta_block_drop=None, conv_data=None, return_states: bool = False,
+                flow_mode: str = 'mean'):
         """Forward pass through the model.
 
         Args:
             x: (B, L, 2) input tensor [flux, flux_err]
             t: (B, L) or (B, L, 1) timestamps
             mask: (B, L) optional sequence mask (1=observed, 0=masked/padded).
-                  Masked positions have their flux/flux_err zeroed in the RNN input.
+                  Masked positions have their flux/flux_err zeroed in the RNN
+                  input AND are gated out of the minGRU recurrence.
             metadata: (B, num_meta_features) optional stellar metadata tensor.
                       If None, the metadata path is skipped.
+            meta_mask: (B, num_meta_features) optional binary validity mask for
+                      metadata fields (1=present, 0=masked). Used only when the
+                      metadata encoder was built with meta_use_mask=True; None
+                      -> all fields present.
+            meta_block_drop: (B,) optional bool tensor; where True the star's
+                      metadata embedding is zeroed (whole-encoder block drop).
             conv_data: dict with optional convolutional inputs:
                       - 'power': (B, freq_length) power spectrum
                       - 'f_stat': (B, freq_length) f-statistic
@@ -335,12 +366,13 @@ class BiDirectionalMinGRU(nn.Module):
         # the unmasked flux_err in the flow context.
         flux_err_unmasked = x[..., 1].clone()  # (B, L)
 
-        # Apply mask to input: zero out flux and flux_err at masked positions
-        # but keep time encoding so the RNN knows the timestamp
+        # Zero flux/flux_err at masked positions. This is now redundant with the
+        # hard recurrence gating applied in the minGRU scans (gated steps
+        # contribute nothing regardless of their input), but is kept as a cheap
+        # belt-and-suspenders so masked inputs never leak even if gating is
+        # bypassed. The real masking mechanism is the gating in step_parallel.
         if mask is not None:
-            # mask shape: (B, L) -> expand to (B, L, 1) for broadcasting
             mask_expanded = mask.unsqueeze(-1)  # (B, L, 1)
-            # Zero out flux (index 0) and flux_err (index 1) at masked positions
             x = x * mask_expanded
 
         # Defensive normalization: expect t to be (B, L) or (B, L, 1)
@@ -361,7 +393,14 @@ class BiDirectionalMinGRU(nn.Module):
 
         # Encode stellar metadata (computed once, broadcast to every RNN timestep).
         if self.meta_encoder is not None and metadata is not None:
-            meta_emb = self.meta_encoder(metadata)  # (B, meta_emb_dim)
+            # MetadataEncoder.forward ignores `mask` when built with use_mask=False,
+            # so passing meta_mask unconditionally is safe.
+            meta_emb = self.meta_encoder(metadata, meta_mask)  # (B, meta_emb_dim)
+            if meta_block_drop is not None:
+                # Whole-encoder block drop: zero the metadata embedding for the
+                # selected stars so they receive no metadata context.
+                keep = (~meta_block_drop).to(meta_emb.dtype).unsqueeze(-1)  # (B, 1)
+                meta_emb = meta_emb * keep
             meta_emb_seq = meta_emb.unsqueeze(1).expand(-1, L, -1)  # (B, L, meta_emb_dim)
         else:
             meta_emb = None
@@ -412,16 +451,21 @@ class BiDirectionalMinGRU(nn.Module):
             x_parts.append(conv_emb_seq)
         x = torch.cat(x_parts, dim=-1)  # (B, L, 2 + Te + meta_emb_dim + conv_emb_dim)
 
-        # ---- Store backward hidden states (mask-gated updates) ----
+        # ---- Store backward hidden states (recurrence gated on `mask`) ----
+        # When `mask` is given, masked/padded steps (mask == 0) are gated out of
+        # the minGRU recurrence so they carry the state unchanged — they do not
+        # perturb the hidden state and do not leak into neighbouring positions.
 
         if self.direction in ['bi', 'backward']:
             h_bwd_tensor = x.new_zeros(B, L, self.hidden_size)
             h_bwd = x.new_zeros(B, self.hidden_size)
+            # Backward pass reverses the sequence — the gating mask must reverse too.
+            mask_bwd = mask.flip(dims=[1]) if mask is not None else None
 
             if self.mode == 'parallel':
                 inp_bwd = x.flip(dims=[1])  # reverse sequence for backward pass
                 x_bwd_proj = self.backward_input_proj(inp_bwd)
-                h_bwd_all = self.backward_cell.step_parallel(x_bwd_proj, h_bwd.unsqueeze(1))
+                h_bwd_all = self.backward_cell.step_parallel(x_bwd_proj, h_bwd.unsqueeze(1), mask=mask_bwd)
                 h_bwd_tensor = h_bwd_all.flip(dims=[1])
                 h0_b = h_bwd_tensor.new_zeros(B, 1, self.hidden_size)
                 h_bwd_tensor = torch.cat([h_bwd_tensor[:, 1:, :], h0_b], dim=1)
@@ -434,7 +478,8 @@ class BiDirectionalMinGRU(nn.Module):
                     # Backward RNN step for this timestep
                     xi_bwd = x[:, ti, :]
                     inp_bwd = self.backward_input_proj(xi_bwd)
-                    h_bwd = self.backward_cell.step(inp_bwd, h_bwd)
+                    mask_ti = mask[:, ti] if mask is not None else None
+                    h_bwd = self.backward_cell.step(inp_bwd, h_bwd, mask_t=mask_ti)
 
         if self.direction in ['bi', 'forward']:
             h_fwd_tensor = x.new_zeros(B, L, self.hidden_size)
@@ -443,7 +488,7 @@ class BiDirectionalMinGRU(nn.Module):
             if self.mode == 'parallel':
                 inp_fwd = x
                 x_fwd_proj = self.forward_input_proj(inp_fwd)
-                h_fwd_all = self.forward_cell.step_parallel(x_fwd_proj, h_fwd.unsqueeze(1))
+                h_fwd_all = self.forward_cell.step_parallel(x_fwd_proj, h_fwd.unsqueeze(1), mask=mask)
                 h_fwd_tensor = h_fwd_all
                 h0_f = h_fwd_tensor.new_zeros(B, 1, self.hidden_size)
                 h_fwd_tensor = torch.cat([h0_f, h_fwd_tensor[:, :-1, :]], dim=1)
@@ -455,7 +500,8 @@ class BiDirectionalMinGRU(nn.Module):
                     # Forward RNN step
                     xi_fwd = x[:, ti, :]
                     inp_fwd = self.forward_input_proj(xi_fwd)
-                    h_fwd = self.forward_cell.step(inp_fwd, h_fwd)
+                    mask_ti = mask[:, ti] if mask is not None else None
+                    h_fwd = self.forward_cell.step(inp_fwd, h_fwd, mask_t=mask_ti)
 
         out = {'reconstructed': None}
         if not return_states:
