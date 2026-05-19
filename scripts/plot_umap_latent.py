@@ -228,12 +228,21 @@ def load_model(model_path: str, device: torch.device, hidden_size: int = 64,
 
     # Override from saved config if present (newer checkpoints only)
     meta_use_mask = False
+    split_meta_encoders = False
+    adversarial_sector_head = False
+    num_sectors = 0
+    instr_emb_dim = 16
     if isinstance(ckpt, dict):
         num_meta_features = ckpt.get('num_meta_features', num_meta_features)
         # Newer checkpoints store whether the metadata encoder uses an explicit
         # binary mask channel (DOROTHY-style masking). Old checkpoints lack the
         # key -> False, matching their use_mask=False meta encoder.
         meta_use_mask = ckpt.get('meta_use_mask', False)
+        # Split-encoder / adversarial-head experiment flags (absent -> False/0).
+        split_meta_encoders = ckpt.get('split_meta_encoders', False)
+        adversarial_sector_head = ckpt.get('adversarial_sector_head', False)
+        num_sectors = ckpt.get('num_sectors', 0)
+        instr_emb_dim = ckpt.get('instr_emb_dim', 16)
 
     model = BiDirectionalMinGRU(
         hidden_size=hidden_size,
@@ -244,6 +253,10 @@ def load_model(model_path: str, device: torch.device, hidden_size: int = 64,
         use_conv_channels=use_conv_channels,
         conv_config=conv_config,
         meta_use_mask=meta_use_mask,
+        split_meta_encoders=split_meta_encoders,
+        instr_emb_dim=instr_emb_dim,
+        adversarial_sector_head=adversarial_sector_head,
+        num_sectors=num_sectors,
     ).to(device)
 
     model.load_state_dict(sd)

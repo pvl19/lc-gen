@@ -35,6 +35,21 @@ DEFAULT_METADATA_FIELDS = [
     'iqr_half_flux',
 ]
 
+# Split of DEFAULT_METADATA_FIELDS into two groups, used by the
+# --split_meta_encoders experiment (see docs/plans/2026-05-18_split-metadata-encoders.md):
+#   - ASTRO: per-star quantities -> kept in the encoder injected into the RNN
+#            hidden states (so the latent may carry them; they are not confounds).
+#   - INSTRUMENTAL: per-observation IDs that bias age inference -> routed to a
+#            SEPARATE encoder that conditions only the prediction head, never the
+#            hidden states.
+# `cadence_s` is intentionally in neither: it is constant (120 s) across the
+# dataset. If TESS cadence diversity is ever added it belongs in INSTRUMENTAL.
+ASTRO_METADATA_FIELDS = [
+    'Tmag', 'parallax', 'parallax_error', 'G0', 'G0_err',
+    'BPRP0', 'BPRP0_err', 'median_flux', 'iqr_half_flux',
+]
+INSTRUMENTAL_METADATA_FIELDS = ['sector', 'camera', 'ccd']
+
 
 class MetadataEncoder(nn.Module):
     """MLP encoder for metadata features with optional mask input.

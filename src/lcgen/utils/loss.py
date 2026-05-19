@@ -50,7 +50,7 @@ def _sample_k_value(K: int, L: int, spacing: str = 'dense'):
         raise ValueError(f"Unknown k_spacing: {spacing}. Choose 'dense' or 'log'.")
 
 
-def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=None, metadata=None, K: int = 128, k_spacing: str = 'dense', fixed_k: int = None, times=None):
+def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=None, metadata=None, K: int = 128, k_spacing: str = 'dense', fixed_k: int = None, times=None, instr_emb=None):
     """
     Compute the average NLL loss for predictions at a single randomly sampled horizon k.
     Each batch samples one k value according to k_spacing strategy, dramatically speeding
@@ -180,6 +180,15 @@ def bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=
             normed = torch.cat([h_hidden, h_time], dim=1)
     else:
         normed = flat_in
+
+    # Split-encoder: concatenate the per-star instrumental embedding into the
+    # head input (after head_norm — it is not a hidden/time quantity). This is
+    # the ONLY place instrumental metadata enters the model's predictions; it
+    # never touches the RNN hidden states. Matches model.forward's head path.
+    if instr_emb is not None:
+        instr_emb = instr_emb.to(device)
+        ie = instr_emb.unsqueeze(1).expand(-1, n_targets, -1)      # (B, n_targets, D)
+        normed = torch.cat([normed, ie.reshape(-1, instr_emb.shape[-1])], dim=1)
 
     # target ground truth and errors (symmetric: positions k to L-1-k)
     flux_tgt = flux[:, k:L-k]                 # (B, n_targets)

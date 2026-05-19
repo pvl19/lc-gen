@@ -32,6 +32,7 @@ from lcgen.utils.trunc_data import extract_data
 from lcgen.utils.loss import recon_loss, bounded_horizon_future_nll
 from lcgen.utils.run_log import log_run_args
 from lcgen.utils.metadata_masking import DynamicMetadataMasking
+from lcgen.models.MetadataAgePredictor import DEFAULT_METADATA_FIELDS, ASTRO_METADATA_FIELDS
 from lcgen.models.TimeSeriesDataset import TimeSeriesDataset, LazyH5Dataset, collate_fn
 
 
@@ -85,13 +86,15 @@ def validate(model, val_loader, device, args):
             x_in = torch.stack([flux, flux_err], dim=-1)
             t_in = torch.stack([times], dim=-1)
 
-            # Request hidden states for multi-step supervision
+            # Request hidden states for multi-step supervision. Validation uses
+            # full, unmasked metadata and no adversary (model.eval()).
             out = model(x_in, t_in, mask=mask, metadata=metadata, conv_data=conv_data, return_states=True)
 
             # Extract forward/backward hidden states and time encodings
             h_fwd = out.get('h_fwd_tensor')
             h_bwd = out.get('h_bwd_tensor')
             t_enc = out.get('t_enc')
+            instr_emb = out.get('instr_emb')  # None unless split_meta_encoders
 
             # Compute bounded-horizon averaged NLL over future predictions
             if hasattr(args, 'val_k_values') and args.val_k_values:
@@ -101,7 +104,7 @@ def validate(model, val_loader, device, args):
                     loss, stats, per_k_mean = bounded_horizon_future_nll(
                         h_fwd, h_bwd, t_enc, model, flux, flux_err,
                         mask=mask, metadata=metadata, K=args.K, k_spacing=args.k_spacing, fixed_k=k_val,
-                        times=times,
+                        times=times, instr_emb=instr_emb,
                     )
                     k_losses.append(loss.item())
                 # Average across k values
@@ -111,7 +114,7 @@ def validate(model, val_loader, device, args):
                 loss, stats, per_k_mean = bounded_horizon_future_nll(
                     h_fwd, h_bwd, t_enc, model, flux, flux_err,
                     mask=mask, metadata=metadata, K=args.K, k_spacing=args.k_spacing,
-                    times=times,
+                    times=times, instr_emb=instr_emb,
                 )
                 batch_loss = loss.item()
 
@@ -144,6 +147,10 @@ def _save_rolling_checkpoint(
         'epoch': epoch,
         'num_meta_features':    model.num_meta_features,
         'meta_use_mask':        model.meta_use_mask,
+        'split_meta_encoders':  model.split_meta_encoders,
+        'adversarial_sector_head': model.adversarial_sector_head,
+        'num_sectors':          model.num_sectors,
+        'instr_emb_dim':        model.instr_emb_dim,
     }, ckpt_path)
 
     # Write losses_per_epoch.npz
@@ -187,6 +194,10 @@ def _save_best_checkpoint(
         'best_val_loss':        best_val_loss,
         'num_meta_features':    model.num_meta_features,
         'meta_use_mask':        model.meta_use_mask,
+        'split_meta_encoders':  model.split_meta_encoders,
+        'adversarial_sector_head': model.adversarial_sector_head,
+        'num_sectors':          model.num_sectors,
+        'instr_emb_dim':        model.instr_emb_dim,
     }, best_path)
 
     if persistent_dir is not None:
@@ -287,7 +298,27 @@ def train(args):
             }
             print(f"Using UNET conv encoder (slower but richer multi-scale features)")
 
-    raw_model = BiDirectionalMinGRU(hidden_size=args.hidden_size, direction=args.direction, mode=args.mode, use_flow=args.use_flow, num_meta_features=num_meta_features, use_conv_channels=args.use_conv_channels, conv_config=conv_config, meta_use_mask=args.meta_use_mask).to(device)
+    # Sector-class map for the adversarial head — needs raw integer sector
+    # labels (the metadata encoder only ever sees standardized sector/100).
+    SECTOR_COL = DEFAULT_METADATA_FIELDS.index('sector')
+    astro_meta_idx = [DEFAULT_METADATA_FIELDS.index(f) for f in ASTRO_METADATA_FIELDS]
+    sector_lut = None
+    num_sectors = 0
+    if args.adversarial_sector_head:
+        all_sec = []
+        for pth in args.input:
+            with h5py.File(pth, 'r') as f:
+                all_sec.append(f['metadata/sector'][:].astype(np.int64))
+        uniq = np.unique(np.concatenate(all_sec))
+        num_sectors = int(len(uniq))
+        lut = np.zeros(int(uniq.max()) + 1, dtype=np.int64)
+        for i, s in enumerate(uniq):
+            lut[int(s)] = i
+        sector_lut = torch.from_numpy(lut).to(device)
+        if is_main:
+            print(f'Adversarial sector head: {num_sectors} sector classes')
+
+    raw_model = BiDirectionalMinGRU(hidden_size=args.hidden_size, direction=args.direction, mode=args.mode, use_flow=args.use_flow, num_meta_features=num_meta_features, use_conv_channels=args.use_conv_channels, conv_config=conv_config, meta_use_mask=args.meta_use_mask, split_meta_encoders=args.split_meta_encoders, instr_emb_dim=args.instr_emb_dim, adversarial_sector_head=args.adversarial_sector_head, num_sectors=num_sectors).to(device)
 
     # DOROTHY-style train-time metadata masking. Active only with --use_metadata
     # AND --meta_use_mask (the explicit mask channel is the masking mechanism).
@@ -477,12 +508,30 @@ def train(args):
             mask = mask.to(device)
             metadata = metadata.to(device) if args.use_metadata else None
 
+            # Adversary needs TRUE sector class labels — capture them from the
+            # UNMASKED metadata before any masking touches the tensor.
+            sector_labels = None
+            if metadata is not None and sector_lut is not None:
+                raw_sector = (metadata[:, SECTOR_COL] * 100.0).round().long()
+                raw_sector = raw_sector.clamp_(0, sector_lut.numel() - 1)
+                sector_labels = sector_lut[raw_sector]
+
             # DOROTHY-style metadata masking — TRAIN ONLY (the validation loop
             # always sees full, unmasked metadata so its loss stays comparable).
+            # With split encoders the masker touches only the astrophysical
+            # columns; instrumental fields go to a separate, unmasked encoder.
             meta_mask = None
             meta_block_drop = None
             if metadata is not None and meta_masker is not None:
-                metadata, meta_mask, meta_block_drop = meta_masker(metadata)
+                if args.split_meta_encoders:
+                    astro = metadata[:, astro_meta_idx]
+                    astro_m, astro_mask_m, meta_block_drop = meta_masker(astro)
+                    metadata = metadata.clone()
+                    metadata[:, astro_meta_idx] = astro_m
+                    meta_mask = torch.ones_like(metadata)
+                    meta_mask[:, astro_meta_idx] = astro_mask_m
+                else:
+                    metadata, meta_mask, meta_block_drop = meta_masker(metadata)
 
             # Move conv_data to device if present
             if conv_data is not None:
@@ -497,14 +546,23 @@ def train(args):
             # Request hidden states for multi-step supervision
             # Pass mask so the model zeros out masked flux/flux_err in RNN input
             forward_start = time_module.time()
+            # Adversarial GRL coefficient: ramped 0 -> adv_lambda_max over training
+            # (DANN schedule) so the adversary establishes before it is fought.
+            adv_lambda = 0.0
+            if args.adversarial_sector_head:
+                p = epoch / max(1, args.epochs - 1)
+                adv_lambda = args.adv_lambda_max * (2.0 / (1.0 + math.exp(-10.0 * p)) - 1.0)
             out = model(x_in, t_in, mask=mask, metadata=metadata, meta_mask=meta_mask,
-                        meta_block_drop=meta_block_drop, conv_data=conv_data, return_states=True)
+                        meta_block_drop=meta_block_drop, conv_data=conv_data,
+                        return_states=True, adv_lambda=adv_lambda)
             recon = out['reconstructed']  # (B, L, 1)
 
             # Extract forward/backward hidden states and time encodings
             h_fwd = out.get('h_fwd_tensor')
             h_bwd = out.get('h_bwd_tensor')
             t_enc = out.get('t_enc')
+            instr_emb = out.get('instr_emb')      # None unless split_meta_encoders
+            sector_logits = out.get('sector_logits')  # None unless adversary on
             time_forward += time_module.time() - forward_start
 
             # Compute bounded-horizon averaged NLL over future predictions
@@ -515,7 +573,13 @@ def train(args):
             # Pass mask so loss is only computed on valid (unmasked) predictions.
             # Pass metadata so the head can use stellar properties for predictions.
             loss_start = time_module.time()
-            loss, stats, per_k_mean = bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=mask, metadata=metadata, K=args.K, k_spacing=args.k_spacing, times=times)
+            loss, stats, per_k_mean = bounded_horizon_future_nll(h_fwd, h_bwd, t_enc, model, flux, flux_err, mask=mask, metadata=metadata, K=args.K, k_spacing=args.k_spacing, times=times, instr_emb=instr_emb)
+
+            # Adversarial sector head: add the adversary's cross-entropy. The GRL
+            # inside the model already negates this term's gradient w.r.t. the
+            # encoder; the adversary's own params get the normal (descent) grad.
+            if sector_logits is not None and sector_labels is not None:
+                loss = loss + F.cross_entropy(sector_logits, sector_labels)
 
             # Track sampled k value for this batch
             if 'sampled_k' in stats:
@@ -650,6 +714,10 @@ def train(args):
             'epoch': len(all_train_losses),
             'num_meta_features': raw_model.num_meta_features,
             'meta_use_mask': raw_model.meta_use_mask,
+            'split_meta_encoders': raw_model.split_meta_encoders,
+            'adversarial_sector_head': raw_model.adversarial_sector_head,
+            'num_sectors': raw_model.num_sectors,
+            'instr_emb_dim': raw_model.instr_emb_dim,
         }
         torch.save(checkpoint_dict, model_path)
         if stopped_early:
@@ -737,6 +805,18 @@ def parse_args():
                         'DOROTHY-style per-field metadata masking.')
     p.add_argument('--meta_keep_max', type=float, default=1.0,
                    help='Upper bound of the per-batch field keep-probability U(min,max).')
+    p.add_argument('--split_meta_encoders', action='store_true',
+                   help='Route instrumental metadata (sector/camera/ccd) to a separate '
+                        'encoder that conditions only the prediction head, keeping it out '
+                        'of the RNN hidden states. See docs/plans/2026-05-18_split-metadata-encoders.md.')
+    p.add_argument('--instr_emb_dim', type=int, default=16,
+                   help='Embedding dim of the instrumental metadata encoder (--split_meta_encoders).')
+    p.add_argument('--adversarial_sector_head', action='store_true',
+                   help='Add a gradient-reversal adversary that predicts sector from the '
+                        'pooled latent, pushing the encoder to make the latent sector-free.')
+    p.add_argument('--adv_lambda_max', type=float, default=1.0,
+                   help='Peak gradient-reversal coefficient for the adversarial sector head; '
+                        'ramped 0->max over training (DANN schedule).')
     p.add_argument('--use_conv_channels', action='store_true',
                    help='Use convolutional encoders for power spectrum, f-statistic, and ACF as additional model input')
     p.add_argument('--conv_encoder_type', type=str, default='unet', choices=['lightweight', 'unet'],

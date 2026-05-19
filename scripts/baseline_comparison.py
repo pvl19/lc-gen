@@ -462,11 +462,15 @@ def _load_rnn_model(model_path: str, device, num_meta_features: int):
         num_meta_features = 0
     if isinstance(ckpt, dict) and 'num_meta_features' in ckpt:
         num_meta_features = ckpt['num_meta_features']
-    meta_use_mask = ckpt.get('meta_use_mask', False) if isinstance(ckpt, dict) else False
+    _d = ckpt if isinstance(ckpt, dict) else {}
     model = BiDirectionalMinGRU(
         hidden_size=64, direction='bi', mode='parallel',
         use_flow=has_flow, num_meta_features=num_meta_features,
-        use_conv_channels=has_conv, meta_use_mask=meta_use_mask,
+        use_conv_channels=has_conv, meta_use_mask=_d.get('meta_use_mask', False),
+        split_meta_encoders=_d.get('split_meta_encoders', False),
+        instr_emb_dim=_d.get('instr_emb_dim', 16),
+        adversarial_sector_head=_d.get('adversarial_sector_head', False),
+        num_sectors=_d.get('num_sectors', 0),
     ).to(device)
     model.load_state_dict(sd)
     model.eval()
