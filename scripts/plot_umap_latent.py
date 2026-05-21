@@ -272,7 +272,11 @@ def compute_multiscale_features(h_valid: torch.Tensor, t_valid: torch.Tensor,
                                 minmax_edge_skip: int = 0,
                                 diff_weight_mode: str = 'unweighted',
                                 minmax_quantile: float = 0.0,
-                                subtract_temporal_mean: bool = False) -> torch.Tensor:
+                                subtract_temporal_mean: bool = False,
+                                glob_mode: str = 'voronoi',
+                                seg_mode: str = 'equal_time',
+                                hidden_size: int = None,
+                                voronoi_cap_factor: float = 3.0) -> torch.Tensor:
     """Compute multi-scale temporal features from hidden states (time-aware).
 
     Pool operators are defined in physical time rather than sample index:
@@ -334,19 +338,31 @@ def compute_multiscale_features(h_valid: torch.Tensor, t_valid: torch.Tensor,
     eps = torch.finfo(dtype).eps
     features = []
 
-    # Voronoi time weights: each sample carries half the gap to each neighbour;
-    # endpoints get the inner half-gap only. Reduces to uniform 1/L weights for
-    # regularly sampled sequences, so this is a strict generalization.
-    if L == 1:
-        w = torch.ones(1, device=device, dtype=dtype)
-    else:
+    # Per-sample weights for the time-average blocks (glob_mean/std + segments):
+    #   'uniform'        : every sample weighted equally (sample-average).
+    #   'voronoi'        : each sample carries half the gap to each neighbour
+    #                      (endpoints get the inner half-gap) — its Voronoi time
+    #                      cell, i.e. a true time-average of a piecewise-constant
+    #                      trajectory. For regular cadence interior weights are
+    #                      equal (endpoints get half).
+    #   'voronoi_capped' : Voronoi, but each gap is clamped to
+    #                      voronoi_cap_factor × median(Δt) first, so the two
+    #                      samples bracketing a large gap can't dominate the mean.
+    if glob_mode == 'uniform' or L == 1:
+        w = torch.ones(L, device=device, dtype=dtype)
+    elif glob_mode in ('voronoi', 'voronoi_capped'):
         dt = (t_valid[1:] - t_valid[:-1]).to(dtype).clamp_min(eps)   # (L-1,)
+        if glob_mode == 'voronoi_capped':
+            cap = (voronoi_cap_factor * dt.median()).clamp_min(eps)
+            dt = dt.clamp_max(cap)
         w = torch.empty(L, device=device, dtype=dtype)
         w[0]  = 0.5 * dt[0]
         w[-1] = 0.5 * dt[-1]
         if L > 2:
             w[1:-1] = 0.5 * (dt[1:] + dt[:-1])
         w = w.clamp_min(0.0)
+    else:
+        raise ValueError(f"Unknown glob_mode: {glob_mode!r}")
     w_sum = w.sum().clamp_min(eps)
     w_col = w.unsqueeze(1)
 
@@ -385,29 +401,62 @@ def compute_multiscale_features(h_valid: torch.Tensor, t_valid: torch.Tensor,
         global_min = h_inner.min(dim=0).values
     features.extend([global_mean, global_std, global_max, global_min])
 
-    # 2. Temporal segment pooling — equal-TIME bins of [t_min, t_max], not
-    # equal-sample quartiles. A 60-day sector's seg3 now covers days 45-60 and
-    # a 30-day sector's seg3 covers days 22.5-30, but the *time-weighted mean*
-    # inside each bin is rate-invariant — that's what makes the pool stop
-    # confusing length structure with content.
-    t_min = t_valid[0]
-    t_max = t_valid[-1]
-    span  = (t_max - t_min).clamp_min(eps)
-    edges = t_min + span * torch.linspace(0.0, 1.0, n_segments + 1,
-                                          device=device, dtype=t_valid.dtype)
-    for seg_idx in range(n_segments):
-        lo = edges[seg_idx]
-        hi = edges[seg_idx + 1]
-        # Closed on the right of the final bin so t_max is included.
-        in_bin = (t_valid >= lo) & (t_valid < hi) if seg_idx < n_segments - 1 \
-                 else (t_valid >= lo) & (t_valid <= hi)
-        if in_bin.any():
-            ws = w[in_bin]
-            denom = ws.sum().clamp_min(eps)
-            seg_mean = (ws.unsqueeze(1) * h_pool[in_bin, :]).sum(dim=0) / denom
-        else:
-            seg_mean = torch.zeros(H, device=device, dtype=dtype)
-        features.append(seg_mean)
+    # 2. Segment pooling. seg_mode selects how the n_segments bins are defined
+    # and how empty bins are handled (segments reuse the `w` weights above, so
+    # glob_mode controls the within-bin weighting too):
+    #   'equal_time'       : equal-duration bins of [t_min, t_max]; an empty bin
+    #                        emits a zero vector (legacy behaviour).
+    #   'equal_time_carry' : equal-duration bins; an empty bin is filled with the
+    #                        DIRECTION-AWARE carry of the bracketing states —
+    #                        forward half from the last sample before the bin,
+    #                        backward half from the first sample after it (the
+    #                        state the model would assign to a point in the gap).
+    #   'equal_count'      : equal-sample-count bins (the original quartile pool);
+    #                        never empty, so no carry/zero-fill is needed.
+    if seg_mode in ('equal_time', 'equal_time_carry'):
+        t_min = t_valid[0]
+        t_max = t_valid[-1]
+        span  = (t_max - t_min).clamp_min(eps)
+        edges = t_min + span * torch.linspace(0.0, 1.0, n_segments + 1,
+                                              device=device, dtype=t_valid.dtype)
+        # Forward/backward split for direction-aware carry: bidirectional latents
+        # are [h_fwd | h_bwd] along the feature axis, so Hd = hidden_size.
+        Hd = hidden_size if (hidden_size is not None and 2 * hidden_size == H) else None
+        for seg_idx in range(n_segments):
+            lo = edges[seg_idx]
+            hi = edges[seg_idx + 1]
+            # Closed on the right of the final bin so t_max is included.
+            in_bin = (t_valid >= lo) & (t_valid < hi) if seg_idx < n_segments - 1 \
+                     else (t_valid >= lo) & (t_valid <= hi)
+            if in_bin.any():
+                ws = w[in_bin]
+                denom = ws.sum().clamp_min(eps)
+                seg_mean = (ws.unsqueeze(1) * h_pool[in_bin, :]).sum(dim=0) / denom
+            elif seg_mode == 'equal_time_carry':
+                # a = last sample before the (interior) empty bin, b = a+1.
+                a = int((t_valid < lo).sum().item()) - 1
+                a = min(max(a, 0), L - 1)
+                b = min(a + 1, L - 1)
+                if Hd is not None:
+                    seg_mean = torch.cat([h_pool[a, :Hd], h_pool[b, Hd:2 * Hd]], dim=0)
+                else:
+                    seg_mean = h_pool[a, :]   # single-direction fallback
+            else:
+                seg_mean = torch.zeros(H, device=device, dtype=dtype)
+            features.append(seg_mean)
+    elif seg_mode == 'equal_count':
+        idx_edges = torch.linspace(0, L, n_segments + 1).round().to(torch.long)
+        for seg_idx in range(n_segments):
+            s = int(idx_edges[seg_idx]); e = int(idx_edges[seg_idx + 1])
+            if e > s:
+                ws = w[s:e]
+                denom = ws.sum().clamp_min(eps)
+                seg_mean = (ws.unsqueeze(1) * h_pool[s:e, :]).sum(dim=0) / denom
+            else:
+                seg_mean = torch.zeros(H, device=device, dtype=dtype)
+            features.append(seg_mean)
+    else:
+        raise ValueError(f"Unknown seg_mode: {seg_mode!r}")
 
     # 3. First / last hidden states (anchored at t_min, t_max).
     features.append(h_pool[0, :])
@@ -425,7 +474,21 @@ def compute_multiscale_features(h_valid: torch.Tensor, t_valid: torch.Tensor,
     if L > 1:
         dt_step = (t_valid[1:] - t_valid[:-1]).to(dtype).clamp_min(eps)
         rates = (h_valid[1:, :] - h_valid[:-1, :]) / dt_step.unsqueeze(1)
-        if diff_weight_mode == 'dt_inverse':
+        if diff_weight_mode == 'dt':
+            # Time-weighted: weight each per-step rate by its duration Δt. The
+            # mean telescopes to the net slope Σ(Δh)/Σ(Δt) = (h_last-h_first)/span
+            # (gap-robust); the std is the Δt-weighted dispersion of the rate
+            # (quadratic-variation-per-time). Neither blows up on dense cadence.
+            w_d = dt_step.unsqueeze(1)                                # (L-1, 1)
+            w_d_sum = w_d.sum().clamp_min(eps)
+            diff_mean = (w_d * rates).sum(dim=0) / w_d_sum
+            if rates.shape[0] > 1:
+                centered = rates - diff_mean.unsqueeze(0)
+                diff_var = (w_d * centered.pow(2)).sum(dim=0) / w_d_sum
+                diff_std = diff_var.clamp_min(0.0).sqrt()
+            else:
+                diff_std = torch.zeros(H, device=device, dtype=dtype)
+        elif diff_weight_mode == 'dt_inverse':
             w_d = (1.0 / dt_step).unsqueeze(1)                        # (L-1, 1)
             w_d_sum = w_d.sum().clamp_min(eps)
             diff_mean = (w_d * rates).sum(dim=0) / w_d_sum
@@ -458,7 +521,8 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
                            diff_weight_mode: str = 'unweighted',
                            minmax_quantile: float = 0.0,
                            subtract_temporal_mean: bool = False,
-                           apply_head_norm: bool = False):
+                           apply_head_norm: bool = False,
+                           pool_configs: list = None):
     """Extract latent vectors for all light curves in the H5 file.
 
     Args:
@@ -553,6 +617,9 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
 
     n_samples = len(lengths)
     latent_vectors = []
+    # When pool_configs is given (multiscale only), emit one latent per config
+    # from the SAME forward pass — the RNN cost is paid once.
+    multi = {cfg['name']: [] for cfg in pool_configs} if pool_configs else None
 
     # Resolve spectra sidecar path for conv channels
     spectra_h5_path = None
@@ -671,12 +738,28 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
                 elif pooling_mode == 'final':
                     latent = h_combined[-1, :]
                 elif pooling_mode == 'multiscale':
+                    if multi is not None:
+                        # Fan out all pool configs from the same hidden states.
+                        for cfg in pool_configs:
+                            lat = compute_multiscale_features(
+                                h_combined, t_combined, n_segments=4,
+                                minmax_edge_skip=minmax_edge_skip,
+                                minmax_quantile=minmax_quantile,
+                                subtract_temporal_mean=subtract_temporal_mean,
+                                hidden_size=model.hidden_size,
+                                glob_mode=cfg.get('glob_mode', 'voronoi'),
+                                seg_mode=cfg.get('seg_mode', 'equal_time'),
+                                diff_weight_mode=cfg.get('diff_mode', diff_weight_mode),
+                            )
+                            multi[cfg['name']].append(lat.cpu().numpy())
+                        continue
                     latent = compute_multiscale_features(
                         h_combined, t_combined, n_segments=4,
                         minmax_edge_skip=minmax_edge_skip,
                         diff_weight_mode=diff_weight_mode,
                         minmax_quantile=minmax_quantile,
                         subtract_temporal_mean=subtract_temporal_mean,
+                        hidden_size=model.hidden_size,
                     )
                 else:
                     raise ValueError(f"Unknown pooling_mode: {pooling_mode}")
@@ -688,6 +771,12 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
     
     if spectra_ctx is not None:
         spectra_ctx.close()
+
+    if multi is not None:
+        out = {name: np.stack(lst, axis=0) for name, lst in multi.items()}
+        for name, arr in out.items():
+            print(f'  [{name}] extracted {arr.shape}')
+        return out
 
     latent_vectors = np.stack(latent_vectors, axis=0)
     print(f'Extracted latent vectors with shape: {latent_vectors.shape}')
