@@ -50,7 +50,7 @@ def load_variant(variant: str):
     if not base.is_dir():
         base = ROOT / 'final_model/parallel_fixed' / variant
     parts = []
-    for name in ('latents_pretrain.npz', 'latents_hosts.npz'):
+    for name in ('latents_pretrain.npz', 'latents_hosts.npz', 'latents_thickdisk.npz'):
         p = base / name
         if not p.exists():
             continue
@@ -83,6 +83,9 @@ def main():
             print(f'\n=== {variant}: SKIP ({e}) ===')
             continue
         print(f'\n=== {variant}: latents={X.shape}, unique stars={len(np.unique(gid))} ===')
+
+        # Keep unfiltered copies for the all-stars sector probe (needs no ages).
+        X_all, gid_all, sec_all = X, gid, sec
 
         # Filter to labeled stars
         log_age_per_obs = np.array([age_map.get(int(g), np.nan) for g in gid])
@@ -193,6 +196,29 @@ def main():
         unique, counts = np.unique(ytr, return_counts=True)
         chance = float(counts.max() / counts.sum())
 
+        # (C2) sector probe on ALL stars with a valid sector — labeled AND
+        # unlabeled (e.g. thick-disk). Sector recovery needs no ages, so this
+        # uses the full latent population. Plain star-grouped 80/20 split (no age
+        # stratification, since unlabeled stars have no age to stratify on).
+        all_ids = np.unique(gid_all)
+        _rng = np.random.default_rng(42)
+        _perm = _rng.permutation(len(all_ids))
+        _te = set(int(s) for s in all_ids[_perm[:max(1, int(0.2 * len(all_ids)))]])
+        te_a = np.array([int(g) in _te for g in gid_all])
+        tr_a = ~te_a
+        sca = StandardScaler().fit(X_all[tr_a])
+        clf_a = LogisticRegression(max_iter=200, solver='lbfgs', C=1.0)
+        clf_a.fit(sca.transform(X_all[tr_a]), sec_all[tr_a])
+        pa = clf_a.predict_proba(sca.transform(X_all[te_a]))
+        ca = clf_a.classes_
+        yte_a = sec_all[te_a]
+        acc1_all = float(np.mean(ca[np.argmax(pa, axis=1)] == yte_a))
+        t3a = ca[np.argsort(-pa, axis=1)[:, :3]]
+        acc3_all = float(np.mean(np.any(t3a == yte_a[:, None], axis=1)))
+        _ua, _cca = np.unique(sec_all[tr_a], return_counts=True)
+        chance_all = float(_cca.max() / _cca.sum())
+        n_all = len(gid_all)
+
         dur = time.time() - t0
         print(f'  (A) age-from-X (star-level, 10-fold):')
         print(f'        sector-only        r={r_s:.4f}  MAE={m_s:.4f} dex')
@@ -201,8 +227,10 @@ def main():
         print(f'        joint - sector     Δr={r_j-r_s:+.4f}  ΔMAE={m_j-m_s:+.4f}')
         print(f'  (B) partial: latent on within-sector residual')
         print(f'        r={r_r:.4f}  MAE={m_r:.4f} dex   (0 = no info beyond sector)')
-        print(f'  (C) sector probe (latent -> sector_id, 80/20 star-grouped):')
+        print(f'  (C) sector probe — LABELED stars (latent -> sector_id, 80/20 star-grouped):')
         print(f'        top-1={acc1:.4f}   top-3={acc3:.4f}   chance={chance:.4f}')
+        print(f'  (C2) sector probe — ALL stars incl. unlabeled (n={n_all}):')
+        print(f'        top-1={acc1_all:.4f}   top-3={acc3_all:.4f}   chance={chance_all:.4f}')
         print(f'  ({dur:.1f}s)')
         summary_rows.append({
             'variant': variant,
@@ -213,6 +241,7 @@ def main():
             'dr_joint_over_sector': r_j - r_s,
             'r_residual': r_r, 'mae_residual': m_r,
             'probe_top1': acc1, 'probe_top3': acc3, 'probe_chance': chance,
+            'probe_top1_all': acc1_all, 'probe_top3_all': acc3_all, 'n_all': n_all,
         })
 
     print('\n\nSUMMARY')
