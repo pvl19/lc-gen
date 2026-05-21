@@ -439,6 +439,7 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
                            batch_size: int = 32, pooling_mode: str = 'multiscale',
                            sample_indices: np.ndarray = None, use_metadata: bool = False,
                            zero_metadata: bool = False,
+                           zero_fields: list = None,
                            use_conv_channels: bool = False, trim_edges: int = 0,
                            minmax_edge_skip: int = 0,
                            diff_weight_mode: str = 'unweighted',
@@ -512,17 +513,30 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
                     raw[feat] = np.zeros(n, dtype=np.float32)
             standardizer = MetadataStandardizer(fields=metadata_features)
             metadata_all = standardizer.transform(raw)
+            # Validity mask (1 = present). Diagnostic ablations zero selected
+            # fields' VALUES *and* their mask-channel entries — matching how the
+            # model saw withheld metadata during DOROTHY-style training
+            # (value 0 + mask 0). For a mask-trained encoder this keeps the
+            # ablation in-distribution rather than presenting "a genuine 0".
+            meta_mask_all = np.ones_like(metadata_all)
+            zero_cols = []
             if zero_metadata:
-                # Diagnostic: withhold the metadata signal while keeping the
-                # meta-encoder path dimensionally intact. meta_encoder(0) is a
-                # constant embedding for every star, so per-star latent
-                # variation comes purely from the light curve. NOTE: the model
-                # was trained with real metadata, so this is out-of-distribution.
-                metadata_all = np.zeros_like(metadata_all)
-                print('  --zero_metadata: standardized metadata zeroed '
-                      '(metadata signal withheld; OOD for a metadata-trained model)')
+                zero_cols = list(range(len(metadata_features)))
+                print('  --zero_metadata: ALL metadata fields withheld (value 0, mask 0)')
+            elif zero_fields:
+                zero_cols = [metadata_features.index(f) for f in zero_fields
+                             if f in metadata_features]
+                bad = [f for f in zero_fields if f not in metadata_features]
+                if bad:
+                    print(f'  WARNING: --zero_fields entries not in metadata, ignored: {bad}')
+                kept = [metadata_features[c] for c in zero_cols]
+                print(f'  --zero_fields: withholding {kept} (value 0, mask 0)')
+            if zero_cols:
+                metadata_all[:, zero_cols] = 0.0
+                meta_mask_all[:, zero_cols] = 0.0
         else:
             metadata_all = None
+            meta_mask_all = None
 
     n_samples = len(lengths)
     latent_vectors = []
@@ -591,8 +605,12 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
                 torch.tensor(metadata_all[start_idx:end_idx], dtype=torch.float32, device=device)
                 if metadata_all is not None else None
             )
+            meta_mask_batch = (
+                torch.tensor(meta_mask_all[start_idx:end_idx], dtype=torch.float32, device=device)
+                if meta_mask_all is not None else None
+            )
 
-            out = model(x_in, t_in, mask=mask, metadata=meta_batch, conv_data=conv_data_batch, return_states=True)
+            out = model(x_in, t_in, mask=mask, metadata=meta_batch, meta_mask=meta_mask_batch, conv_data=conv_data_batch, return_states=True)
 
             h_fwd = out.get('h_fwd_tensor')  # (B, L, H)
             h_bwd = out.get('h_bwd_tensor')  # (B, L, H)
@@ -866,6 +884,11 @@ def main():
                              'signal while keeping the meta-encoder dimensionally intact. '
                              'Used to probe whether the latent encodes sector via the '
                              'light curve alone (Route B) vs. via metadata (Route A).')
+    parser.add_argument('--zero_fields', type=str, default=None,
+                        help='Comma-separated metadata field names to withhold (value 0 + '
+                             'mask 0), keeping all others — e.g. "sector,camera,ccd" to drop '
+                             'the instrumental confounds while keeping astrophysical metadata. '
+                             'Requires --use_metadata; ignored if --zero_metadata is set.')
     parser.add_argument('--use_conv_channels', action='store_true')
     parser.add_argument('--trim_edges', type=int, default=0,
                         help='If >0, strip this many samples from each end of every light '
@@ -1014,6 +1037,7 @@ def main():
                 sample_indices=sample_indices,
                 use_metadata=args.use_metadata,
                 zero_metadata=args.zero_metadata,
+                zero_fields=(args.zero_fields.split(',') if args.zero_fields else None),
                 use_conv_channels=args.use_conv_channels,
                 trim_edges=args.trim_edges,
                 minmax_edge_skip=args.minmax_edge_skip,

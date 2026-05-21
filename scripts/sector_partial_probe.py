@@ -44,9 +44,14 @@ VARIANTS = sys.argv[1:] or [
 
 
 def load_variant(variant: str):
+    # `variant` may be a bare name (resolved under final_model/parallel_fixed/)
+    # or a direct path to a dir containing latents_{pretrain,hosts}.npz.
+    base = Path(variant)
+    if not base.is_dir():
+        base = ROOT / 'final_model/parallel_fixed' / variant
     parts = []
     for name in ('latents_pretrain.npz', 'latents_hosts.npz'):
-        p = ROOT / f'final_model/parallel_fixed/{variant}/{name}'
+        p = base / name
         if not p.exists():
             continue
         z = np.load(p, allow_pickle=True)
