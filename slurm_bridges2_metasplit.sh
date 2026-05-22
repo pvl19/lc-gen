@@ -7,7 +7,7 @@
 #   2. Update --epochs to your new target (e.g., 50 or 100)
 #   3. Training will continue from where it left off
 #
-#SBATCH --job-name=final-meta-mask-pt2
+#SBATCH --job-name=meta-split-adv
 #### Change account to your allocation (e.g., abc123p)
 #SBATCH --account=phy260003p
 #SBATCH --partition=GPU-shared
@@ -34,7 +34,7 @@ OUTPUT_DIR="$PROJECT_DIR/output/$SLURM_JOBID-$SLURM_JOB_NAME"
 #### Leave empty ("") for fresh training
 #### Cleared for the final run: Changes 1/3 (recurrence gating + metadata
 #### mask channel) make old checkpoints incompatible — this MUST be a fresh run.
-RESUME_FROM="checkpoints/resume/model.pt"
+RESUME_FROM=""
 
 # Define container
 CONTAINER="/ocean/containers/ngc/pytorch/pytorch_24.11-py3.sif"
@@ -126,10 +126,14 @@ time -p singularity exec --nv --bind /ocean,$LOCAL,$HOME \
     --num_workers 4 \
     --K 2880 \
     --k_spacing log \
-    --patience 10 \
+    --patience 20 \
     --min_delta 0.0 \
+    --split_meta_encoders \
+    --instr_emb_dim 16 \
+    --adversarial_sector_head \
+    --adv_lambda_max 1.0 \
     --save_every 1 \
-    --checkpoint_copy_dir $PROJECT_DIR/checkpoints/resume \
+    --checkpoint_copy_dir $PROJECT_DIR/checkpoints/resume_split \
     $RESUME_FLAG
 
 echo "========================================"
