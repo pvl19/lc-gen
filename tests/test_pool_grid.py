@@ -99,16 +99,20 @@ def test_voronoi_capped_limits_gap_edge_weight():
     assert d_cap < d_vor, (d_cap, d_vor)
 
 
-def test_backward_compatible_defaults_and_shape():
-    """Default kwargs reproduce the explicit legacy config and yield 12*H dims."""
+def test_default_recipe_and_shape():
+    """Defaults are the agreed recipe (uniform / equal_count / dt) and yield 12*H dims."""
     H = 4
     t = torch.linspace(0, 27, 50, dtype=torch.float64)
     h = torch.randn(len(t), H, dtype=torch.float64)
     f_default = compute_multiscale_features(h, t)
     f_explicit = compute_multiscale_features(
-        h, t, glob_mode='voronoi', seg_mode='equal_time', diff_weight_mode='unweighted')
+        h, t, glob_mode='uniform', seg_mode='equal_count', diff_weight_mode='dt')
     assert f_default.shape[0] == 12 * H
     assert torch.allclose(f_default, f_explicit)
+    # ...and differs from the old legacy recipe.
+    f_legacy = compute_multiscale_features(
+        h, t, glob_mode='voronoi', seg_mode='equal_time', diff_weight_mode='unweighted')
+    assert not torch.allclose(f_default, f_legacy)
 
 
 if __name__ == '__main__':

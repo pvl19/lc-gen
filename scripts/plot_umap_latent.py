@@ -270,11 +270,11 @@ def load_model(model_path: str, device: torch.device, hidden_size: int = 64,
 def compute_multiscale_features(h_valid: torch.Tensor, t_valid: torch.Tensor,
                                 n_segments: int = 4,
                                 minmax_edge_skip: int = 0,
-                                diff_weight_mode: str = 'unweighted',
+                                diff_weight_mode: str = 'dt',
                                 minmax_quantile: float = 0.0,
                                 subtract_temporal_mean: bool = False,
-                                glob_mode: str = 'voronoi',
-                                seg_mode: str = 'equal_time',
+                                glob_mode: str = 'uniform',
+                                seg_mode: str = 'equal_count',
                                 hidden_size: int = None,
                                 voronoi_cap_factor: float = 3.0) -> torch.Tensor:
     """Compute multi-scale temporal features from hidden states (time-aware).
@@ -518,11 +518,13 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
                            zero_fields: list = None,
                            use_conv_channels: bool = False, trim_edges: int = 0,
                            minmax_edge_skip: int = 0,
-                           diff_weight_mode: str = 'unweighted',
+                           diff_weight_mode: str = 'dt',
                            minmax_quantile: float = 0.0,
                            subtract_temporal_mean: bool = False,
                            apply_head_norm: bool = False,
-                           pool_configs: list = None):
+                           pool_configs: list = None,
+                           glob_mode: str = 'uniform',
+                           seg_mode: str = 'equal_count'):
     """Extract latent vectors for all light curves in the H5 file.
 
     Args:
@@ -760,6 +762,7 @@ def extract_latent_vectors(model, h5_path: str, device: torch.device, max_length
                         minmax_quantile=minmax_quantile,
                         subtract_temporal_mean=subtract_temporal_mean,
                         hidden_size=model.hidden_size,
+                        glob_mode=glob_mode, seg_mode=seg_mode,
                     )
                 else:
                     raise ValueError(f"Unknown pooling_mode: {pooling_mode}")
@@ -1001,13 +1004,25 @@ def main():
                              'before computing global_min / global_max only. Mitigates the '
                              'MinGRU cumulative-scan edge bias on per-feature extrema. '
                              'Mean/std/segment/diff stats are unaffected.')
-    parser.add_argument('--diff_weight_mode', type=str, default='unweighted',
-                        choices=['unweighted', 'dt_inverse'],
+    parser.add_argument('--diff_weight_mode', type=str, default='dt',
+                        choices=['dt', 'unweighted', 'dt_inverse'],
                         help="How to aggregate per-step rates Δh/Δt in the diff_mean/diff_std "
-                             "blocks. 'unweighted' (default) is the existing equal-count mean. "
-                             "'dt_inverse' weights each rate sample by 1/Δt so dense within-sector "
-                             "pairs dominate and the long-Δt rate sample spanning a mid-sector "
-                             "gap is suppressed.")
+                             "blocks. 'dt' (default) is true Δt-weighting: mean telescopes to the "
+                             "net endpoint slope, std is the Δt-weighted rate dispersion. "
+                             "'unweighted' is the legacy equal-count mean; 'dt_inverse' weights "
+                             "by 1/Δt.")
+    parser.add_argument('--glob_mode', type=str, default='uniform',
+                        choices=['uniform', 'voronoi', 'voronoi_capped'],
+                        help="Per-sample weighting for glob_mean/std + segment means. 'uniform' "
+                             "(default) weights every sample equally; 'voronoi' weights by time "
+                             "cell (over-weights gap-edge samples on regular cadence); "
+                             "'voronoi_capped' clamps the gap to 3x median Δt.")
+    parser.add_argument('--seg_mode', type=str, default='equal_count',
+                        choices=['equal_count', 'equal_time', 'equal_time_carry'],
+                        help="Segment binning. 'equal_count' (default) = equal-sample quartiles "
+                             "(never empty); 'equal_time' = equal-duration bins (empty→zeros); "
+                             "'equal_time_carry' = equal-duration bins, empty bins direction-aware "
+                             "carry-filled.")
     parser.add_argument('--minmax_quantile', type=float, default=0.0,
                         help='If >0, replace global_min / global_max with time-weighted '
                              'quantiles at q and 1-q (e.g. 0.05 -> 5th/95th percentile). '
@@ -1147,6 +1162,7 @@ def main():
                 minmax_quantile=args.minmax_quantile,
                 subtract_temporal_mean=args.subtract_temporal_mean,
                 apply_head_norm=args.apply_head_norm,
+                glob_mode=args.glob_mode, seg_mode=args.seg_mode,
             )
 
             ages, bprp0, bprp0_err, mg, mg_err, mem_prob, gaia_ids, tic_ids, sectors = load_ages(
