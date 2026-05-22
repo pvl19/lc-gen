@@ -18,19 +18,21 @@
 
 OUTBASE="final_model/meta_mask/e50/sector-robust/sweep"
 
-# ALL labeled stars (no ChronoFlow subset): more single-sector field-like stars
-# → robust star-disjoint sector-CV folds (cfonly is heavily multi-sector, which
-# empties folds), and better matches the "applicability to other stars" goal.
-# Reduced n_folds=5 / n_epochs=120 keep the all-stars sweep feasible on the laptop;
-# relative comparisons hold, bump to 10/300 for the final config.
-COMMON="--load_latents final_model/meta_mask/e50/metaAll/latents_pretrain.npz \
+# RANDOM ~4000-star subset of e50 labeled stars (keeps ALL sectors per star, so
+# multi-sector structure + within-sector age spread are intact — unlike the
+# age-stratified subset that broke partial-r). 13,897 rows / 99 sectors. This +
+# n_folds=3 / n_epochs=60 makes each run ~5-7 min so the full 11-point matrix runs
+# in ~1-1.5h. Relative comparisons hold; rerun the winning config at full
+# resolution (all stars, n_folds=10, n_epochs=300) before deployment.
+# --pca_h5_paths dropped: mlp encoder doesn't use PCA, and normalization from the
+# subset latents is fine + avoids re-touching the H5.
+COMMON="--load_latents final_model/meta_mask/e50/metaAll/latents_pretrain_sub4k.npz \
   --age_csv final_pretrain/all_ages.csv \
-  --pca_h5_paths final_pretrain/timeseries_pretrain.h5 final_pretrain/timeseries_exop_hosts.h5 \
   --encoder_type mlp --pca_dim 4 --mlp_encoder_hidden 128 64 \
-  --n_folds 5 --lr 1e-3 --lr_decay_rate 0.97 --n_epochs 120 --batch_size 64 \
+  --n_folds 3 --lr 1e-3 --lr_decay_rate 0.97 --n_epochs 60 --batch_size 64 \
   --flow_transforms 6 --flow_hidden_dims 64 64 --loga_grid_size 1000 --seed 42 \
   --use_metadata --aux_loss_weight 1.0 --dropout 0.1 --variance_reg_weight 0.25 \
-  --training_stages three_stage --encoder_pretrain_epochs 40 --joint_finetune_epochs 40 \
+  --training_stages three_stage --encoder_pretrain_epochs 20 --joint_finetune_epochs 20 \
   --finetune_encoder_lr_mult 0.1 --finetune_flow_lr_mult 0.1"
 
 # Two holdout variants — BOTH hold the SECTOR out of training (--sector_level_split):
