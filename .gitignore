@@ -6,9 +6,12 @@ output/ps_acf_predictor/*
 exop_hosts/lc_data.pickle
 exop_hosts/lc_data.h5
 final_pretrain/*
+final_pretrain_robust/
 final_model/*
 checkpoints/*
 .DS_Store
 *.npz
+# large generated artifacts — too big for git
+output/umap/v3-full-dataset/
 # output/age_predictor/*
 # output/age_predictor_tests/*
