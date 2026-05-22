@@ -26,15 +26,20 @@ ROOT = Path('/Users/philvanlane/Documents/lc_ae')
 sys.path.insert(0, str(ROOT / 'scripts'))
 sys.path.insert(0, str(ROOT / 'src'))
 from plot_umap_latent import (  # noqa: E402
-    load_model, extract_latent_vectors, load_ages, save_latents_cache, METADATA_FEATURES)
+    load_model, extract_latent_vectors, load_ages, save_latents_cache,
+    get_stratified_indices, METADATA_FEATURES)
 
 # --- Target checkpoint + outputs ---
 MODEL_PATH = ROOT / 'final_model/parallel_fixed/e110/best_model.pt'
-OUT_BASE   = ROOT / 'final_model/parallel_fixed/e110_poolgrid'
-# e110 predates the thick-disk set and its cache is pretrain+hosts only — match it.
+# Stratified-by-age SUBSET run (fast turnaround). Comparisons across configs are
+# valid (every config sees the same subset); only the exact-N match to the cached
+# full e110 (0.533) becomes approximate. Set MAX_SAMPLES per H5 to None for a full run.
+OUT_BASE   = ROOT / 'final_model/parallel_fixed/e110_poolgrid_subset'
+# (category, h5 path, max stratified-by-age samples). e110 predates thick-disk;
+# cache is pretrain+hosts only.
 H5 = [
-    ('pretrain', ROOT / 'final_pretrain/timeseries_pretrain.h5'),
-    ('hosts',    ROOT / 'final_pretrain/timeseries_exop_hosts.h5'),
+    ('pretrain', ROOT / 'final_pretrain/timeseries_pretrain.h5', 10000),
+    ('hosts',    ROOT / 'final_pretrain/timeseries_exop_hosts.h5', 6000),
 ]
 AGE_CSV = [str(ROOT / 'final_pretrain/metadata.csv'),
            str(ROOT / 'final_pretrain/host_all_metadata.csv')]
@@ -63,14 +68,21 @@ def main():
                        num_meta_features=len(METADATA_FEATURES))
     print(f'Pool grid ({len(GRID)} configs): {[c["name"] for c in GRID]}')
 
-    for cat, h5 in H5:
-        print(f'\n=== {cat}: {h5} ===')
+    for cat, h5, max_n in H5:
+        print(f'\n=== {cat}: {h5} (max_samples={max_n}) ===')
+        # Stratified-by-age subset of LABELED stars (finite age) for fast probing.
+        sample_indices = None
+        if max_n is not None:
+            ages_full = load_ages(str(h5), AGE_CSV, sample_indices=None)[0]
+            sample_indices = get_stratified_indices(ages_full, max_samples=max_n,
+                                                    n_bins=20, seed=42)
+            print(f'  subset: {len(sample_indices)} stratified-by-age stars')
         out = extract_latent_vectors(
             model, str(h5), dev, batch_size=BATCH, pooling_mode='multiscale',
             use_metadata=True, trim_edges=TRIM_EDGES, minmax_edge_skip=MINMAX_EDGE_SKIP,
-            pool_configs=GRID)
+            sample_indices=sample_indices, pool_configs=GRID)
         (ages, bprp0, bprp0_err, mg, mg_err, mem_prob,
-         gaia_ids, tic_ids, sectors) = load_ages(str(h5), AGE_CSV, sample_indices=None)
+         gaia_ids, tic_ids, sectors) = load_ages(str(h5), AGE_CSV, sample_indices=sample_indices)
         for cfg in GRID:
             path = OUT_BASE / cfg['name'] / f'latents_{cat}.npz'
             save_latents_cache(str(path), out[cfg['name']], ages, bprp0,
