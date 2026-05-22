@@ -1679,6 +1679,48 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
 # K-fold cross-validation
 # ---------------------------------------------------------------------------
 
+def loocv_age_folds(ages, young_n=20, young_size=5, indiv_min=100, sparse_split=1000.0):
+    """Leave-one-cluster-out folds for ChronoFlow, using age as a cluster proxy.
+
+    Each ChronoFlow cluster carries one isochrone age, so unique ages ≈ clusters.
+    Sort unique ages ascending, then:
+      - bundle the youngest `young_n` ages into folds of `young_size` (the young end
+        is densely clumped within age uncertainty — testing them individually is
+        meaningless and leaves tiny folds);
+      - among the rest, keep ages with >= `indiv_min` stars as their own fold
+        (well-populated, well-separated clusters — the meaningful LOCO tests);
+      - bundle the remaining sparse ages into two folds split at `sparse_split` Myr
+        (intermediate vs old field-like).
+    SHARED by kfold_age_inference and kfold_gyro_baseline so the folds are identical.
+    Returns (fold_of_sample int array aligned to `ages`, n_folds).
+    """
+    key = np.round(np.asarray(ages, dtype=np.float64), 3)
+    uniq, counts = np.unique(key, return_counts=True)            # ascending
+    cnt = dict(zip(uniq.tolist(), counts.tolist()))
+    age_to_fold, fid = {}, 0
+    n_young = min(young_n, len(uniq))
+    for s in range(0, n_young, young_size):                       # young bundles
+        for a in uniq[s:s + young_size]:
+            age_to_fold[a] = fid
+        fid += 1
+    rest = uniq[n_young:]
+    indiv      = [a for a in rest if cnt[a] >= indiv_min]
+    sparse_mid = [a for a in rest if cnt[a] < indiv_min and a <  sparse_split]
+    sparse_old = [a for a in rest if cnt[a] < indiv_min and a >= sparse_split]
+    for a in indiv:                                               # individual clusters
+        age_to_fold[a] = fid; fid += 1
+    if sparse_mid:
+        for a in sparse_mid:
+            age_to_fold[a] = fid
+        fid += 1
+    if sparse_old:
+        for a in sparse_old:
+            age_to_fold[a] = fid
+        fid += 1
+    fold_of_sample = np.array([age_to_fold[a] for a in key], dtype=int)
+    return fold_of_sample, fid
+
+
 def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
                  n_folds=10, pca_dim=32, pca_latents=None,
                  lr=1e-3, weight_decay=1e-4, n_epochs=100, batch_size=64,
@@ -1811,19 +1853,12 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
         print('  NOTE: combined_mode + sector_level_split — using sector split (combined ignored).')
         combined_mode = False
     if loocv_age:
-        # Leave-one-age-out: each unique age value is its own fold (a cluster proxy
-        # for ChronoFlow, where each cluster carries one isochrone age). Tests
-        # whether a held-out population's age is recovered from OTHER ages' training
-        # data — a cluster-generalization / anti-memorization check. n_folds is
-        # OVERRIDDEN to the number of unique ages. Note: each held-out fold contains
-        # a single age, so per-fold r is undefined (zero age variance); read the
-        # GLOBAL r/MAE over all held-out predictions (plot_kfold_results does this).
-        age_key  = np.round(np.asarray(ages, dtype=np.float64), 4)
-        uniq_age = np.unique(age_key)
-        age2fold = {a: i for i, a in enumerate(uniq_age)}
-        fold_of_sample = np.array([age2fold[a] for a in age_key])
-        n_folds = len(uniq_age)
-        print(f'Leave-one-age-out (cluster proxy): {n_folds} unique ages, held out one at a time')
+        # Leave-one-cluster-out via the shared age-grouping (young bundled, big
+        # clusters individual, sparse ages bundled). n_folds is OVERRIDDEN. Each
+        # held-out fold spans only held-out ages, so read the GLOBAL r/MAE over all
+        # held-out predictions (plot_kfold_results does this), not per-fold r.
+        fold_of_sample, n_folds = loocv_age_folds(ages)
+        print(f'Leave-one-cluster-out (age-grouped, ChronoFlow proxy): {n_folds} folds')
     elif sector_level_split:
         # Hold out entire SECTORS per fold so each fold predicts stars observed
         # in sectors absent from training — a proxy for field-star generalization.

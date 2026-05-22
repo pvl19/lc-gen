@@ -146,11 +146,28 @@ def test_adversary_rejects_pca_encoder():
                      encoder_type='pca', sectors=d['sectors'], adv_sector_weight=1.0)
 
 
-def test_loocv_age_one_fold_per_age():
-    """Leave-one-age-out: n_folds overridden to #unique ages; each fold = one age; all predicted."""
+def test_loocv_age_folds_grouping():
+    """Shared LOCO grouping: young bundled in 5s, big clusters individual, sparse bundled."""
+    from kfold_age_inference import loocv_age_folds
+    ages = [float(a) for a in range(1, 21) for _ in range(3)]   # 20 young ages, 3 stars each
+    ages += [100.0] * 150                                       # big cluster -> individual
+    ages += [500.0] * 5                                         # sparse mid (<1000) -> bundle
+    ages += [2000.0] * 4                                        # sparse old (>=1000) -> bundle
+    ages = np.array(ages)
+    fos, nf = loocv_age_folds(ages, young_n=20, young_size=5, indiv_min=100, sparse_split=1000.)
+    assert nf == 7                                              # 4 young + 1 big + mid + old
+    assert len(np.unique(fos[np.isin(ages, [1., 2., 3., 4., 5.])])) == 1   # youngest 5 share a fold
+    assert len(np.unique(fos[ages == 100.])) == 1              # big cluster is its own fold
+    assert fos[ages == 500.][0] != fos[ages == 2000.][0]       # mid vs old in different folds
+    assert (fos >= 0).all() and len(np.unique(fos)) == 7
+
+
+def test_loocv_age_runs_end_to_end():
+    """run_kfold_cv with loocv_age completes and predicts every star (grouped folds)."""
     rng = np.random.default_rng(3)
-    cluster_ages = [10., 50., 200., 700., 2000.]   # 5 discrete "clusters"
-    ages = np.array([ca for ca in cluster_ages for _ in range(12)], dtype=np.float32)
+    # 22 ages: 20 young (3 stars) + a big cluster (40) + a sparse-old (4)
+    ages = np.array([float(a) for a in range(1, 21) for _ in range(3)]
+                    + [100.0] * 40 + [2000.0] * 4, dtype=np.float32)
     N = len(ages)
     d = dict(
         latent_vectors=rng.standard_normal((N, 16)).astype(np.float32),
@@ -159,10 +176,7 @@ def test_loocv_age_one_fold_per_age():
         mg=rng.uniform(0, 8, N).astype(np.float32), mem_prob=np.full(N, .9, np.float32),
         tic_ids=np.arange(N), sectors=rng.integers(0, 6, N))
     preds, stats, a, tics, folds, losses, _ = _run({'loocv_age': True}, d=d)
-    assert len(np.unique(folds)) == 5            # one fold per unique age (n_folds override)
     assert np.isfinite(preds).all()              # every star held out once and predicted
-    for f in np.unique(folds):                   # each fold holds a single age
-        assert len(np.unique(a[folds == f])) == 1
 
 
 def test_sector_options_require_sectors():

@@ -20,6 +20,9 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from kfold_age_inference import loocv_age_folds  # shared LOCO grouping (identical folds)
 
 try:
     import zuko
@@ -166,10 +169,22 @@ class CombinedLRScheduler:
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_gyro_data(csv_path: str):
-    """Load ages, BPRP0, BPRP0_err, Prot, mem_prob, gaia_ids, gaia_ids from phot_all.csv."""
+def load_gyro_data(csv_path: str, subset_col: str = None, subset_val: list = None):
+    """Load ages, BPRP0, BPRP0_err, Prot, mem_prob, gaia_ids from a metadata CSV.
+
+    subset_col/subset_val: optionally keep only rows where subset_col is in
+    subset_val (e.g. ref == ChronoFlow), so the gyro baseline runs on the same
+    population as the latent age-inference comparison.
+    """
     df = pd.read_csv(csv_path)
     df['GaiaDR3_ID'] = df['GaiaDR3_ID'].astype(str)
+
+    if subset_col and subset_val:
+        if subset_col not in df.columns:
+            raise ValueError(f'--subset_col "{subset_col}" not in {csv_path}; columns: {list(df.columns)}')
+        n0 = len(df)
+        df = df[df[subset_col].isin(subset_val)].reset_index(drop=True)
+        print(f'  subset {subset_col} in {subset_val}: {n0} → {len(df)} rows')
 
     valid_mask = (
         df['age_Myr'].notna() &
@@ -290,7 +305,7 @@ def run_kfold_cv(ages, bprp0, bprp0_err, prot, mem_prob, gaia_ids,
                  n_folds=5, lr=1e-3, weight_decay=1e-4, n_epochs=300, batch_size=64,
                  device=None, seed=42, save_models_dir=None,
                  flow_transforms=8, flow_hidden_features=None,
-                 loga_grid_size=None, lr_decay_rate=None):
+                 loga_grid_size=None, lr_decay_rate=None, loocv_age=False):
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -306,14 +321,20 @@ def run_kfold_cv(ages, bprp0, bprp0_err, prot, mem_prob, gaia_ids,
     loga_grid_t = torch.tensor(np.linspace(PRIOR_LOGA_MYR[0], PRIOR_LOGA_MYR[1], G),
                                dtype=torch.float32)
 
-    # Sample-level fold assignment (all sectors per star already reduced to one row)
-    perm           = np.random.permutation(n_samples)
-    fold_size      = n_samples // n_folds
-    fold_of_sample = np.zeros(n_samples, dtype=int)
-    for f in range(n_folds):
-        s = f * fold_size
-        e = s + fold_size if f < n_folds - 1 else n_samples
-        fold_of_sample[perm[s:e]] = f
+    if loocv_age:
+        # Identical LOCO grouping to kfold_age_inference (shared helper) so the
+        # gyro baseline is a perfect apples-to-apples comparison.
+        fold_of_sample, n_folds = loocv_age_folds(ages)
+        print(f'Leave-one-cluster-out (age-grouped, ChronoFlow proxy): {n_folds} folds')
+    else:
+        # Sample-level fold assignment (all sectors per star already reduced to one row)
+        perm           = np.random.permutation(n_samples)
+        fold_size      = n_samples // n_folds
+        fold_of_sample = np.zeros(n_samples, dtype=int)
+        for f in range(n_folds):
+            s = f * fold_size
+            e = s + fold_size if f < n_folds - 1 else n_samples
+            fold_of_sample[perm[s:e]] = f
 
     stat_keys = ('median', 'mean', 'map', 'p16', 'p84')
     all_stats   = {k: np.zeros(n_samples) for k in stat_keys}
@@ -350,7 +371,8 @@ def run_kfold_cv(ages, bprp0, bprp0_err, prot, mem_prob, gaia_ids,
 
         val_pred_log = val_stats['median']
         val_mae  = np.mean(np.abs(val_pred_log - y[val_idx]))
-        val_corr = np.corrcoef(val_pred_log, y[val_idx])[0, 1]
+        val_corr = (np.corrcoef(val_pred_log, y[val_idx])[0, 1]
+                    if np.std(y[val_idx]) > 0 else np.nan)   # undefined for single-age LOCO folds
         print(f'  Fold {fold + 1}/{n_folds}: best_val_nll={best_nll:.4f}  '
               f'val_MAE={val_mae:.3f} dex  val_r={val_corr:.3f}')
 
@@ -509,7 +531,13 @@ def main():
     parser.add_argument('--load_latents', type=str, default=None,
                         help='Path to latents cache (.npz). If provided, gyro data is '
                              'filtered to only stars present in the cache (i.e. stars '
-                             'with TESS light curves).')
+                             'with TESS light curves) — use to match the latent run star set.')
+    parser.add_argument('--subset_col', type=str, default=None,
+                        help='Keep only rows where this column is in --subset_val (e.g. ref).')
+    parser.add_argument('--subset_val', type=str, nargs='+', default=None)
+    parser.add_argument('--loocv_age', action='store_true',
+                        help='Leave-one-cluster-out CV using the shared age grouping '
+                             '(identical folds to kfold_age_inference --loocv_age).')
 
     args   = parser.parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -519,7 +547,8 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print('\n=== Loading gyro data ===')
-    ages, bprp0, bprp0_err, prot, mem_prob, gaia_ids, _ = load_gyro_data(args.age_csv)
+    ages, bprp0, bprp0_err, prot, mem_prob, gaia_ids, _ = load_gyro_data(
+        args.age_csv, subset_col=args.subset_col, subset_val=args.subset_val)
 
     if args.load_latents:
         print(f'\n=== Filtering to stars with light curves (from {args.load_latents}) ===')
@@ -544,6 +573,7 @@ def main():
     predictions, pred_stats, true_ages, bprp0, prot, gaia_ids, fold_assignments, fold_losses = run_kfold_cv(
         ages, bprp0, bprp0_err, prot, mem_prob, gaia_ids,
         n_folds=args.n_folds,
+        loocv_age=args.loocv_age,
         lr=args.lr,
         lr_decay_rate=args.lr_decay_rate,
         weight_decay=args.weight_decay,
