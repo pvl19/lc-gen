@@ -146,6 +146,25 @@ def test_adversary_rejects_pca_encoder():
                      encoder_type='pca', sectors=d['sectors'], adv_sector_weight=1.0)
 
 
+def test_loocv_age_one_fold_per_age():
+    """Leave-one-age-out: n_folds overridden to #unique ages; each fold = one age; all predicted."""
+    rng = np.random.default_rng(3)
+    cluster_ages = [10., 50., 200., 700., 2000.]   # 5 discrete "clusters"
+    ages = np.array([ca for ca in cluster_ages for _ in range(12)], dtype=np.float32)
+    N = len(ages)
+    d = dict(
+        latent_vectors=rng.standard_normal((N, 16)).astype(np.float32),
+        ages=ages, bprp0=rng.uniform(.5, 2.5, N).astype(np.float32),
+        bprp0_err=rng.uniform(.01, .1, N).astype(np.float32),
+        mg=rng.uniform(0, 8, N).astype(np.float32), mem_prob=np.full(N, .9, np.float32),
+        tic_ids=np.arange(N), sectors=rng.integers(0, 6, N))
+    preds, stats, a, tics, folds, losses, _ = _run({'loocv_age': True}, d=d)
+    assert len(np.unique(folds)) == 5            # one fold per unique age (n_folds override)
+    assert np.isfinite(preds).all()              # every star held out once and predicted
+    for f in np.unique(folds):                   # each fold holds a single age
+        assert len(np.unique(a[folds == f])) == 1
+
+
 def test_sector_options_require_sectors():
     d = _synth()
     with pytest.raises(ValueError):

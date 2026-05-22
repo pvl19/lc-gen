@@ -1698,7 +1698,8 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
                  sectors=None,
                  sector_level_split=False, sector_split_drop_star_overlap=True,
                  balance_sector_age=False, n_balance_age_bins=10,
-                 adv_sector_weight=0.0, adv_hidden=64):
+                 adv_sector_weight=0.0, adv_hidden=64,
+                 loocv_age=False):
     """Run k-fold cross-validation.
 
     Args:
@@ -1809,7 +1810,21 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
     if combined_mode and sector_level_split:
         print('  NOTE: combined_mode + sector_level_split — using sector split (combined ignored).')
         combined_mode = False
-    if sector_level_split:
+    if loocv_age:
+        # Leave-one-age-out: each unique age value is its own fold (a cluster proxy
+        # for ChronoFlow, where each cluster carries one isochrone age). Tests
+        # whether a held-out population's age is recovered from OTHER ages' training
+        # data — a cluster-generalization / anti-memorization check. n_folds is
+        # OVERRIDDEN to the number of unique ages. Note: each held-out fold contains
+        # a single age, so per-fold r is undefined (zero age variance); read the
+        # GLOBAL r/MAE over all held-out predictions (plot_kfold_results does this).
+        age_key  = np.round(np.asarray(ages, dtype=np.float64), 4)
+        uniq_age = np.unique(age_key)
+        age2fold = {a: i for i, a in enumerate(uniq_age)}
+        fold_of_sample = np.array([age2fold[a] for a in age_key])
+        n_folds = len(uniq_age)
+        print(f'Leave-one-age-out (cluster proxy): {n_folds} unique ages, held out one at a time')
+    elif sector_level_split:
         # Hold out entire SECTORS per fold so each fold predicts stars observed
         # in sectors absent from training — a proxy for field-star generalization.
         uniq          = np.unique(sec_arr)
@@ -1947,7 +1962,9 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
 
         val_pred_log = val_stats['median']
         val_mae  = np.mean(np.abs(val_pred_log - y_central[val_idx]))  # dex
-        val_corr = np.corrcoef(val_pred_log, y_central[val_idx])[0, 1]
+        # In leave-one-age-out a fold holds a single age (no variance) → r undefined.
+        val_corr = (np.corrcoef(val_pred_log, y_central[val_idx])[0, 1]
+                    if np.std(y_central[val_idx]) > 0 else np.nan)
         print(f'  Fold {fold + 1}/{n_folds}: best_val_nll={train_loss:.4f}  '
               f'val_MAE={val_mae:.3f} dex  val_r={val_corr:.3f}')
 
@@ -2243,6 +2260,12 @@ def main():
                              'Requires --encoder_type mlp/linear.')
     parser.add_argument('--adv_hidden', type=int, default=64,
                         help='Hidden width of the GRL sector-adversary MLP (default 64).')
+    parser.add_argument('--loocv_age', action='store_true',
+                        help='Leave-one-age-out CV: each unique age value is its own fold, held '
+                             'out one at a time (a cluster proxy for ChronoFlow, where each cluster '
+                             'has one isochrone age). Overrides --n_folds. Tests cluster '
+                             'generalization / anti-memorization. Read the GLOBAL r/MAE (per-fold r '
+                             'is undefined since each fold is a single age).')
 
     # Age predictor training
     parser.add_argument('--encoder_type',         type=str,   default='pca',
@@ -2746,6 +2769,7 @@ def main():
         n_balance_age_bins=args.n_balance_age_bins,
         adv_sector_weight=args.adv_sector_weight,
         adv_hidden=args.adv_hidden,
+        loocv_age=args.loocv_age,
     )
 
     # ── Step 4: for predict_mean, save per-sector CSV then average per star ─
