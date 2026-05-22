@@ -1954,14 +1954,19 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
     if save_models_dir is not None:
         save_dir = Path(save_models_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
+        # n_eff < n_folds when sector-disjoint CV skips folds that have no
+        # star-disjoint val rows; index by the actual fold_models length.
+        n_eff = len(fold_models)
         torch.save({
             'fold_models': fold_models,   # list of {'state_dict': ..., 'pca': sklearn.PCA, 'train_losses': ..., 'val_losses': ...}
             'normalization_params': norm_params,
             'pca_dim': pca_dim,
-            'n_folds': n_folds,
+            'n_folds': n_eff,
             'seed': seed,
         }, save_dir / 'kfold_models.pt')
-        print(f'Saved {n_folds} fold models to {save_dir / "kfold_models.pt"}')
+        print(f'Saved {n_eff} fold models to {save_dir / "kfold_models.pt"}'
+              + (f' ({n_folds - n_eff} fold(s) skipped — no star-disjoint val rows)'
+                 if n_eff < n_folds else ''))
 
         import json
         loss_curves = {
@@ -1969,7 +1974,7 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
                 'train_nll': fold_models[f]['train_losses'],
                 'val_nll':   fold_models[f]['val_losses'],
             }
-            for f in range(n_folds)
+            for f in range(n_eff)
         }
         with open(save_dir / 'training_curves.json', 'w') as fp:
             json.dump(loss_curves, fp)

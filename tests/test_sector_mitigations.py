@@ -84,15 +84,15 @@ def _synth(n_stars=40, n_sectors=6, D=16, seed=0):
         tic_ids=np.array(tic), sectors=np.array(sec))
 
 
-def _run(extra):
-    d = _synth()
+def _run(extra, d=None, save_models_dir=None):
+    d = d or _synth()
     return run_kfold_cv(
         d['latent_vectors'], d['ages'], d['bprp0'], d['bprp0_err'], d['mg'],
         d['mem_prob'], d['tic_ids'], n_folds=3, pca_dim=4, lr=1e-3,
         weight_decay=1e-4, n_epochs=2, batch_size=16, device=torch.device('cpu'),
         seed=0, encoder_type='mlp', mlp_encoder_hidden=[8], flow_transforms=2,
         flow_hidden_features=[8], training_stages='joint', sectors=d['sectors'],
-        **extra)
+        save_models_dir=save_models_dir, **extra)
 
 
 def test_sector_disjoint_cv_runs_and_drops_overlap():
@@ -101,6 +101,30 @@ def test_sector_disjoint_cv_runs_and_drops_overlap():
     assert np.isfinite(preds).any()                   # some rows predicted
     # star-overlap drop should leave at least one unpredicted (NaN) row
     assert np.isnan(preds).any()
+
+
+def test_sector_disjoint_with_save_survives_skipped_fold(tmp_path):
+    """A held-out sector whose stars all appear in training sectors empties a fold;
+    the model/curve save must index by the actual fold count, not n_folds."""
+    rng = np.random.default_rng(1)
+    tic, sec = [], []
+    # Stars 0-29 each span sectors {0,1,2} → in 3-fold sector-disjoint CV, every
+    # held-out sector's stars also appear in a training sector → folds get emptied.
+    for s in range(30):
+        for sv in (0, 1, 2):
+            tic.append(s); sec.append(sv)
+    N = len(tic)
+    d = dict(
+        latent_vectors=rng.standard_normal((N, 16)).astype(np.float32),
+        ages=(10 ** rng.uniform(1.0, 3.3, N)).astype(np.float32),
+        bprp0=rng.uniform(0.5, 2.5, N).astype(np.float32),
+        bprp0_err=rng.uniform(0.01, 0.1, N).astype(np.float32),
+        mg=rng.uniform(0.0, 8.0, N).astype(np.float32),
+        mem_prob=np.full(N, 0.9, np.float32),
+        tic_ids=np.array(tic), sectors=np.array(sec))
+    # Must not raise (this is the IndexError regression).
+    _run({'sector_level_split': True}, d=d, save_models_dir=str(tmp_path))
+    assert (tmp_path / 'kfold_models.pt').exists()
 
 
 def test_balance_sector_age_runs():
