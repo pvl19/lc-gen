@@ -412,11 +412,14 @@ class MetadataStandardizer:
     Normalization rules:
         - sector: divide by 100
         - cadence_s, Tmag, parallax, parallax_error,
-          G0, G0_err, BPRP0_err, mean_flux, std_flux: log10 transform
+          G0, G0_err, BPRP0_err, median_flux, iqr_half_flux: log10 transform
         - BPRP0, camera, ccd: raw (no transformation)
     """
 
-    # Fields that get log10 transformed
+    # Fields that get log10 transformed.
+    # NOTE: the flux fields are 'median_flux'/'iqr_half_flux' (the actual H5 names).
+    # They were previously listed as 'mean_flux'/'std_flux', which silently fell
+    # through to raw — feeding the metadata encoder values up to ~1e7.
     LOG10_FIELDS = {
         'cadence_s',
         'Tmag',
@@ -425,8 +428,8 @@ class MetadataStandardizer:
         'G0',
         'G0_err',
         'BPRP0_err',
-        'mean_flux',
-        'std_flux',
+        'median_flux',
+        'iqr_half_flux',
     }
 
     # Fields that get divided by a constant
