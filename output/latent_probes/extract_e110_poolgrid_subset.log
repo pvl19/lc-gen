@@ -1,0 +1,133 @@
+Loaded model from /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110/best_model.pt (hidden=64, direction=bi, num_meta=13, meta_use_mask=False, conv=False, flow=True)
+Pool grid (7 configs): ['glob-uniform__seg-equal_count', 'glob-uniform__seg-equal_time_carry', 'glob-voronoi__seg-equal_count', 'glob-voronoi__seg-equal_time_carry', 'glob-voronoi_capped__seg-equal_count', 'glob-voronoi_capped__seg-equal_time_carry', 'legacy-timeaware']
+
+=== pretrain: /Users/philvanlane/Documents/lc_ae/final_pretrain/timeseries_pretrain.h5 (max_samples=10000) ===
+Loaded ages for 31873/40662 light curves (78.4%)
+Stratified sampling: 10000 samples across 20 log-age bins
+  Age range: 1.5 - 8165.0 Myr
+  subset: 10000 stratified-by-age stars
+Extracting latent vectors for 10000 light curves (pooling=multiscale)...
+  Processed 16/10000 light curves
+  Processed 176/10000 light curves
+  Processed 336/10000 light curves
+  Processed 496/10000 light curves
+  Processed 656/10000 light curves
+  Processed 816/10000 light curves
+  Processed 976/10000 light curves
+  Processed 1136/10000 light curves
+  Processed 1296/10000 light curves
+  Processed 1456/10000 light curves
+  Processed 1616/10000 light curves
+  Processed 1776/10000 light curves
+  Processed 1936/10000 light curves
+  Processed 2096/10000 light curves
+  Processed 2256/10000 light curves
+  Processed 2416/10000 light curves
+  Processed 2576/10000 light curves
+  Processed 2736/10000 light curves
+  Processed 2896/10000 light curves
+  Processed 3056/10000 light curves
+  Processed 3216/10000 light curves
+  Processed 3376/10000 light curves
+  Processed 3536/10000 light curves
+  Processed 3696/10000 light curves
+  Processed 3856/10000 light curves
+  Processed 4016/10000 light curves
+  Processed 4176/10000 light curves
+  Processed 4336/10000 light curves
+  Processed 4496/10000 light curves
+  Processed 4656/10000 light curves
+  Processed 4816/10000 light curves
+  Processed 4976/10000 light curves
+  Processed 5136/10000 light curves
+  Processed 5296/10000 light curves
+  Processed 5456/10000 light curves
+  Processed 5616/10000 light curves
+  Processed 5776/10000 light curves
+  Processed 5936/10000 light curves
+  Processed 6096/10000 light curves
+  Processed 6256/10000 light curves
+  Processed 6416/10000 light curves
+  Processed 6576/10000 light curves
+  Processed 6736/10000 light curves
+  Processed 6896/10000 light curves
+  Processed 7056/10000 light curves
+  Processed 7216/10000 light curves
+  Processed 7376/10000 light curves
+  Processed 7536/10000 light curves
+  Processed 7696/10000 light curves
+  Processed 7856/10000 light curves
+  Processed 8016/10000 light curves
+  Processed 8176/10000 light curves
+  Processed 8336/10000 light curves
+  Processed 8496/10000 light curves
+  Processed 8656/10000 light curves
+  Processed 8816/10000 light curves
+  Processed 8976/10000 light curves
+  Processed 9136/10000 light curves
+  Processed 9296/10000 light curves
+  Processed 9456/10000 light curves
+  Processed 9616/10000 light curves
+  Processed 9776/10000 light curves
+  Processed 9936/10000 light curves
+  [glob-uniform__seg-equal_count] extracted (10000, 1536)
+  [glob-uniform__seg-equal_time_carry] extracted (10000, 1536)
+  [glob-voronoi__seg-equal_count] extracted (10000, 1536)
+  [glob-voronoi__seg-equal_time_carry] extracted (10000, 1536)
+  [glob-voronoi_capped__seg-equal_count] extracted (10000, 1536)
+  [glob-voronoi_capped__seg-equal_time_carry] extracted (10000, 1536)
+  [legacy-timeaware] extracted (10000, 1536)
+Loaded ages for 10000/10000 light curves (100.0%)
+Saved latents cache → /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-uniform__seg-equal_count/latents_pretrain.npz (10000 samples, keys=['latent_vectors', 'ages', 'bprp0', 'gaia_ids', 'tic_ids', 'sectors', 'bprp0_err', 'mg', 'mg_err', 'mem_prob'])
+  saved /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-uniform__seg-equal_count/latents_pretrain.npz  (10000, 1536)
+Saved latents cache → /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-uniform__seg-equal_time_carry/latents_pretrain.npz (10000 samples, keys=['latent_vectors', 'ages', 'bprp0', 'gaia_ids', 'tic_ids', 'sectors', 'bprp0_err', 'mg', 'mg_err', 'mem_prob'])
+  saved /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-uniform__seg-equal_time_carry/latents_pretrain.npz  (10000, 1536)
+Saved latents cache → /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-voronoi__seg-equal_count/latents_pretrain.npz (10000 samples, keys=['latent_vectors', 'ages', 'bprp0', 'gaia_ids', 'tic_ids', 'sectors', 'bprp0_err', 'mg', 'mg_err', 'mem_prob'])
+  saved /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-voronoi__seg-equal_count/latents_pretrain.npz  (10000, 1536)
+Saved latents cache → /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-voronoi__seg-equal_time_carry/latents_pretrain.npz (10000 samples, keys=['latent_vectors', 'ages', 'bprp0', 'gaia_ids', 'tic_ids', 'sectors', 'bprp0_err', 'mg', 'mg_err', 'mem_prob'])
+  saved /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-voronoi__seg-equal_time_carry/latents_pretrain.npz  (10000, 1536)
+Saved latents cache → /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-voronoi_capped__seg-equal_count/latents_pretrain.npz (10000 samples, keys=['latent_vectors', 'ages', 'bprp0', 'gaia_ids', 'tic_ids', 'sectors', 'bprp0_err', 'mg', 'mg_err', 'mem_prob'])
+  saved /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-voronoi_capped__seg-equal_count/latents_pretrain.npz  (10000, 1536)
+Saved latents cache → /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-voronoi_capped__seg-equal_time_carry/latents_pretrain.npz (10000 samples, keys=['latent_vectors', 'ages', 'bprp0', 'gaia_ids', 'tic_ids', 'sectors', 'bprp0_err', 'mg', 'mg_err', 'mem_prob'])
+  saved /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-voronoi_capped__seg-equal_time_carry/latents_pretrain.npz  (10000, 1536)
+Saved latents cache → /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/legacy-timeaware/latents_pretrain.npz (10000 samples, keys=['latent_vectors', 'ages', 'bprp0', 'gaia_ids', 'tic_ids', 'sectors', 'bprp0_err', 'mg', 'mg_err', 'mem_prob'])
+  saved /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/legacy-timeaware/latents_pretrain.npz  (10000, 1536)
+
+=== hosts: /Users/philvanlane/Documents/lc_ae/final_pretrain/timeseries_exop_hosts.h5 (max_samples=6000) ===
+Loaded ages for 905/19969 light curves (4.5%)
+Requested 6000 samples but only 905 have valid ages. Using all.
+  subset: 905 stratified-by-age stars
+Extracting latent vectors for 905 light curves (pooling=multiscale)...
+  Processed 16/905 light curves
+  Processed 176/905 light curves
+  Processed 336/905 light curves
+  Processed 496/905 light curves
+  Processed 656/905 light curves
+  Processed 816/905 light curves
+  [glob-uniform__seg-equal_count] extracted (905, 1536)
+  [glob-uniform__seg-equal_time_carry] extracted (905, 1536)
+  [glob-voronoi__seg-equal_count] extracted (905, 1536)
+  [glob-voronoi__seg-equal_time_carry] extracted (905, 1536)
+  [glob-voronoi_capped__seg-equal_count] extracted (905, 1536)
+  [glob-voronoi_capped__seg-equal_time_carry] extracted (905, 1536)
+  [legacy-timeaware] extracted (905, 1536)
+Loaded ages for 905/905 light curves (100.0%)
+Saved latents cache → /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-uniform__seg-equal_count/latents_hosts.npz (905 samples, keys=['latent_vectors', 'ages', 'bprp0', 'gaia_ids', 'tic_ids', 'sectors', 'bprp0_err', 'mg', 'mg_err', 'mem_prob'])
+  saved /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-uniform__seg-equal_count/latents_hosts.npz  (905, 1536)
+Saved latents cache → /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-uniform__seg-equal_time_carry/latents_hosts.npz (905 samples, keys=['latent_vectors', 'ages', 'bprp0', 'gaia_ids', 'tic_ids', 'sectors', 'bprp0_err', 'mg', 'mg_err', 'mem_prob'])
+  saved /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-uniform__seg-equal_time_carry/latents_hosts.npz  (905, 1536)
+Saved latents cache → /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-voronoi__seg-equal_count/latents_hosts.npz (905 samples, keys=['latent_vectors', 'ages', 'bprp0', 'gaia_ids', 'tic_ids', 'sectors', 'bprp0_err', 'mg', 'mg_err', 'mem_prob'])
+  saved /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-voronoi__seg-equal_count/latents_hosts.npz  (905, 1536)
+Saved latents cache → /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-voronoi__seg-equal_time_carry/latents_hosts.npz (905 samples, keys=['latent_vectors', 'ages', 'bprp0', 'gaia_ids', 'tic_ids', 'sectors', 'bprp0_err', 'mg', 'mg_err', 'mem_prob'])
+  saved /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-voronoi__seg-equal_time_carry/latents_hosts.npz  (905, 1536)
+Saved latents cache → /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-voronoi_capped__seg-equal_count/latents_hosts.npz (905 samples, keys=['latent_vectors', 'ages', 'bprp0', 'gaia_ids', 'tic_ids', 'sectors', 'bprp0_err', 'mg', 'mg_err', 'mem_prob'])
+  saved /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-voronoi_capped__seg-equal_count/latents_hosts.npz  (905, 1536)
+Saved latents cache → /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-voronoi_capped__seg-equal_time_carry/latents_hosts.npz (905 samples, keys=['latent_vectors', 'ages', 'bprp0', 'gaia_ids', 'tic_ids', 'sectors', 'bprp0_err', 'mg', 'mg_err', 'mem_prob'])
+  saved /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-voronoi_capped__seg-equal_time_carry/latents_hosts.npz  (905, 1536)
+Saved latents cache → /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/legacy-timeaware/latents_hosts.npz (905 samples, keys=['latent_vectors', 'ages', 'bprp0', 'gaia_ids', 'tic_ids', 'sectors', 'bprp0_err', 'mg', 'mg_err', 'mem_prob'])
+  saved /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/legacy-timeaware/latents_hosts.npz  (905, 1536)
+
+DONE — probe with:
+  python scripts/sector_partial_probe.py \
+    /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-uniform__seg-equal_count /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-uniform__seg-equal_time_carry /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-voronoi__seg-equal_count /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-voronoi__seg-equal_time_carry /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-voronoi_capped__seg-equal_count /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/glob-voronoi_capped__seg-equal_time_carry /Users/philvanlane/Documents/lc_ae/final_model/parallel_fixed/e110_poolgrid_subset/legacy-timeaware \
+    e110
