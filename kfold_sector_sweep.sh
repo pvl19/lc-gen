@@ -11,14 +11,10 @@
 # Reduced N_EPOCHS (150 vs the 300 headline) for sweep turnaround — relative
 # comparisons hold; bump back to 300 for the final config.
 #
-# Matrix:
-#   baseline_starsplit  predict_mean (star-disjoint, no leakage) — the reference r/MAE
-#   secdisjoint         none + --sector_level_split — held-out-sector generalization
-#                       (gap vs baseline = sector reliance)
-#   secdisjoint_balance + --balance_sector_age
-#   secdisjoint_adv0.3  + --adv_sector_weight 0.3   } adversary λ sweep — does it close
-#   secdisjoint_adv0.5  + --adv_sector_weight 0.5   } the generalization gap without
-#   secdisjoint_adv1.0  + --adv_sector_weight 1.0   } hurting in-distribution accuracy?
+# Matrix: a baseline (predict_mean star-disjoint reference) + the mitigation set
+# {plain secdisjoint, balance, adv 0.3/0.5/1.0} run under BOTH holdout variants
+# (__sectoronly and __stardisjoint, see below). Gap vs baseline = sector reliance;
+# the adversary λ sweep asks whether it closes the gap without hurting accuracy.
 
 OUTBASE="final_model/meta_mask/e50/sector-robust/sweep"
 
@@ -37,14 +33,30 @@ COMMON="--load_latents final_model/meta_mask/e50/metaAll/latents_pretrain.npz \
   --training_stages three_stage --encoder_pretrain_epochs 40 --joint_finetune_epochs 40 \
   --finetune_encoder_lr_mult 0.1 --finetune_flow_lr_mult 0.1"
 
+# Two holdout variants — BOTH hold the SECTOR out of training (--sector_level_split):
+#   __sectoronly  : sector held out; the star MAY appear via another sector
+#                   (--sector_split_keep_star_overlap). Larger holdout; the primary
+#                   "sector not seen in training" reading.
+#   __stardisjoint: sector AND star both held out (default star-overlap drop).
+#                   Stricter (unseen star in an unseen sector); smaller holdout.
+SD="--star_aggregation none --sector_level_split"
+KEEP="--sector_split_keep_star_overlap"
+
 # name : extra flags (sequential)
 points=(
-  "baseline_starsplit:--star_aggregation predict_mean"
-  "secdisjoint:--star_aggregation none --sector_level_split"
-  "secdisjoint_balance:--star_aggregation none --sector_level_split --balance_sector_age"
-  "secdisjoint_adv0.3:--star_aggregation none --sector_level_split --adv_sector_weight 0.3"
-  "secdisjoint_adv0.5:--star_aggregation none --sector_level_split --adv_sector_weight 0.5"
-  "secdisjoint_adv1.0:--star_aggregation none --sector_level_split --adv_sector_weight 1.0"
+  "baseline:--star_aggregation predict_mean"
+  # --- sector-only (primary) ---
+  "secdisjoint__sectoronly:${SD} ${KEEP}"
+  "balance__sectoronly:${SD} ${KEEP} --balance_sector_age"
+  "adv0.3__sectoronly:${SD} ${KEEP} --adv_sector_weight 0.3"
+  "adv0.5__sectoronly:${SD} ${KEEP} --adv_sector_weight 0.5"
+  "adv1.0__sectoronly:${SD} ${KEEP} --adv_sector_weight 1.0"
+  # --- star-disjoint (stricter) ---
+  "secdisjoint__stardisjoint:${SD}"
+  "balance__stardisjoint:${SD} --balance_sector_age"
+  "adv0.3__stardisjoint:${SD} --adv_sector_weight 0.3"
+  "adv0.5__stardisjoint:${SD} --adv_sector_weight 0.5"
+  "adv1.0__stardisjoint:${SD} --adv_sector_weight 1.0"
 )
 
 for entry in "${points[@]}"; do
