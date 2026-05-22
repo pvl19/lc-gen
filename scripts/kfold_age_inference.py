@@ -58,6 +58,24 @@ P_OUTLIER     = 0.05                   # outlier fraction per star
 # Model
 # ---------------------------------------------------------------------------
 
+class GradReverse(torch.autograd.Function):
+    """Gradient Reversal Layer (Ganin & Lempitsky 2015).
+
+    Identity on the forward pass; multiplies the gradient by -lambda on the
+    backward pass. Placed between the bottleneck and a sector classifier so that
+    minimising the classifier's loss pushes the *encoder* to make the bottleneck
+    sector-INVARIANT (while the classifier itself still learns to read sector).
+    """
+    @staticmethod
+    def forward(ctx, x, lambda_):
+        ctx.lambda_ = float(lambda_)
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.lambda_, None
+
+
 class AgePredictor(nn.Module):
     """Neural Likelihood Estimation via NSF:
     models p(z_pca | log10_age, BPRP0, log10(BPRP0_err), log10(MG_quick)).
@@ -198,7 +216,9 @@ class AgePredictorMLP(nn.Module):
                  aux_loss_weight: float = 1.0,
                  use_mg: bool = False,
                  dropout: float = 0.1,
-                 variance_reg_weight: float = 0.0):
+                 variance_reg_weight: float = 0.0,
+                 n_sectors: int = 0,
+                 adv_hidden: int = 64):
         super().__init__()
         if zuko is None:
             raise ImportError("zuko is required for the flow head. Install with: pip install zuko")
@@ -232,6 +252,19 @@ class AgePredictorMLP(nn.Module):
             transforms=flow_transforms,
             hidden_features=flow_hidden_features,
         )
+
+        # Optional gradient-reversal sector adversary on the bottleneck. Trained to
+        # predict sector from z; the GRL flips its gradient into the encoder, pushing
+        # z toward sector-invariance while the flow still fits age. Discarded at
+        # inference (predict_stats never touches it).
+        self.n_sectors = n_sectors
+        if n_sectors > 0:
+            self.sector_adversary = nn.Sequential(
+                nn.Linear(bottleneck_dim, adv_hidden), nn.ReLU(),
+                nn.Linear(adv_hidden, n_sectors),
+            )
+        else:
+            self.sector_adversary = None
 
     def _per_sample_nll(self, log_prob_flow: torch.Tensor, z: torch.Tensor,
                          mem_prob: torch.Tensor = None) -> torch.Tensor:
@@ -290,10 +323,19 @@ class AgePredictorMLP(nn.Module):
         context = torch.stack(parts, dim=1)
         return self._nll_with_outlier(self.flow(context).log_prob(z), z, mem_prob)
 
+    def _adversary_loss(self, z: torch.Tensor, sector_idx: torch.Tensor,
+                        adv_lambda: float) -> torch.Tensor:
+        """Cross-entropy of the GRL sector adversary (0 if disabled)."""
+        if (self.sector_adversary is None or sector_idx is None or adv_lambda <= 0):
+            return z.new_zeros(())
+        logits = self.sector_adversary(GradReverse.apply(z, adv_lambda))
+        return nn.functional.cross_entropy(logits, sector_idx)
+
     def forward(self, x: torch.Tensor, log_age: torch.Tensor,
                 bprp0: torch.Tensor, log_bprp0_err: torch.Tensor,
                 log_mg: torch.Tensor = None, mem_prob: torch.Tensor = None,
-                loss_mode: str = 'full') -> torch.Tensor:
+                loss_mode: str = 'full',
+                sector_idx: torch.Tensor = None, adv_lambda: float = 0.0) -> torch.Tensor:
         """Compute loss.
 
         loss_mode:
@@ -305,6 +347,10 @@ class AgePredictorMLP(nn.Module):
         estimator, so it always trains against the per-star central age (mean
         over K when multi-sample); per-sample MC on the aux head would just
         add noise without changing the L1 minimizer in expectation.
+
+        sector_idx / adv_lambda: when the GRL adversary is enabled, add its
+        cross-entropy to the encoder-training losses ('full', 'aux_only'). Skipped
+        for 'nll_only' (the encoder is frozen there, so the GRL push is moot).
         """
         z         = self.encoder(x)
         aux_target = log_age.mean(dim=1) if log_age.dim() == 2 else log_age
@@ -312,6 +358,7 @@ class AgePredictorMLP(nn.Module):
         if loss_mode == 'aux_only':
             aux  = torch.mean(torch.abs(self.aux_age_head(z).squeeze(1) - aux_target))
             loss = aux  # weight is irrelevant when aux is the only loss term
+            loss = loss + self._adversary_loss(z, sector_idx, adv_lambda)
         elif loss_mode == 'nll_only':
             return self._flow_nll(z, log_age, bprp0, log_bprp0_err, log_mg, mem_prob)
         else:  # 'full'
@@ -322,6 +369,7 @@ class AgePredictorMLP(nn.Module):
             nll_scale = nll.detach().abs().clamp(min=1e-4)
             aux_scale = aux.detach().abs().clamp(min=1e-4)
             loss = nll + self.aux_loss_weight * (nll_scale / aux_scale) * aux
+            loss = loss + self._adversary_loss(z, sector_idx, adv_lambda)
 
         if self.variance_reg_weight > 0 and z.shape[0] > 1:
             std      = z.std(dim=0)
@@ -1347,7 +1395,10 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
                       training_stages='joint', encoder_pretrain_epochs=100,
                       joint_finetune_epochs=50, finetune_encoder_lr_mult=0.01,
                       finetune_flow_lr_mult=0.1,
-                      prediction_mode='nle'):
+                      prediction_mode='nle',
+                      sectors_idx_train=None, n_sectors=0,
+                      balance_sector_age=False, n_balance_age_bins=10,
+                      adv_sector_weight=0.0, adv_hidden=64):
     """Train one fold of NLE *or* NPE model.
 
     prediction_mode:
@@ -1374,6 +1425,13 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
         loga_grid = torch.tensor(LOGA_GRID, dtype=torch.float32, device=device)
 
     fold_pca = None
+
+    # Sector-aware training switches (both need the NLE MLP/linear encoder).
+    use_adv     = adv_sector_weight > 0 and n_sectors > 0 and sectors_idx_train is not None
+    use_balance = balance_sector_age and sectors_idx_train is not None
+    if use_adv and (encoder_type == 'pca' or prediction_mode != 'nle'):
+        raise ValueError("adv_sector_weight requires encoder_type in {mlp, linear} and "
+                         "prediction_mode='nle' (the adversary attaches to the MLP bottleneck).")
 
     if prediction_mode == 'npe' and encoder_type == 'pca':
         raise ValueError("prediction_mode='npe' requires encoder_type='mlp' or 'linear' "
@@ -1431,8 +1489,14 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
                 use_mg=use_mg,
                 dropout=dropout,
                 variance_reg_weight=variance_reg_weight,
+                n_sectors=(n_sectors if use_adv else 0),
+                adv_hidden=adv_hidden,
             ).to(device)
 
+    # Sector index per row (zeros placeholder when sector-aware training is off);
+    # always present so the batch loop can unpack a fixed-width tuple.
+    sec_train_np = (sectors_idx_train.astype(np.int64) if sectors_idx_train is not None
+                    else np.zeros(len(Z_train), dtype=np.int64))
     train_dataset = TensorDataset(
         torch.tensor(Z_train,         dtype=torch.float32, device=device),
         torch.tensor(y_train,         dtype=torch.float32, device=device),
@@ -1440,8 +1504,26 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
         torch.tensor(bprp0_err_train, dtype=torch.float32, device=device),
         torch.tensor(mg_train,        dtype=torch.float32, device=device),
         torch.tensor(mem_prob_train,  dtype=torch.float32, device=device),
+        torch.tensor(sec_train_np,    dtype=torch.long,    device=device),
     )
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    if use_balance:
+        # Flatten the (sector × age-bin) joint so over-represented cluster cells
+        # stop dominating the gradient and the model can't lean on sector→age.
+        from torch.utils.data import WeightedRandomSampler
+        y_bin_src = y_train if y_train.ndim == 1 else y_train.mean(axis=1)
+        edges   = np.linspace(np.min(y_bin_src), np.max(y_bin_src) + 1e-6, n_balance_age_bins + 1)
+        age_bin = np.clip(np.digitize(y_bin_src, edges) - 1, 0, n_balance_age_bins - 1)
+        cell    = sectors_idx_train.astype(np.int64) * n_balance_age_bins + age_bin
+        uniq_cell, counts = np.unique(cell, return_counts=True)
+        cell_count = dict(zip(uniq_cell.tolist(), counts.tolist()))
+        w = np.array([1.0 / cell_count[int(c)] for c in cell], dtype=np.float64)
+        sampler = WeightedRandomSampler(torch.as_tensor(w / w.sum(), dtype=torch.double),
+                                        num_samples=len(Z_train), replacement=True)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
+        print(f'    balance_sector_age: flattening {len(uniq_cell)} (sector × age-bin) '
+              f'cells over {len(Z_train)} rows.')
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
     Z_val_t        = torch.tensor(Z_val,         dtype=torch.float32, device=device)
     bprp0_val_t    = torch.tensor(bprp0_val,     dtype=torch.float32, device=device)
@@ -1454,6 +1536,8 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
     val_losses   = []
     best_loss  = float('inf')
     best_state = None
+    epochs_done = 0            # global epoch counter for the adversary λ ramp
+    adv_total   = max(n_epochs, 1)
 
     def _run_stage(params, n_stage_epochs, stage_lr, loss_mode='full', label='',
                    optimizer=None):
@@ -1463,17 +1547,29 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
         state across stages). Otherwise build a fresh AdamW from `params`.
         Returns the optimizer used so the caller can pass it to the next stage.
         """
-        nonlocal best_loss, best_state
+        nonlocal best_loss, best_state, epochs_done
         opt = optimizer if optimizer is not None else optim.AdamW(
             params, lr=stage_lr, weight_decay=weight_decay)
         sched = CombinedLRScheduler(opt, n_epochs=n_stage_epochs, initial_lr=stage_lr,
                                     decay_rate=lr_decay_rate)
         for _ in range(n_stage_epochs):
+            # DANN λ ramp 0→adv_sector_weight over the full epoch budget — a high λ
+            # from step 0 collapses the bottleneck before it learns anything.
+            if use_adv:
+                p = min(epochs_done / max(adv_total - 1, 1), 1.0)
+                cur_lambda = adv_sector_weight * (2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0)
+            else:
+                cur_lambda = 0.0
             model.train()
             epoch_loss = 0.0
-            for Z_b, y_b, bprp0_b, bprp0_err_b, mg_b, mem_prob_b in train_loader:
+            for Z_b, y_b, bprp0_b, bprp0_err_b, mg_b, mem_prob_b, sec_b in train_loader:
                 opt.zero_grad()
-                if isinstance(model, (AgePredictorMLP, AgePredictorNPE)):
+                if isinstance(model, AgePredictorMLP):
+                    loss = model(Z_b, y_b, bprp0_b, bprp0_err_b, mg_b, mem_prob_b,
+                                 loss_mode=loss_mode,
+                                 sector_idx=(sec_b if use_adv else None),
+                                 adv_lambda=cur_lambda)
+                elif isinstance(model, AgePredictorNPE):
                     loss = model(Z_b, y_b, bprp0_b, bprp0_err_b, mg_b, mem_prob_b,
                                  loss_mode=loss_mode)
                 else:
@@ -1483,6 +1579,7 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
                 epoch_loss += loss.item() * len(Z_b)
             epoch_loss /= len(Z_train)
             train_losses.append(epoch_loss)
+            epochs_done += 1
 
             model.eval()
             with torch.no_grad():
@@ -1597,7 +1694,11 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
                  train_full=False, source=None,
                  skip_log10=False, age_grid_range=None,
                  age_err=None, k_age_samples=1,
-                 prediction_mode='nle'):
+                 prediction_mode='nle',
+                 sectors=None,
+                 sector_level_split=False, sector_split_drop_star_overlap=True,
+                 balance_sector_age=False, n_balance_age_bins=10,
+                 adv_sector_weight=0.0, adv_hidden=64):
     """Run k-fold cross-validation.
 
     Args:
@@ -1684,11 +1785,47 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
     loga_grid_np = np.linspace(grid_min, grid_max, G)
     loga_grid_t  = torch.tensor(loga_grid_np, dtype=torch.float32)
 
+    # Sector handling for the disjoint-CV / balancing / adversary options.
+    # All three need a per-sample sector, which only exists for the per-sector
+    # aggregations ('none' / 'predict_mean'); aggregated modes collapse sectors.
+    needs_sector = sector_level_split or balance_sector_age or adv_sector_weight > 0
+    if needs_sector and sectors is None:
+        raise ValueError(
+            'sector_level_split / balance_sector_age / adv_sector_weight require '
+            'per-sample `sectors` — run with --star_aggregation none (or predict_mean).')
+    sec_arr = np.asarray(sectors) if sectors is not None else None
+    if sec_arr is not None:
+        uniq_sec    = np.unique(sec_arr)
+        sec_to_idx  = {int(s): i for i, s in enumerate(uniq_sec)}
+        sec_idx_all = np.array([sec_to_idx[int(s)] for s in sec_arr], dtype=np.int64)
+        n_sectors   = len(uniq_sec)
+    else:
+        sec_idx_all, n_sectors = None, 0
+
     # Build fold assignments
     fold_of_sample = np.zeros(n_samples, dtype=int)
 
     combined_mode = source is not None
-    if combined_mode:
+    if combined_mode and sector_level_split:
+        print('  NOTE: combined_mode + sector_level_split — using sector split (combined ignored).')
+        combined_mode = False
+    if sector_level_split:
+        # Hold out entire SECTORS per fold so each fold predicts stars observed
+        # in sectors absent from training — a proxy for field-star generalization.
+        uniq          = np.unique(sec_arr)
+        perm          = np.random.permutation(len(uniq))
+        secs_shuffled = uniq[perm]
+        fold_size     = max(len(secs_shuffled) // n_folds, 1)
+        sec_fold      = {}
+        for f in range(n_folds):
+            s = f * fold_size
+            e = s + fold_size if f < n_folds - 1 else len(secs_shuffled)
+            for sv in secs_shuffled[s:e]:
+                sec_fold[int(sv)] = f
+        fold_of_sample = np.array([sec_fold[int(s)] for s in sec_arr])
+        print(f'Sector-disjoint split: {len(uniq)} unique sectors across {n_folds} folds '
+              f'(star-overlap drop={sector_split_drop_star_overlap}).')
+    elif combined_mode:
         # K-fold over host stars only; non-host (source==0) rows always train
         host_mask    = (source == 1)
         host_idx_all = np.where(host_mask)[0]
@@ -1732,7 +1869,9 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
 
     # One array per posterior statistic (all in log10_age space)
     stat_keys = ('median', 'mean', 'map', 'p16', 'p84')
-    all_stats   = {k: np.zeros(n_samples) for k in stat_keys}
+    # NaN init: in sector-disjoint mode some rows are intentionally never predicted
+    # (star-overlap drop). Normal modes predict every row, so no NaN survives.
+    all_stats   = {k: np.full(n_samples, np.nan) for k in stat_keys}
     fold_losses = []
     fold_models = []
 
@@ -1746,6 +1885,23 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
             train_idx = np.where((source == 0) | ((source == 1) & (fold_of_sample != fold)))[0]
         else:
             train_idx = np.where(fold_of_sample != fold)[0]
+
+        # Sector-disjoint CV: optionally drop val rows whose star ALSO appears in a
+        # training sector, so the held-out evaluation is star-disjoint too (a true
+        # "unseen star in an unseen sector" estimate). Dropped rows stay NaN.
+        if sector_level_split and sector_split_drop_star_overlap:
+            train_tics = set(int(t) for t in tic_ids[train_idx])
+            keep = np.array([int(t) not in train_tics for t in tic_ids[val_idx]], dtype=bool)
+            n_drop = int((~keep).sum())
+            val_idx = val_idx[keep]
+            if n_drop:
+                print(f'    Fold {fold + 1}: dropped {n_drop} val rows whose star also '
+                      f'appears in a training sector (star-disjoint).')
+            if len(val_idx) == 0:
+                print(f'    Fold {fold + 1}: no star-disjoint val rows left; skipping fold.')
+                continue
+
+        sec_idx_train = sec_idx_all[train_idx] if sec_idx_all is not None else None
 
         X_train, y_train   = X_norm[train_idx],        y[train_idx]
         X_val              = X_norm[val_idx]
@@ -1775,6 +1931,9 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
             finetune_encoder_lr_mult=finetune_encoder_lr_mult,
             finetune_flow_lr_mult=finetune_flow_lr_mult,
             prediction_mode=prediction_mode,
+            sectors_idx_train=sec_idx_train, n_sectors=n_sectors,
+            balance_sector_age=balance_sector_age, n_balance_age_bins=n_balance_age_bins,
+            adv_sector_weight=adv_sector_weight, adv_hidden=adv_hidden,
         )
         fold_models.append({
             'state_dict': model_state, 'pca': fold_pca,
@@ -1841,6 +2000,9 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
             finetune_encoder_lr_mult=finetune_encoder_lr_mult,
             finetune_flow_lr_mult=finetune_flow_lr_mult,
             prediction_mode=prediction_mode,
+            sectors_idx_train=sec_idx_all, n_sectors=n_sectors,
+            balance_sector_age=balance_sector_age, n_balance_age_bins=n_balance_age_bins,
+            adv_sector_weight=adv_sector_weight, adv_hidden=adv_hidden,
         )
 
         torch.save({
@@ -1882,6 +2044,23 @@ def plot_kfold_results(predictions, true_ages, bprp0, tic_ids, fold_assignments,
     true_ages:   linear Myr (raw data)
     pred_stats:  dict of log10(age/Myr) arrays: median, mean, map, p16, p84
     """
+    # Drop rows without a prediction (sector-disjoint star-overlap leaves NaNs);
+    # normal modes predict every row, so this is a no-op there.
+    predictions = np.asarray(predictions)
+    true_ages   = np.asarray(true_ages)
+    finite = np.isfinite(predictions) & np.isfinite(true_ages) & (true_ages > 0)
+    if not finite.all():
+        n_drop = int((~finite).sum())
+        print(f'  [metrics] excluding {n_drop} row(s) without a finite prediction '
+              f'(e.g. sector-disjoint star-overlap drops).')
+        predictions = predictions[finite]
+        true_ages   = true_ages[finite]
+        bprp0       = np.asarray(bprp0)[finite]
+        tic_ids     = np.asarray(tic_ids)[finite]
+        fold_assignments = np.asarray(fold_assignments)[finite]
+        if pred_stats is not None:
+            pred_stats = {k: np.asarray(v)[finite] for k, v in pred_stats.items()}
+
     log_true  = np.log10(true_ages)
     log_resid = predictions - log_true   # dex (pred − true)
     mae       = np.mean(np.abs(log_resid))
@@ -2035,6 +2214,30 @@ def main():
     # K-fold
     parser.add_argument('--n_folds',    type=int,   default=10)
     parser.add_argument('--seed',       type=int,   default=42)
+
+    # Sector-confound mitigations (all need per-sample sectors -> use
+    # --star_aggregation none or predict_mean).
+    parser.add_argument('--sector_level_split', action='store_true',
+                        help='Hold out whole SECTORS per fold (sector-disjoint CV) so each '
+                             'fold predicts stars from unseen sectors — a field-star '
+                             'generalization proxy. Replaces the star/sample split.')
+    parser.add_argument('--sector_split_keep_star_overlap', action='store_true',
+                        help='With --sector_level_split, KEEP val rows whose star also '
+                             'appears in a training sector (default: drop them so the '
+                             'held-out set is star-disjoint too).')
+    parser.add_argument('--balance_sector_age', action='store_true',
+                        help='Sample training rows to flatten the (sector x age-bin) joint, '
+                             'so over-represented cluster cells stop dominating and the model '
+                             'cannot lean on sector->age.')
+    parser.add_argument('--n_balance_age_bins', type=int, default=10,
+                        help='Number of age bins for --balance_sector_age (default 10).')
+    parser.add_argument('--adv_sector_weight', type=float, default=0.0,
+                        help='Peak GRL coefficient for the sector adversary on the MLP '
+                             'bottleneck (0 = off). Ramped 0->this over training. Tune on '
+                             'the Pareto front: sector probe down while partial r stays up. '
+                             'Requires --encoder_type mlp/linear.')
+    parser.add_argument('--adv_hidden', type=int, default=64,
+                        help='Hidden width of the GRL sector-adversary MLP (default 64).')
 
     # Age predictor training
     parser.add_argument('--encoder_type',         type=str,   default='pca',
@@ -2531,6 +2734,13 @@ def main():
         finetune_flow_lr_mult=args.finetune_flow_lr_mult,
         train_full=args.train_full,
         source=kfold_source,
+        sectors=kfold_sectors,
+        sector_level_split=args.sector_level_split,
+        sector_split_drop_star_overlap=(not args.sector_split_keep_star_overlap),
+        balance_sector_age=args.balance_sector_age,
+        n_balance_age_bins=args.n_balance_age_bins,
+        adv_sector_weight=args.adv_sector_weight,
+        adv_hidden=args.adv_hidden,
     )
 
     # ── Step 4: for predict_mean, save per-sector CSV then average per star ─
