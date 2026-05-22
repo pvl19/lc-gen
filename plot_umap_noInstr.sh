@@ -15,7 +15,7 @@
 # ablation is in-distribution, not "a genuine zero value").
 
 # === CHANGE THIS to switch versions: metaAll | noInstr | noMeta ===
-META_MODE="metaAll"
+META_MODE="noInstr"
 
 MODEL_PATH="final_model/meta_mask/e50/best_model.pt"
 H5_PATHS="final_pretrain/timeseries_pretrain.h5 final_pretrain/timeseries_exop_hosts.h5 final_pretrain/timeseries_thickdisk.h5"
