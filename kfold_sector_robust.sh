@@ -7,9 +7,17 @@
 # set so runs do not clobber each other.
 #
 # IMPORTANT: these mitigations need a per-sample sector, so STAR_AGGREGATION must
-# be 'none' (per-sector rows) — NOT latent_max. That means results are compared
-# against a per-sector star-split baseline, not the 0.912 latent_max headline.
-# Run BASELINE first (all toggles off) to get that reference, then flip toggles.
+# be 'none' (per-sector rows) — NOT latent_max. So compare against a per-sector
+# baseline, not the 0.912 latent_max headline.
+#
+# Choosing the reference baseline (run this first):
+#   - For a NO-LEAKAGE reference, set STAR_AGGREGATION="predict_mean" with all
+#     toggles off — that splits by star (no multi-sector leakage) and is the fair
+#     comparison for the sector-disjoint run.
+#   - STAR_AGGREGATION="none" with all toggles off uses a sample-level split,
+#     which leaks multi-sector stars across folds (optimistic) — handy as an
+#     upper bound but not the honest reference.
+# The sector-disjoint run itself REQUIRES STAR_AGGREGATION="none" (+ SECTOR_SPLIT).
 #
 #   1. SECTOR_SPLIT       — sector-disjoint CV: hold out whole sectors per fold so
 #                           each fold predicts stars from unseen sectors (field-star
