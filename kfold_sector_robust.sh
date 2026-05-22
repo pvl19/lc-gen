@@ -43,7 +43,10 @@ ADV_HIDDEN=64
 # ===========================================================================
 
 # --- Data / model (load cached per-sector latents; no model fwd needed) ---
-LOAD_LATENTS="final_model/parallel_fixed/e110/latents_pretrain.npz"
+# e50 = chosen pretraining (masked metadata). NOTE: these cached latents use the
+# OLD pooling (voronoi/equal_time/unweighted); the agreed recipe is now the default
+# (uniform/equal_count/dt) — re-extract e50 before the final tuned run.
+LOAD_LATENTS="final_model/meta_mask/e50/metaAll/latents_pretrain.npz"
 AGE_CSV="final_pretrain/all_ages.csv"
 PCA_H5_PATHS="final_pretrain/timeseries_pretrain.h5 final_pretrain/timeseries_exop_hosts.h5"
 
@@ -77,7 +80,7 @@ TAG="baseline"
 [ "${BALANCE_SECTOR_AGE}" = "true" ] && TAG="${TAG}+balance"
 # bash float compare: treat any non-"0.0"/"0" as on
 case "${ADV_SECTOR_WEIGHT}" in 0|0.0|0.00) ;; *) TAG="${TAG}+adv${ADV_SECTOR_WEIGHT}" ;; esac
-OUTPUT_DIR="final_model/parallel_fixed/e110/sector-robust/${STAR_AGGREGATION}__${TAG}"
+OUTPUT_DIR="final_model/meta_mask/e50/sector-robust/${STAR_AGGREGATION}__${TAG}"
 
 echo "Sector-robust age inference:"
 echo "  Latents:          ${LOAD_LATENTS}"
