@@ -1,0 +1,185 @@
+/Users/philvanlane/Documents/lc_ae/.venv/lib/python3.12/site-packages/sklearn/linear_model/_logistic.py:1184: FutureWarning: 'n_jobs' has no effect since 1.8 and will be removed in 1.10. You provided 'n_jobs=-1', please leave it unspecified.
+  warnings.warn(msg, category=FutureWarning)
+/Users/philvanlane/Documents/lc_ae/.venv/lib/python3.12/site-packages/sklearn/linear_model/_logistic.py:406: ConvergenceWarning: lbfgs failed to converge after 200 iteration(s) (status=1):
+STOP: TOTAL NO. OF ITERATIONS REACHED LIMIT
+
+Increase the number of iterations to improve the convergence (max_iter=200).
+You might also want to scale the data as shown in:
+    https://scikit-learn.org/stable/modules/preprocessing.html
+Please also refer to the documentation for alternative solver options:
+    https://scikit-learn.org/stable/modules/linear_model.html#logistic-regression
+  n_iter_i = _check_optimize_result(
+/Users/philvanlane/Documents/lc_ae/.venv/lib/python3.12/site-packages/sklearn/linear_model/_logistic.py:406: ConvergenceWarning: lbfgs failed to converge after 200 iteration(s) (status=1):
+STOP: TOTAL NO. OF ITERATIONS REACHED LIMIT
+
+Increase the number of iterations to improve the convergence (max_iter=200).
+You might also want to scale the data as shown in:
+    https://scikit-learn.org/stable/modules/preprocessing.html
+Please also refer to the documentation for alternative solver options:
+    https://scikit-learn.org/stable/modules/linear_model.html#logistic-regression
+  n_iter_i = _check_optimize_result(
+/Users/philvanlane/Documents/lc_ae/.venv/lib/python3.12/site-packages/sklearn/linear_model/_logistic.py:1184: FutureWarning: 'n_jobs' has no effect since 1.8 and will be removed in 1.10. You provided 'n_jobs=-1', please leave it unspecified.
+  warnings.warn(msg, category=FutureWarning)
+/Users/philvanlane/Documents/lc_ae/.venv/lib/python3.12/site-packages/sklearn/linear_model/_logistic.py:406: ConvergenceWarning: lbfgs failed to converge after 200 iteration(s) (status=1):
+STOP: TOTAL NO. OF ITERATIONS REACHED LIMIT
+
+Increase the number of iterations to improve the convergence (max_iter=200).
+You might also want to scale the data as shown in:
+    https://scikit-learn.org/stable/modules/preprocessing.html
+Please also refer to the documentation for alternative solver options:
+    https://scikit-learn.org/stable/modules/linear_model.html#logistic-regression
+  n_iter_i = _check_optimize_result(
+/Users/philvanlane/Documents/lc_ae/.venv/lib/python3.12/site-packages/sklearn/linear_model/_logistic.py:406: ConvergenceWarning: lbfgs failed to converge after 200 iteration(s) (status=1):
+STOP: TOTAL NO. OF ITERATIONS REACHED LIMIT
+
+Increase the number of iterations to improve the convergence (max_iter=200).
+You might also want to scale the data as shown in:
+    https://scikit-learn.org/stable/modules/preprocessing.html
+Please also refer to the documentation for alternative solver options:
+    https://scikit-learn.org/stable/modules/linear_model.html#logistic-regression
+  n_iter_i = _check_optimize_result(
+/Users/philvanlane/Documents/lc_ae/.venv/lib/python3.12/site-packages/sklearn/linear_model/_logistic.py:1184: FutureWarning: 'n_jobs' has no effect since 1.8 and will be removed in 1.10. You provided 'n_jobs=-1', please leave it unspecified.
+  warnings.warn(msg, category=FutureWarning)
+/Users/philvanlane/Documents/lc_ae/.venv/lib/python3.12/site-packages/sklearn/linear_model/_logistic.py:406: ConvergenceWarning: lbfgs failed to converge after 200 iteration(s) (status=1):
+STOP: TOTAL NO. OF ITERATIONS REACHED LIMIT
+
+Increase the number of iterations to improve the convergence (max_iter=200).
+You might also want to scale the data as shown in:
+    https://scikit-learn.org/stable/modules/preprocessing.html
+Please also refer to the documentation for alternative solver options:
+    https://scikit-learn.org/stable/modules/linear_model.html#logistic-regression
+  n_iter_i = _check_optimize_result(
+/Users/philvanlane/Documents/lc_ae/.venv/lib/python3.12/site-packages/sklearn/linear_model/_logistic.py:406: ConvergenceWarning: lbfgs failed to converge after 200 iteration(s) (status=1):
+STOP: TOTAL NO. OF ITERATIONS REACHED LIMIT
+
+Increase the number of iterations to improve the convergence (max_iter=200).
+You might also want to scale the data as shown in:
+    https://scikit-learn.org/stable/modules/preprocessing.html
+Please also refer to the documentation for alternative solver options:
+    https://scikit-learn.org/stable/modules/linear_model.html#logistic-regression
+  n_iter_i = _check_optimize_result(
+/Users/philvanlane/Documents/lc_ae/.venv/lib/python3.12/site-packages/sklearn/linear_model/_logistic.py:1184: FutureWarning: 'n_jobs' has no effect since 1.8 and will be removed in 1.10. You provided 'n_jobs=-1', please leave it unspecified.
+  warnings.warn(msg, category=FutureWarning)
+/Users/philvanlane/Documents/lc_ae/.venv/lib/python3.12/site-packages/sklearn/linear_model/_logistic.py:406: ConvergenceWarning: lbfgs failed to converge after 200 iteration(s) (status=1):
+STOP: TOTAL NO. OF ITERATIONS REACHED LIMIT
+
+Increase the number of iterations to improve the convergence (max_iter=200).
+You might also want to scale the data as shown in:
+    https://scikit-learn.org/stable/modules/preprocessing.html
+Please also refer to the documentation for alternative solver options:
+    https://scikit-learn.org/stable/modules/linear_model.html#logistic-regression
+  n_iter_i = _check_optimize_result(
+/Users/philvanlane/Documents/lc_ae/.venv/lib/python3.12/site-packages/sklearn/linear_model/_logistic.py:406: ConvergenceWarning: lbfgs failed to converge after 200 iteration(s) (status=1):
+STOP: TOTAL NO. OF ITERATIONS REACHED LIMIT
+
+Increase the number of iterations to improve the convergence (max_iter=200).
+You might also want to scale the data as shown in:
+    https://scikit-learn.org/stable/modules/preprocessing.html
+Please also refer to the documentation for alternative solver options:
+    https://scikit-learn.org/stable/modules/linear_model.html#logistic-regression
+  n_iter_i = _check_optimize_result(
+/Users/philvanlane/Documents/lc_ae/.venv/lib/python3.12/site-packages/sklearn/linear_model/_logistic.py:1184: FutureWarning: 'n_jobs' has no effect since 1.8 and will be removed in 1.10. You provided 'n_jobs=-1', please leave it unspecified.
+  warnings.warn(msg, category=FutureWarning)
+/Users/philvanlane/Documents/lc_ae/.venv/lib/python3.12/site-packages/sklearn/linear_model/_logistic.py:406: ConvergenceWarning: lbfgs failed to converge after 200 iteration(s) (status=1):
+STOP: TOTAL NO. OF ITERATIONS REACHED LIMIT
+
+Increase the number of iterations to improve the convergence (max_iter=200).
+You might also want to scale the data as shown in:
+    https://scikit-learn.org/stable/modules/preprocessing.html
+Please also refer to the documentation for alternative solver options:
+    https://scikit-learn.org/stable/modules/linear_model.html#logistic-regression
+  n_iter_i = _check_optimize_result(
+/Users/philvanlane/Documents/lc_ae/.venv/lib/python3.12/site-packages/sklearn/linear_model/_logistic.py:406: ConvergenceWarning: lbfgs failed to converge after 200 iteration(s) (status=1):
+STOP: TOTAL NO. OF ITERATIONS REACHED LIMIT
+
+Increase the number of iterations to improve the convergence (max_iter=200).
+You might also want to scale the data as shown in:
+    https://scikit-learn.org/stable/modules/preprocessing.html
+Please also refer to the documentation for alternative solver options:
+    https://scikit-learn.org/stable/modules/linear_model.html#logistic-regression
+  n_iter_i = _check_optimize_result(
+
+=== final_model/meta_mask/e50/metaAll: latents=(69319, 1536), unique stars=21477 ===
+  labeled rows: 32171, labeled stars: 9287
+  (A) age-from-X (star-level, 10-fold):
+        sector-only        r=0.7954  MAE=0.2418 dex
+        latent-only        r=0.7070  MAE=0.3305 dex
+        joint              r=0.8196  MAE=0.2377 dex
+        joint - sector     Δr=+0.0243  ΔMAE=-0.0042
+  (B) partial: latent on within-sector residual
+        r=0.3308  MAE=0.2341 dex   (0 = no info beyond sector)
+  (C) sector probe — LABELED stars (latent -> sector_id, 80/20 star-grouped):
+        top-1=0.8060   top-3=0.9230   chance=0.0725
+  (C2) sector probe — ALL stars incl. unlabeled (n=69319):
+        top-1=0.8338   top-3=0.9409   chance=0.0385
+  (259.8s)
+
+=== final_model/meta_mask/e50/noInstr: latents=(69319, 1536), unique stars=21477 ===
+  labeled rows: 32171, labeled stars: 9287
+  (A) age-from-X (star-level, 10-fold):
+        sector-only        r=0.7954  MAE=0.2418 dex
+        latent-only        r=0.7046  MAE=0.3327 dex
+        joint              r=0.8194  MAE=0.2378 dex
+        joint - sector     Δr=+0.0240  ΔMAE=-0.0040
+  (B) partial: latent on within-sector residual
+        r=0.3282  MAE=0.2343 dex   (0 = no info beyond sector)
+  (C) sector probe — LABELED stars (latent -> sector_id, 80/20 star-grouped):
+        top-1=0.8082   top-3=0.9225   chance=0.0725
+  (C2) sector probe — ALL stars incl. unlabeled (n=69319):
+        top-1=0.8346   top-3=0.9403   chance=0.0385
+  (252.8s)
+
+=== final_model/meta_mask/e50/noMeta: latents=(69319, 1536), unique stars=21477 ===
+  labeled rows: 32171, labeled stars: 9287
+  (A) age-from-X (star-level, 10-fold):
+        sector-only        r=0.7954  MAE=0.2418 dex
+        latent-only        r=0.7003  MAE=0.3349 dex
+        joint              r=0.8158  MAE=0.2381 dex
+        joint - sector     Δr=+0.0204  ΔMAE=-0.0037
+  (B) partial: latent on within-sector residual
+        r=0.2915  MAE=0.2345 dex   (0 = no info beyond sector)
+  (C) sector probe — LABELED stars (latent -> sector_id, 80/20 star-grouped):
+        top-1=0.8048   top-3=0.9234   chance=0.0725
+  (C2) sector probe — ALL stars incl. unlabeled (n=69319):
+        top-1=0.8354   top-3=0.9400   chance=0.0385
+  (250.9s)
+
+=== e110_timeaware: latents=(60631, 1536), unique stars=15462 ===
+  labeled rows: 32171, labeled stars: 9287
+  (A) age-from-X (star-level, 10-fold):
+        sector-only        r=0.7954  MAE=0.2418 dex
+        latent-only        r=0.6548  MAE=0.3327 dex
+        joint              r=0.7954  MAE=0.2401 dex
+        joint - sector     Δr=+0.0001  ΔMAE=-0.0017
+  (B) partial: latent on within-sector residual
+        r=0.2623  MAE=0.2364 dex   (0 = no info beyond sector)
+  (C) sector probe — LABELED stars (latent -> sector_id, 80/20 star-grouped):
+        top-1=0.8215   top-3=0.9230   chance=0.0725
+  (C2) sector probe — ALL stars incl. unlabeled (n=60631):
+        top-1=0.8296   top-3=0.9386   chance=0.0439
+  (244.9s)
+
+=== e110_nometa: latents=(60631, 1536), unique stars=15462 ===
+  labeled rows: 32171, labeled stars: 9287
+  (A) age-from-X (star-level, 10-fold):
+        sector-only        r=0.7954  MAE=0.2418 dex
+        latent-only        r=0.7123  MAE=0.3295 dex
+        joint              r=0.8202  MAE=0.2377 dex
+        joint - sector     Δr=+0.0249  ΔMAE=-0.0041
+  (B) partial: latent on within-sector residual
+        r=0.3221  MAE=0.2338 dex   (0 = no info beyond sector)
+  (C) sector probe — LABELED stars (latent -> sector_id, 80/20 star-grouped):
+        top-1=0.8191   top-3=0.9298   chance=0.0725
+  (C2) sector probe — ALL stars incl. unlabeled (n=60631):
+        top-1=0.8307   top-3=0.9366   chance=0.0439
+  (238.6s)
+
+
+SUMMARY
+====================================================================================================
+                          variant  n_stars  r_sector_only  mae_sector_only  r_latent_only  mae_latent_only  r_joint  mae_joint  dr_joint_over_sector  r_residual  mae_residual  probe_top1  probe_top3  probe_chance  probe_top1_all  probe_top3_all  n_all
+final_model/meta_mask/e50/metaAll     9287         0.7954           0.2418         0.7070           0.3305   0.8196     0.2377                0.0243      0.3308        0.2341      0.8060      0.9230        0.0725          0.8338          0.9409  69319
+final_model/meta_mask/e50/noInstr     9287         0.7954           0.2418         0.7046           0.3327   0.8194     0.2378                0.0240      0.3282        0.2343      0.8082      0.9225        0.0725          0.8346          0.9403  69319
+ final_model/meta_mask/e50/noMeta     9287         0.7954           0.2418         0.7003           0.3349   0.8158     0.2381                0.0204      0.2915        0.2345      0.8048      0.9234        0.0725          0.8354          0.9400  69319
+                   e110_timeaware     9287         0.7954           0.2418         0.6548           0.3327   0.7954     0.2401                0.0001      0.2623        0.2364      0.8215      0.9230        0.0725          0.8296          0.9386  60631
+                      e110_nometa     9287         0.7954           0.2418         0.7123           0.3295   0.8202     0.2377                0.0249      0.3221        0.2338      0.8191      0.9298        0.0725          0.8307          0.9366  60631

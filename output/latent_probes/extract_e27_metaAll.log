@@ -1,0 +1,490 @@
+META_MODE=metaAll -> final_model/meta_split/e27/metaAll  (zero flag: 'none')
+/Users/philvanlane/Documents/lc_ae/src/lcgen/models/MetadataAgePredictor.py:467: RuntimeWarning: invalid value encountered in log10
+  values = np.where(values > 0, np.log10(values), np.nan)
+Using device: cpu
+Loaded model from final_model/meta_split/e27/best_model.pt (hidden=64, direction=bi, num_meta=13, meta_use_mask=True, conv=False, flow=True)
+
+--- Processing final_pretrain/timeseries_pretrain.h5 ---
+Extracting latent vectors for 40662 light curves (pooling=multiscale)...
+  Processed 16/40662 light curves
+  Processed 176/40662 light curves
+  Processed 336/40662 light curves
+  Processed 496/40662 light curves
+  Processed 656/40662 light curves
+  Processed 816/40662 light curves
+  Processed 976/40662 light curves
+  Processed 1136/40662 light curves
+  Processed 1296/40662 light curves
+  Processed 1456/40662 light curves
+  Processed 1616/40662 light curves
+  Processed 1776/40662 light curves
+  Processed 1936/40662 light curves
+  Processed 2096/40662 light curves
+  Processed 2256/40662 light curves
+  Processed 2416/40662 light curves
+  Processed 2576/40662 light curves
+  Processed 2736/40662 light curves
+  Processed 2896/40662 light curves
+  Processed 3056/40662 light curves
+  Processed 3216/40662 light curves
+  Processed 3376/40662 light curves
+  Processed 3536/40662 light curves
+  Processed 3696/40662 light curves
+  Processed 3856/40662 light curves
+  Processed 4016/40662 light curves
+  Processed 4176/40662 light curves
+  Processed 4336/40662 light curves
+  Processed 4496/40662 light curves
+  Processed 4656/40662 light curves
+  Processed 4816/40662 light curves
+  Processed 4976/40662 light curves
+  Processed 5136/40662 light curves
+  Processed 5296/40662 light curves
+  Processed 5456/40662 light curves
+  Processed 5616/40662 light curves
+  Processed 5776/40662 light curves
+  Processed 5936/40662 light curves
+  Processed 6096/40662 light curves
+  Processed 6256/40662 light curves
+  Processed 6416/40662 light curves
+  Processed 6576/40662 light curves
+  Processed 6736/40662 light curves
+  Processed 6896/40662 light curves
+  Processed 7056/40662 light curves
+  Processed 7216/40662 light curves
+  Processed 7376/40662 light curves
+  Processed 7536/40662 light curves
+  Processed 7696/40662 light curves
+  Processed 7856/40662 light curves
+  Processed 8016/40662 light curves
+  Processed 8176/40662 light curves
+  Processed 8336/40662 light curves
+  Processed 8496/40662 light curves
+  Processed 8656/40662 light curves
+  Processed 8816/40662 light curves
+  Processed 8976/40662 light curves
+  Processed 9136/40662 light curves
+  Processed 9296/40662 light curves
+  Processed 9456/40662 light curves
+  Processed 9616/40662 light curves
+  Processed 9776/40662 light curves
+  Processed 9936/40662 light curves
+  Processed 10096/40662 light curves
+  Processed 10256/40662 light curves
+  Processed 10416/40662 light curves
+  Processed 10576/40662 light curves
+  Processed 10736/40662 light curves
+  Processed 10896/40662 light curves
+  Processed 11056/40662 light curves
+  Processed 11216/40662 light curves
+  Processed 11376/40662 light curves
+  Processed 11536/40662 light curves
+  Processed 11696/40662 light curves
+  Processed 11856/40662 light curves
+  Processed 12016/40662 light curves
+  Processed 12176/40662 light curves
+  Processed 12336/40662 light curves
+  Processed 12496/40662 light curves
+  Processed 12656/40662 light curves
+  Processed 12816/40662 light curves
+  Processed 12976/40662 light curves
+  Processed 13136/40662 light curves
+  Processed 13296/40662 light curves
+  Processed 13456/40662 light curves
+  Processed 13616/40662 light curves
+  Processed 13776/40662 light curves
+  Processed 13936/40662 light curves
+  Processed 14096/40662 light curves
+  Processed 14256/40662 light curves
+  Processed 14416/40662 light curves
+  Processed 14576/40662 light curves
+  Processed 14736/40662 light curves
+  Processed 14896/40662 light curves
+  Processed 15056/40662 light curves
+  Processed 15216/40662 light curves
+  Processed 15376/40662 light curves
+  Processed 15536/40662 light curves
+  Processed 15696/40662 light curves
+  Processed 15856/40662 light curves
+  Processed 16016/40662 light curves
+  Processed 16176/40662 light curves
+  Processed 16336/40662 light curves
+  Processed 16496/40662 light curves
+  Processed 16656/40662 light curves
+  Processed 16816/40662 light curves
+  Processed 16976/40662 light curves
+  Processed 17136/40662 light curves
+  Processed 17296/40662 light curves
+  Processed 17456/40662 light curves
+  Processed 17616/40662 light curves
+  Processed 17776/40662 light curves
+  Processed 17936/40662 light curves
+  Processed 18096/40662 light curves
+  Processed 18256/40662 light curves
+  Processed 18416/40662 light curves
+  Processed 18576/40662 light curves
+  Processed 18736/40662 light curves
+  Processed 18896/40662 light curves
+  Processed 19056/40662 light curves
+  Processed 19216/40662 light curves
+  Processed 19376/40662 light curves
+  Processed 19536/40662 light curves
+  Processed 19696/40662 light curves
+  Processed 19856/40662 light curves
+  Processed 20016/40662 light curves
+  Processed 20176/40662 light curves
+  Processed 20336/40662 light curves
+  Processed 20496/40662 light curves
+  Processed 20656/40662 light curves
+  Processed 20816/40662 light curves
+  Processed 20976/40662 light curves
+  Processed 21136/40662 light curves
+  Processed 21296/40662 light curves
+  Processed 21456/40662 light curves
+  Processed 21616/40662 light curves
+  Processed 21776/40662 light curves
+  Processed 21936/40662 light curves
+  Processed 22096/40662 light curves
+  Processed 22256/40662 light curves
+  Processed 22416/40662 light curves
+  Processed 22576/40662 light curves
+  Processed 22736/40662 light curves
+  Processed 22896/40662 light curves
+  Processed 23056/40662 light curves
+  Processed 23216/40662 light curves
+  Processed 23376/40662 light curves
+  Processed 23536/40662 light curves
+  Processed 23696/40662 light curves
+  Processed 23856/40662 light curves
+  Processed 24016/40662 light curves
+  Processed 24176/40662 light curves
+  Processed 24336/40662 light curves
+  Processed 24496/40662 light curves
+  Processed 24656/40662 light curves
+  Processed 24816/40662 light curves
+  Processed 24976/40662 light curves
+  Processed 25136/40662 light curves
+  Processed 25296/40662 light curves
+  Processed 25456/40662 light curves
+  Processed 25616/40662 light curves
+  Processed 25776/40662 light curves
+  Processed 25936/40662 light curves
+  Processed 26096/40662 light curves
+  Processed 26256/40662 light curves
+  Processed 26416/40662 light curves
+  Processed 26576/40662 light curves
+  Processed 26736/40662 light curves
+  Processed 26896/40662 light curves
+  Processed 27056/40662 light curves
+  Processed 27216/40662 light curves
+  Processed 27376/40662 light curves
+  Processed 27536/40662 light curves
+  Processed 27696/40662 light curves
+  Processed 27856/40662 light curves
+  Processed 28016/40662 light curves
+  Processed 28176/40662 light curves
+  Processed 28336/40662 light curves
+  Processed 28496/40662 light curves
+  Processed 28656/40662 light curves
+  Processed 28816/40662 light curves
+  Processed 28976/40662 light curves
+  Processed 29136/40662 light curves
+  Processed 29296/40662 light curves
+  Processed 29456/40662 light curves
+  Processed 29616/40662 light curves
+  Processed 29776/40662 light curves
+  Processed 29936/40662 light curves
+  Processed 30096/40662 light curves
+  Processed 30256/40662 light curves
+  Processed 30416/40662 light curves
+  Processed 30576/40662 light curves
+  Processed 30736/40662 light curves
+  Processed 30896/40662 light curves
+  Processed 31056/40662 light curves
+  Processed 31216/40662 light curves
+  Processed 31376/40662 light curves
+  Processed 31536/40662 light curves
+  Processed 31696/40662 light curves
+  Processed 31856/40662 light curves
+  Processed 32016/40662 light curves
+  Processed 32176/40662 light curves
+  Processed 32336/40662 light curves
+  Processed 32496/40662 light curves
+  Processed 32656/40662 light curves
+  Processed 32816/40662 light curves
+  Processed 32976/40662 light curves
+  Processed 33136/40662 light curves
+  Processed 33296/40662 light curves
+  Processed 33456/40662 light curves
+  Processed 33616/40662 light curves
+  Processed 33776/40662 light curves
+  Processed 33936/40662 light curves
+  Processed 34096/40662 light curves
+  Processed 34256/40662 light curves
+  Processed 34416/40662 light curves/Users/philvanlane/Documents/lc_ae/.venv/lib/python3.12/site-packages/umap/umap_.py:1952: UserWarning: n_jobs value 1 overridden to 1 by setting random_state. Use no seed for parallelism.
+  warn(
+
+  Processed 34576/40662 light curves
+  Processed 34736/40662 light curves
+  Processed 34896/40662 light curves
+  Processed 35056/40662 light curves
+  Processed 35216/40662 light curves
+  Processed 35376/40662 light curves
+  Processed 35536/40662 light curves
+  Processed 35696/40662 light curves
+  Processed 35856/40662 light curves
+  Processed 36016/40662 light curves
+  Processed 36176/40662 light curves
+  Processed 36336/40662 light curves
+  Processed 36496/40662 light curves
+  Processed 36656/40662 light curves
+  Processed 36816/40662 light curves
+  Processed 36976/40662 light curves
+  Processed 37136/40662 light curves
+  Processed 37296/40662 light curves
+  Processed 37456/40662 light curves
+  Processed 37616/40662 light curves
+  Processed 37776/40662 light curves
+  Processed 37936/40662 light curves
+  Processed 38096/40662 light curves
+  Processed 38256/40662 light curves
+  Processed 38416/40662 light curves
+  Processed 38576/40662 light curves
+  Processed 38736/40662 light curves
+  Processed 38896/40662 light curves
+  Processed 39056/40662 light curves
+  Processed 39216/40662 light curves
+  Processed 39376/40662 light curves
+  Processed 39536/40662 light curves
+  Processed 39696/40662 light curves
+  Processed 39856/40662 light curves
+  Processed 40016/40662 light curves
+  Processed 40176/40662 light curves
+  Processed 40336/40662 light curves
+  Processed 40496/40662 light curves
+  Processed 40656/40662 light curves
+Extracted latent vectors with shape: (40662, 1536)
+Loaded ages for 31873/40662 light curves (78.4%)
+Saved latents cache → final_model/meta_split/e27/metaAll/latents_pretrain.npz (40662 samples, keys=['latent_vectors', 'ages', 'bprp0', 'gaia_ids', 'tic_ids', 'sectors', 'bprp0_err', 'mg', 'mg_err', 'mem_prob'])
+
+--- Processing final_pretrain/timeseries_exop_hosts.h5 ---
+Extracting latent vectors for 19969 light curves (pooling=multiscale)...
+  Processed 16/19969 light curves
+  Processed 176/19969 light curves
+  Processed 336/19969 light curves
+  Processed 496/19969 light curves
+  Processed 656/19969 light curves
+  Processed 816/19969 light curves
+  Processed 976/19969 light curves
+  Processed 1136/19969 light curves
+  Processed 1296/19969 light curves
+  Processed 1456/19969 light curves
+  Processed 1616/19969 light curves
+  Processed 1776/19969 light curves
+  Processed 1936/19969 light curves
+  Processed 2096/19969 light curves
+  Processed 2256/19969 light curves
+  Processed 2416/19969 light curves
+  Processed 2576/19969 light curves
+  Processed 2736/19969 light curves
+  Processed 2896/19969 light curves
+  Processed 3056/19969 light curves
+  Processed 3216/19969 light curves
+  Processed 3376/19969 light curves
+  Processed 3536/19969 light curves
+  Processed 3696/19969 light curves
+  Processed 3856/19969 light curves
+  Processed 4016/19969 light curves
+  Processed 4176/19969 light curves
+  Processed 4336/19969 light curves
+  Processed 4496/19969 light curves
+  Processed 4656/19969 light curves
+  Processed 4816/19969 light curves
+  Processed 4976/19969 light curves
+  Processed 5136/19969 light curves
+  Processed 5296/19969 light curves
+  Processed 5456/19969 light curves
+  Processed 5616/19969 light curves
+  Processed 5776/19969 light curves
+  Processed 5936/19969 light curves
+  Processed 6096/19969 light curves
+  Processed 6256/19969 light curves
+  Processed 6416/19969 light curves
+  Processed 6576/19969 light curves
+  Processed 6736/19969 light curves
+  Processed 6896/19969 light curves
+  Processed 7056/19969 light curves
+  Processed 7216/19969 light curves
+  Processed 7376/19969 light curves
+  Processed 7536/19969 light curves
+  Processed 7696/19969 light curves
+  Processed 7856/19969 light curves
+  Processed 8016/19969 light curves
+  Processed 8176/19969 light curves
+  Processed 8336/19969 light curves
+  Processed 8496/19969 light curves
+  Processed 8656/19969 light curves
+  Processed 8816/19969 light curves
+  Processed 8976/19969 light curves
+  Processed 9136/19969 light curves
+  Processed 9296/19969 light curves
+  Processed 9456/19969 light curves
+  Processed 9616/19969 light curves
+  Processed 9776/19969 light curves
+  Processed 9936/19969 light curves
+  Processed 10096/19969 light curves
+  Processed 10256/19969 light curves
+  Processed 10416/19969 light curves
+  Processed 10576/19969 light curves
+  Processed 10736/19969 light curves
+  Processed 10896/19969 light curves
+  Processed 11056/19969 light curves
+  Processed 11216/19969 light curves
+  Processed 11376/19969 light curves
+  Processed 11536/19969 light curves
+  Processed 11696/19969 light curves
+  Processed 11856/19969 light curves
+  Processed 12016/19969 light curves
+  Processed 12176/19969 light curves
+  Processed 12336/19969 light curves
+  Processed 12496/19969 light curves
+  Processed 12656/19969 light curves
+  Processed 12816/19969 light curves
+  Processed 12976/19969 light curves
+  Processed 13136/19969 light curves
+  Processed 13296/19969 light curves
+  Processed 13456/19969 light curves
+  Processed 13616/19969 light curves
+  Processed 13776/19969 light curves
+  Processed 13936/19969 light curves
+  Processed 14096/19969 light curves
+  Processed 14256/19969 light curves
+  Processed 14416/19969 light curves
+  Processed 14576/19969 light curves
+  Processed 14736/19969 light curves
+  Processed 14896/19969 light curves
+  Processed 15056/19969 light curves
+  Processed 15216/19969 light curves
+  Processed 15376/19969 light curves
+  Processed 15536/19969 light curves
+  Processed 15696/19969 light curves
+  Processed 15856/19969 light curves
+  Processed 16016/19969 light curves
+  Processed 16176/19969 light curves
+  Processed 16336/19969 light curves
+  Processed 16496/19969 light curves
+  Processed 16656/19969 light curves
+  Processed 16816/19969 light curves
+  Processed 16976/19969 light curves
+  Processed 17136/19969 light curves
+  Processed 17296/19969 light curves
+  Processed 17456/19969 light curves
+  Processed 17616/19969 light curves
+  Processed 17776/19969 light curves
+  Processed 17936/19969 light curves
+  Processed 18096/19969 light curves
+  Processed 18256/19969 light curves
+  Processed 18416/19969 light curves
+  Processed 18576/19969 light curves
+  Processed 18736/19969 light curves
+  Processed 18896/19969 light curves
+  Processed 19056/19969 light curves
+  Processed 19216/19969 light curves
+  Processed 19376/19969 light curves
+  Processed 19536/19969 light curves
+  Processed 19696/19969 light curves
+  Processed 19856/19969 light curves
+Extracted latent vectors with shape: (19969, 1536)
+Loaded ages for 905/19969 light curves (4.5%)
+Saved latents cache → final_model/meta_split/e27/metaAll/latents_hosts.npz (19969 samples, keys=['latent_vectors', 'ages', 'bprp0', 'gaia_ids', 'tic_ids', 'sectors', 'bprp0_err', 'mg', 'mg_err', 'mem_prob'])
+
+--- Processing final_pretrain/timeseries_thickdisk.h5 ---
+Extracting latent vectors for 8688 light curves (pooling=multiscale)...
+  Processed 16/8688 light curves
+  Processed 176/8688 light curves
+  Processed 336/8688 light curves
+  Processed 496/8688 light curves
+  Processed 656/8688 light curves
+  Processed 816/8688 light curves
+  Processed 976/8688 light curves
+  Processed 1136/8688 light curves
+  Processed 1296/8688 light curves
+  Processed 1456/8688 light curves
+  Processed 1616/8688 light curves
+  Processed 1776/8688 light curves
+  Processed 1936/8688 light curves
+  Processed 2096/8688 light curves
+  Processed 2256/8688 light curves
+  Processed 2416/8688 light curves
+  Processed 2576/8688 light curves
+  Processed 2736/8688 light curves
+  Processed 2896/8688 light curves
+  Processed 3056/8688 light curves
+  Processed 3216/8688 light curves
+  Processed 3376/8688 light curves
+  Processed 3536/8688 light curves
+  Processed 3696/8688 light curves
+  Processed 3856/8688 light curves
+  Processed 4016/8688 light curves
+  Processed 4176/8688 light curves
+  Processed 4336/8688 light curves
+  Processed 4496/8688 light curves
+  Processed 4656/8688 light curves
+  Processed 4816/8688 light curves
+  Processed 4976/8688 light curves
+  Processed 5136/8688 light curves
+  Processed 5296/8688 light curves
+  Processed 5456/8688 light curves
+  Processed 5616/8688 light curves
+  Processed 5776/8688 light curves
+  Processed 5936/8688 light curves
+  Processed 6096/8688 light curves
+  Processed 6256/8688 light curves
+  Processed 6416/8688 light curves
+  Processed 6576/8688 light curves
+  Processed 6736/8688 light curves
+  Processed 6896/8688 light curves
+  Processed 7056/8688 light curves
+  Processed 7216/8688 light curves
+  Processed 7376/8688 light curves
+  Processed 7536/8688 light curves
+  Processed 7696/8688 light curves
+  Processed 7856/8688 light curves
+  Processed 8016/8688 light curves
+  Processed 8176/8688 light curves
+  Processed 8336/8688 light curves
+  Processed 8496/8688 light curves
+  Processed 8656/8688 light curves
+Extracted latent vectors with shape: (8688, 1536)
+Loaded ages for 0/8688 light curves (0.0%)
+Saved latents cache → final_model/meta_split/e27/metaAll/latents_thickdisk.npz (8688 samples, keys=['latent_vectors', 'ages', 'bprp0', 'gaia_ids', 'tic_ids', 'sectors', 'bprp0_err', 'mg', 'mg_err', 'mem_prob'])
+
+Total: 69319 light curves across 3 H5 file(s)
+Computing UMAP on all 69319 samples (32778 have valid ages)...
+UMAP(n_jobs=1, n_neighbors=30, random_state=42, verbose=True)
+Thu May 21 22:39:41 2026 Construct fuzzy simplicial set
+Thu May 21 22:39:41 2026 Finding Nearest Neighbors
+Thu May 21 22:39:41 2026 Building RP forest with 18 trees
+Thu May 21 22:39:48 2026 NN descent for 16 iterations
+	 1  /  16
+	 2  /  16
+	Stopping threshold met -- exiting after 2 iterations
+Thu May 21 22:40:09 2026 Finished Nearest Neighbor Search
+Thu May 21 22:40:11 2026 Construct embedding
+Epochs completed:   0%|            0/200 [00:00]Epochs completed:   0%|            1/200 [00:00]Epochs completed:   1%|            2/200 [00:00]Epochs completed:   2%| ▏          3/200 [00:01]Epochs completed:   2%| ▏          4/200 [00:01]Epochs completed:   2%| ▎          5/200 [00:02]Epochs completed:   3%| ▎          6/200 [00:02]Epochs completed:   4%| ▎          7/200 [00:03]Epochs completed:   4%| ▍          8/200 [00:03]Epochs completed:   4%| ▍          9/200 [00:04]Epochs completed:   5%| ▌          10/200 [00:04]Epochs completed:   6%| ▌          11/200 [00:05]Epochs completed:   6%| ▌          12/200 [00:05]Epochs completed:   6%| ▋          13/200 [00:06]Epochs completed:   7%| ▋          14/200 [00:06]Epochs completed:   8%| ▊          15/200 [00:07]Epochs completed:   8%| ▊          16/200 [00:08]Epochs completed:   8%| ▊          17/200 [00:08]Epochs completed:   9%| ▉          18/200 [00:09]Epochs completed:  10%| ▉          19/200 [00:09]Epochs completed:  10%| █          20/200 [00:10]Epochs completed:  10%| █          21/200 [00:10]Epochs completed:  11%| █          22/200 [00:11]Epochs completed:  12%| █▏         23/200 [00:11]Epochs completed:  12%| █▏         24/200 [00:12]Epochs completed:  12%| █▎         25/200 [00:12]Epochs completed:  13%| █▎         26/200 [00:13]Epochs completed:  14%| █▎         27/200 [00:13]Epochs completed:  14%| █▍         28/200 [00:14]Epochs completed:  14%| █▍         29/200 [00:14]Epochs completed:  15%| █▌         30/200 [00:15]Epochs completed:  16%| █▌         31/200 [00:15]Epochs completed:  16%| █▌         32/200 [00:16]Epochs completed:  16%| █▋         33/200 [00:16]Epochs completed:  17%| █▋         34/200 [00:17]Epochs completed:  18%| █▊         35/200 [00:18]Epochs completed:  18%| █▊         36/200 [00:18]Epochs completed:  18%| █▊         37/200 [00:19]Epochs completed:  19%| █▉         38/200 [00:19]Epochs completed:  20%| █▉         39/200 [00:20]Epochs completed:  20%| ██         40/200 [00:20]Epochs completed:  20%| ██         41/200 [00:21]Epochs completed:  21%| ██         42/200 [00:21]Epochs completed:  22%| ██▏        43/200 [00:22]Epochs completed:  22%| ██▏        44/200 [00:22]Epochs completed:  22%| ██▎        45/200 [00:23]Epochs completed:  23%| ██▎        46/200 [00:23]Epochs completed:  24%| ██▎        47/200 [00:24]Epochs completed:  24%| ██▍        48/200 [00:24]Epochs completed:  24%| ██▍        49/200 [00:25]Epochs completed:  25%| ██▌        50/200 [00:25]Epochs completed:  26%| ██▌        51/200 [00:26]Epochs completed:  26%| ██▌        52/200 [00:26]Epochs completed:  26%| ██▋        53/200 [00:27]Epochs completed:  27%| ██▋        54/200 [00:28]Epochs completed:  28%| ██▊        55/200 [00:28]Epochs completed:  28%| ██▊        56/200 [00:29]Epochs completed:  28%| ██▊        57/200 [00:29]Epochs completed:  29%| ██▉        58/200 [00:30]Epochs completed:  30%| ██▉        59/200 [00:30]Epochs completed:  30%| ███        60/200 [00:31]Epochs completed:  30%| ███        61/200 [00:31]Epochs completed:  31%| ███        62/200 [00:32]Epochs completed:  32%| ███▏       63/200 [00:32]Epochs completed:  32%| ███▏       64/200 [00:33]Epochs completed:  32%| ███▎       65/200 [00:33]Epochs completed:  33%| ███▎       66/200 [00:34]Epochs completed:  34%| ███▎       67/200 [00:34]Epochs completed:  34%| ███▍       68/200 [00:35]Epochs completed:  34%| ███▍       69/200 [00:35]Epochs completed:  35%| ███▌       70/200 [00:36]Epochs completed:  36%| ███▌       71/200 [00:36]Epochs completed:  36%| ███▌       72/200 [00:37]Epochs completed:  36%| ███▋       73/200 [00:38]Epochs completed:  37%| ███▋       74/200 [00:38]Epochs completed:  38%| ███▊       75/200 [00:39]Epochs completed:  38%| ███▊       76/200 [00:39]Epochs completed:  38%| ███▊       77/200 [00:40]Epochs completed:  39%| ███▉       78/200 [00:40]Epochs completed:  40%| ███▉       79/200 [00:41]Epochs completed:  40%| ████       80/200 [00:41]Epochs completed:  40%| ████       81/200 [00:42]Epochs completed:  41%| ████       82/200 [00:42]Epochs completed:  42%| ████▏      83/200 [00:43]Epochs completed:  42%| ████▏      84/200 [00:43]Epochs completed:  42%| ████▎      85/200 [00:44]Epochs completed:  43%| ████▎      86/200 [00:44]Epochs completed:  44%| ████▎      87/200 [00:45]Epochs completed:  44%| ████▍      88/200 [00:45]Epochs completed:  44%| ████▍      89/200 [00:46]Epochs completed:  45%| ████▌      90/200 [00:46]Epochs completed:  46%| ████▌      91/200 [00:47]Epochs completed:  46%| ████▌      92/200 [00:48]Epochs completed:  46%| ████▋      93/200 [00:48]Epochs completed:  47%| ████▋      94/200 [00:49]Epochs completed:  48%| ████▊      95/200 [00:49]Epochs completed:  48%| ████▊      96/200 [00:50]Epochs completed:  48%| ████▊      97/200 [00:50]Epochs completed:  49%| ████▉      98/200 [00:51]Epochs completed:  50%| ████▉      99/200 [00:51]Epochs completed:  50%| █████      100/200 [00:52]Epochs completed:  50%| █████      101/200 [00:52]Epochs completed:  51%| █████      102/200 [00:53]Epochs completed:  52%| █████▏     103/200 [00:53]Epochs completed:  52%| █████▏     104/200 [00:54]Epochs completed:  52%| █████▎     105/200 [00:54]Epochs completed:  53%| █████▎     106/200 [00:55]Epochs completed:  54%| █████▎     107/200 [00:55]Epochs completed:  54%| █████▍     108/200 [00:56]Epochs completed:  55%| █████▍     109/200 [00:56]Epochs completed:  55%| █████▌     110/200 [00:57]Epochs completed:  56%| █████▌     111/200 [00:58]Epochs completed:  56%| █████▌     112/200 [00:58]Epochs completed:  56%| █████▋     113/200 [00:59]Epochs completed:  57%| █████▋     114/200 [00:59]Epochs completed:  57%| █████▊     115/200 [01:00]Epochs completed:  58%| █████▊     116/200 [01:00]Epochs completed:  58%| █████▊     117/200 [01:01]Epochs completed:  59%| █████▉     118/200 [01:01]Epochs completed:  60%| █████▉     119/200 [01:02]Epochs completed:  60%| ██████     120/200 [01:02]Epochs completed:  60%| ██████     121/200 [01:03]Epochs completed:  61%| ██████     122/200 [01:03]Epochs completed:  62%| ██████▏    123/200 [01:04]Epochs completed:  62%| ██████▏    124/200 [01:04]Epochs completed:  62%| ██████▎    125/200 [01:05]Epochs completed:  63%| ██████▎    126/200 [01:05]Epochs completed:  64%| ██████▎    127/200 [01:06]Epochs completed:  64%| ██████▍    128/200 [01:06]Epochs completed:  64%| ██████▍    129/200 [01:07]Epochs completed:  65%| ██████▌    130/200 [01:08]Epochs completed:  66%| ██████▌    131/200 [01:08]Epochs completed:  66%| ██████▌    132/200 [01:09]Epochs completed:  66%| ██████▋    133/200 [01:09]Epochs completed:  67%| ██████▋    134/200 [01:10]Epochs completed:  68%| ██████▊    135/200 [01:10]Epochs completed:  68%| ██████▊    136/200 [01:11]Epochs completed:  68%| ██████▊    137/200 [01:11]Epochs completed:  69%| ██████▉    138/200 [01:12]Epochs completed:  70%| ██████▉    139/200 [01:12]Epochs completed:  70%| ███████    140/200 [01:13]Epochs completed:  70%| ███████    141/200 [01:13]Epochs completed:  71%| ███████    142/200 [01:14]Epochs completed:  72%| ███████▏   143/200 [01:14]Epochs completed:  72%| ███████▏   144/200 [01:15]Epochs completed:  72%| ███████▎   145/200 [01:15]Epochs completed:  73%| ███████▎   146/200 [01:16]Epochs completed:  74%| ███████▎   147/200 [01:17]Epochs completed:  74%| ███████▍   148/200 [01:17]Epochs completed:  74%| ███████▍   149/200 [01:18]Epochs completed:  75%| ███████▌   150/200 [01:18]Epochs completed:  76%| ███████▌   151/200 [01:19]Epochs completed:  76%| ███████▌   152/200 [01:19]Epochs completed:  76%| ███████▋   153/200 [01:20]Epochs completed:  77%| ███████▋   154/200 [01:20]Epochs completed:  78%| ███████▊   155/200 [01:21]Epochs completed:  78%| ███████▊   156/200 [01:21]Epochs completed:  78%| ███████▊   157/200 [01:22]Epochs completed:  79%| ███████▉   158/200 [01:22]Epochs completed:  80%| ███████▉   159/200 [01:23]Epochs completed:  80%| ████████   160/200 [01:23]Epochs completed:  80%| ████████   161/200 [01:24]Epochs completed:  81%| ████████   162/200 [01:24]Epochs completed:  82%| ████████▏  163/200 [01:25]Epochs completed:  82%| ████████▏  164/200 [01:25]Epochs completed:  82%| ████████▎  165/200 [01:26]Epochs completed:  83%| ████████▎  166/200 [01:27]Epochs completed:  84%| ████████▎  167/200 [01:27]Epochs completed:  84%| ████████▍  168/200 [01:28]Epochs completed:  84%| ████████▍  169/200 [01:28]Epochs completed:  85%| ████████▌  170/200 [01:29]Epochs completed:  86%| ████████▌  171/200 [01:29]Epochs completed:  86%| ████████▌  172/200 [01:30]Epochs completed:  86%| ████████▋  173/200 [01:30]Epochs completed:  87%| ████████▋  174/200 [01:31]Epochs completed:  88%| ████████▊  175/200 [01:31]Epochs completed:  88%| ████████▊  176/200 [01:32]Epochs completed:  88%| ████████▊  177/200 [01:32]Epochs completed:  89%| ████████▉  178/200 [01:33]Epochs completed:  90%| ████████▉  179/200 [01:33]Epochs completed:  90%| █████████  180/200 [01:34]Epochs completed:  90%| █████████  181/200 [01:34]Epochs completed:  91%| █████████  182/200 [01:35]Epochs completed:  92%| █████████▏ 183/200 [01:35]Epochs completed:  92%| █████████▏ 184/200 [01:36]Epochs completed:  92%| █████████▎ 185/200 [01:36]Epochs completed:  93%| █████████▎ 186/200 [01:37]Epochs completed:  94%| █████████▎ 187/200 [01:38]Epochs completed:  94%| █████████▍ 188/200 [01:38]Epochs completed:  94%| █████████▍ 189/200 [01:39]Epochs completed:  95%| █████████▌ 190/200 [01:39]Epochs completed:  96%| █████████▌ 191/200 [01:40]Epochs completed:  96%| █████████▌ 192/200 [01:40]Epochs completed:  96%| █████████▋ 193/200 [01:41]Epochs completed:  97%| █████████▋ 194/200 [01:41]Epochs completed:  98%| █████████▊ 195/200 [01:42]Epochs completed:  98%| █████████▊ 196/200 [01:42]Epochs completed:  98%| █████████▊ 197/200 [01:43]Epochs completed:  99%| █████████▉ 198/200 [01:43]Epochs completed: 100%| █████████▉ 199/200 [01:44]Epochs completed: 100%| ██████████ 200/200 [01:44]Epochs completed: 100%| ██████████ 200/200 [01:44]
+	completed  0  /  200 epochs
+	completed  20  /  200 epochs
+	completed  40  /  200 epochs
+	completed  60  /  200 epochs
+	completed  80  /  200 epochs
+	completed  100  /  200 epochs
+	completed  120  /  200 epochs
+	completed  140  /  200 epochs
+	completed  160  /  200 epochs
+	completed  180  /  200 epochs
+Thu May 21 22:42:01 2026 Finished embedding
+UMAP embedding shape: (69319, 2)
+Plotting 32778 aged + 36541 unaged stars
+Saved UMAP plot to final_model/meta_split/e27/metaAll/umap/umap_age_best_model_multiscale.png
+Saved embedding data to final_model/meta_split/e27/metaAll/umap/umap_age_best_model_multiscale_data.npz
+Done!
