@@ -6,8 +6,10 @@
 # locked-in pooling (uniform/equal_count/dt), so the kfold just consumes them.
 #
 # Goal: which PCA dim best trades capacity vs out-of-cluster overfitting.
-#   pca{D}_random : random 10-fold (in-distribution reference, per dim)
-#   pca{D}_loco   : leave-one-cluster-out (generalization, per dim)
+#   pca{4,8,16}_loco : leave-one-cluster-out (generalization) — this picks the dim
+#   pca8_random      : ONE random 10-fold = in-distribution ceiling / memorization-gap
+#                      reference (per-dim random is redundant — in-distribution all dims
+#                      do ~equally, so one suffices).
 # Baseline for context: gyro LOCO r=0.498 (model-independent — uses Prot, not latents;
 # see final_model/parallel_fixed/e110/loocv/gyro/).
 
@@ -20,10 +22,13 @@ COMMON="--load_latents ${LAT} --age_csv final_pretrain/metadata.csv --override_a
   --flow_transforms 6 --flow_hidden_dims 64 64 \
   --encoder_type pca --training_stages joint --n_epochs 100"
 
+# One in-distribution ceiling reference (dim 8, random 10-fold).
+echo "############## PCA dim 8 — random 10-fold (in-distribution ceiling) ##############"
+python scripts/kfold_age_inference.py ${COMMON} --pca_dim 8 --n_folds 10 \
+  --output_dir ${BASE}/pca8_random || echo "  !! pca8_random FAILED"
+
+# Dim comparison: LOCO for each dim (this is what picks the dim).
 for D in 4 8 16; do
-  echo "############## PCA dim ${D} — random 10-fold ##############"
-  python scripts/kfold_age_inference.py ${COMMON} --pca_dim ${D} --n_folds 10 \
-    --output_dir ${BASE}/pca${D}_random || echo "  !! pca${D}_random FAILED"
   echo "############## PCA dim ${D} — LOCO ##############"
   python scripts/kfold_age_inference.py ${COMMON} --pca_dim ${D} --n_folds 11 --loocv_age \
     --output_dir ${BASE}/pca${D}_loco || echo "  !! pca${D}_loco FAILED"
@@ -36,15 +41,13 @@ import json, os
 import pandas as pd, numpy as np
 base = "${BASE}"
 print(f"{'run':16}{'N':>7}{'r':>9}{'MAE':>9}")
-for D in (4, 8, 16):
-    for kind in ('random', 'loco'):
-        d = f'pca{D}_{kind}'
-        p = os.path.join(base, d, 'kfold_metrics.json')
-        if os.path.exists(p):
-            m = json.load(open(p))
-            print(f"{d:16}{m['n_samples']:>7}{m['correlation']:>9.3f}{m['mae_dex']:>9.3f}")
-        else:
-            print(f"{d:16}{'(missing)':>7}")
+for d in ('pca8_random', 'pca4_loco', 'pca8_loco', 'pca16_loco'):
+    p = os.path.join(base, d, 'kfold_metrics.json')
+    if os.path.exists(p):
+        m = json.load(open(p))
+        print(f"{d:16}{m['n_samples']:>7}{m['correlation']:>9.3f}{m['mae_dex']:>9.3f}")
+    else:
+        print(f"{d:16}{'(missing)':>7}")
 print("\ncontext: gyro LOCO r=0.498 MAE=0.553 (model-independent baseline)")
 print("\nPer-fold (age-group) MAE [dex] — LOCO runs:")
 for D in (4, 8, 16):
