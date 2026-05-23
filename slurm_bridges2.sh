@@ -7,7 +7,7 @@
 #   2. Update --epochs to your new target (e.g., 50 or 100)
 #   3. Training will continue from where it left off
 #
-#SBATCH --job-name=final-meta-mask-pt2
+#SBATCH --job-name=final-meta-mask-e100
 #### Change account to your allocation (e.g., abc123p)
 #SBATCH --account=phy260003p
 #SBATCH --partition=GPU-shared
@@ -32,8 +32,9 @@ OUTPUT_DIR="$PROJECT_DIR/output/$SLURM_JOBID-$SLURM_JOB_NAME"
 #### OPTIONAL: Set to resume training from a previous checkpoint
 #### Example: RESUME_FROM="checkpoints/resume/model.pt"
 #### Leave empty ("") for fresh training
-#### Cleared for the final run: Changes 1/3 (recurrence gating + metadata
-#### mask channel) make old checkpoints incompatible — this MUST be a fresh run.
+#### WARM RESTART e50 -> e100: resume the e50 rolling checkpoint. Architecture/data
+#### unchanged, so it loads cleanly. Paired with --fresh_scheduler + --epochs 100
+#### below to run a new OneCycle over the remaining 50 epochs.
 RESUME_FROM="checkpoints/resume/model.pt"
 
 # Define container
@@ -105,10 +106,10 @@ time -p singularity exec --nv --bind /ocean,$LOCAL,$HOME \
     --batch_size 64 \
     --hidden_size 64 \
     --output_name model.pt \
-    --epochs 50 \
-    --scheduler_epochs 50 \
-    --pct_start 0.2 \
-    --lr 2e-4 \
+    --epochs 100 \
+    --fresh_scheduler \
+    --pct_start 0.1 \
+    --lr 1e-4 \
     --lr_div_factor 2.0 \
     --min_size 5 \
     --max_size 2880 \
