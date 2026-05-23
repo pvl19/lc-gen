@@ -2295,6 +2295,11 @@ def main():
                              'Requires --encoder_type mlp/linear.')
     parser.add_argument('--adv_hidden', type=int, default=64,
                         help='Hidden width of the GRL sector-adversary MLP (default 64).')
+    parser.add_argument('--override_ages_from_csv', action='store_true',
+                        help='In --load_latents mode, re-join ages from --age_csv by GaiaDR3_ID, '
+                             'overriding the cache ages. Use for ChronoFlow LOCO so grouping+target '
+                             'use the clean ChronoFlow isochrone ages (metadata.csv), not the blended '
+                             'multi-catalog ages baked into the cache. Rows not in the CSV are dropped.')
     parser.add_argument('--loocv_age', action='store_true',
                         help='Leave-one-age-out CV: each unique age value is its own fold, held '
                              'out one at a time (a cluster proxy for ChronoFlow, where each cluster '
@@ -2589,6 +2594,30 @@ def main():
         gaia_ids, tic_ids, sectors = c['gaia_ids'], c['tic_ids'], c['sectors']
         cached_cross_sector_latents = c['cross_sector_latents']
         cached_cross_sector_tic_ids = c['cross_sector_tic_ids']
+
+        if args.override_ages_from_csv:
+            # Re-join ages from --age_csv (e.g. ChronoFlow isochrone ages) so LOCO
+            # grouping + target use clean per-cluster ages, not the blended
+            # multi-catalog ages baked into the cache. Drop rows not in the CSV.
+            adf = pd.read_csv(args.age_csv); adf['GaiaDR3_ID'] = adf['GaiaDR3_ID'].astype(str)
+            # metadata.csv has one row per (star, ref); restrict to the subset
+            # (e.g. ref==ChronoFlow) BEFORE mapping so multi-ref stars get the
+            # correct catalog's age — matching how the gyro baseline filters.
+            if args.subset_col and args.subset_val and args.subset_col in adf.columns:
+                adf = adf[adf[args.subset_col].isin(args.subset_val)]
+            amap = dict(zip(adf['GaiaDR3_ID'], adf['age_Myr'].astype(float)))
+            gids = np.asarray(gaia_ids).astype(str)
+            new_ages = np.array([amap.get(g, np.nan) for g in gids], dtype=np.float64)
+            keep = np.isfinite(new_ages)
+            nchg = int(np.sum(np.isfinite(ages) & keep
+                              & (np.abs(new_ages - np.asarray(ages, float)) > 1e-3)))
+            print(f'  --override_ages_from_csv ({args.age_csv}): {nchg} ages changed, '
+                  f'dropping {int((~keep).sum())} rows not in CSV')
+            ages = new_ages.astype(np.float32)
+            (latent_vectors, ages, bprp0, bprp0_err, mg, mg_err, mem_prob,
+             gaia_ids, tic_ids, sectors) = (
+                a[keep] for a in (latent_vectors, ages, bprp0, bprp0_err, mg, mg_err,
+                                  mem_prob, gaia_ids, tic_ids, sectors))
     else:
         if args.model_path is None:
             parser.error('--model_path is required unless --load_latents is set.')
