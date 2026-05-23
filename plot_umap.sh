@@ -1,10 +1,13 @@
 #!/bin/bash
-# UMAP visualization + latent extraction for the metadata-masking (e50) model.
+# UMAP visualization + latent extraction for the FINAL sendit model (e50, log10
+# metadata fix). Uses the locked-in pooling by default (uniform/equal_count/dt) —
+# this script passes no --glob_mode/--seg_mode/--diff_weight_mode, so it inherits
+# those defaults; trim_edges=10 matches training.
 #
 # Sector-leakage diagnostic: extract latents under three metadata conditions and
 # probe each. Set META_MODE below, run the script, then change META_MODE and
 # re-run — once per version. Each run writes one latent file per H5 category
-# (pretrain, hosts, thickdisk) into final_model/meta_mask/e50/<META_MODE>/.
+# (pretrain, hosts, thickdisk) into final_model/sendit/e50/<META_MODE>/.
 #
 #   metaAll : all metadata fed normally
 #   noInstr : withhold sector,camera,ccd (value 0 + mask 0); keep astrophysical metadata
@@ -17,9 +20,9 @@
 # === CHANGE THIS to switch versions: metaAll | noInstr | noMeta ===
 META_MODE="metaAll"
 
-MODEL_PATH="final_model/meta_mask/e50/best_model.pt"
+MODEL_PATH="final_model/sendit/e50/best_model.pt"
 H5_PATHS="final_pretrain/timeseries_pretrain.h5 final_pretrain/timeseries_exop_hosts.h5 final_pretrain/timeseries_thickdisk.h5"
-LATENT_BASE="final_model/meta_mask/e50"
+LATENT_BASE="final_model/sendit/e50"
 
 # Derive the ablation flag from META_MODE.
 case "${META_MODE}" in
