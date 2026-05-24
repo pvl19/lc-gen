@@ -1722,13 +1722,13 @@ def loocv_age_folds(ages, young_n=20, young_size=5, indiv_min=100, sparse_split=
 
 
 def loso_sector_folds(star_sectors, n_folds=10, seed=42):
-    """Leave-one-sector-out folds for per-star validation.
+    """Leave-one-sector-out folds for per-star validation (balanced).
 
-    Randomly partitions the unique TESS sectors into `n_folds` disjoint groups.
-    Each held-out group defines one fold. For that fold:
+    Partitions the unique TESS sectors into `n_folds` disjoint groups. Each held-out
+    group defines one fold. For that fold:
       - VALIDATION = stars assigned to the fold (each star is assigned to ONE fold,
-        a randomly chosen group among those its own sectors touch — so every
-        validated star genuinely has a light curve in a held-out sector);
+        a group among those its own sectors touch — so every validated star genuinely
+        has a light curve in a held-out sector);
       - TRAINING eligibility = a star may train ONLY if NONE of its sectors fall in
         the held-out group. A star observed in any held-out sector is removed from
         training entirely (the whole star, not just its held-out-sector rows) — so
@@ -1740,35 +1740,61 @@ def loso_sector_folds(star_sectors, n_folds=10, seed=42):
     training in each of those folds but validated in only one (used nowhere else —
     no leakage).
 
+    Fold balancing (two greedy heuristics — the alternative to a random split, which
+    leaves the last group oversized and the continuous-viewing-zone stars piled into a
+    few folds):
+      1. SECTOR PARTITION by star-load (LPT): assign each sector — heaviest first — to
+         the group with the least accumulated load (≈ number of stars observed in it).
+         Equalizes how many stars get held out per fold → even TRAINING sizes.
+      2. VALIDATION assignment greedily: process the most-constrained stars first
+         (fewest touched groups — single-sector stars are locked) and send each to its
+         least-loaded touched group → even VALIDATION sizes.
+    Both are deterministic given `seed` (used only to break load ties in the partition).
+
     Args:
         star_sectors: list/array of iterables of sector numbers, one entry per star,
                       aligned to the aggregated latent rows.
         n_folds:      requested number of sector groups (capped at #unique sectors).
-        seed:         RNG seed for the sector partition and the per-star fold pick.
+        seed:         RNG seed; only breaks ties in the load-balanced partition.
 
     Returns:
         fold_of_sample:    (N,) int — validation fold per star
         star_touch_groups: list of frozenset[int] — group indices each star touches
-        n_folds_eff:       number of non-empty sector groups (== n_folds unless capped)
+        n_folds_eff:       number of sector groups (== n_folds unless capped by #sectors)
     """
-    all_secs = sorted({int(s) for ss in star_sectors for s in ss})
+    # Per-sector load = number of stars observed in that sector.
+    sec_load = {}
+    for ss in star_sectors:
+        for s in ss:
+            s = int(s)
+            sec_load[s] = sec_load.get(s, 0) + 1
+    all_secs = sorted(sec_load)
     if not all_secs:
         raise ValueError('loso_sector_folds: no sectors found in star_sectors.')
+    n_folds_eff = min(n_folds, len(all_secs))
+
+    # (1) LPT load-balanced partition. Seed shuffles first so equal-load sectors get a
+    # seed-dependent (but reproducible) tie order; the stable sort by -load keeps it.
     rng = np.random.RandomState(seed)
-    perm = rng.permutation(len(all_secs))
-    secs_shuffled = [all_secs[i] for i in perm]
-    grp_size = max(len(secs_shuffled) // n_folds, 1)
+    order = [int(x) for x in rng.permutation(all_secs)]
+    order.sort(key=lambda s: -sec_load[s])
+    group_load = [0] * n_folds_eff
     sec_to_group = {}
-    for f in range(n_folds):
-        s = f * grp_size
-        e = s + grp_size if f < n_folds - 1 else len(secs_shuffled)
-        for sv in secs_shuffled[s:e]:
-            sec_to_group[sv] = f
-    n_folds_eff = len(set(sec_to_group.values()))
+    for s in order:
+        f = int(np.argmin(group_load))
+        sec_to_group[s] = f
+        group_load[f] += sec_load[s]
+
     star_touch_groups = [frozenset(sec_to_group[int(s)] for s in ss) for ss in star_sectors]
-    rng2 = np.random.default_rng(seed)
-    fold_of_sample = np.array(
-        [int(rng2.choice(sorted(g))) for g in star_touch_groups], dtype=int)
+
+    # (2) Greedy validation assignment: most-constrained stars first, each to its
+    # least-loaded touched group. Ties resolved by index/group order (deterministic).
+    val_count = [0] * n_folds_eff
+    fold_of_sample = np.empty(len(star_sectors), dtype=int)
+    for i in sorted(range(len(star_sectors)), key=lambda i: len(star_touch_groups[i])):
+        f = min(sorted(star_touch_groups[i]), key=lambda g: val_count[g])
+        fold_of_sample[i] = f
+        val_count[f] += 1
     return fold_of_sample, star_touch_groups, n_folds_eff
 
 
