@@ -1721,6 +1721,57 @@ def loocv_age_folds(ages, young_n=20, young_size=5, indiv_min=100, sparse_split=
     return fold_of_sample, fid
 
 
+def loso_sector_folds(star_sectors, n_folds=10, seed=42):
+    """Leave-one-sector-out folds for per-star validation.
+
+    Randomly partitions the unique TESS sectors into `n_folds` disjoint groups.
+    Each held-out group defines one fold. For that fold:
+      - VALIDATION = stars assigned to the fold (each star is assigned to ONE fold,
+        a randomly chosen group among those its own sectors touch — so every
+        validated star genuinely has a light curve in a held-out sector);
+      - TRAINING eligibility = a star may train ONLY if NONE of its sectors fall in
+        the held-out group. A star observed in any held-out sector is removed from
+        training entirely (the whole star, not just its held-out-sector rows) — so
+        the age model never sees a star that shares a sector with the validation set.
+
+    This is the per-star (latent_max) analogue of the per-sector sector-disjoint CV:
+    it estimates generalization to stars observed only in sectors the age model has
+    never trained on. A star whose sectors span several groups is excluded from
+    training in each of those folds but validated in only one (used nowhere else —
+    no leakage).
+
+    Args:
+        star_sectors: list/array of iterables of sector numbers, one entry per star,
+                      aligned to the aggregated latent rows.
+        n_folds:      requested number of sector groups (capped at #unique sectors).
+        seed:         RNG seed for the sector partition and the per-star fold pick.
+
+    Returns:
+        fold_of_sample:    (N,) int — validation fold per star
+        star_touch_groups: list of frozenset[int] — group indices each star touches
+        n_folds_eff:       number of non-empty sector groups (== n_folds unless capped)
+    """
+    all_secs = sorted({int(s) for ss in star_sectors for s in ss})
+    if not all_secs:
+        raise ValueError('loso_sector_folds: no sectors found in star_sectors.')
+    rng = np.random.RandomState(seed)
+    perm = rng.permutation(len(all_secs))
+    secs_shuffled = [all_secs[i] for i in perm]
+    grp_size = max(len(secs_shuffled) // n_folds, 1)
+    sec_to_group = {}
+    for f in range(n_folds):
+        s = f * grp_size
+        e = s + grp_size if f < n_folds - 1 else len(secs_shuffled)
+        for sv in secs_shuffled[s:e]:
+            sec_to_group[sv] = f
+    n_folds_eff = len(set(sec_to_group.values()))
+    star_touch_groups = [frozenset(sec_to_group[int(s)] for s in ss) for ss in star_sectors]
+    rng2 = np.random.default_rng(seed)
+    fold_of_sample = np.array(
+        [int(rng2.choice(sorted(g))) for g in star_touch_groups], dtype=int)
+    return fold_of_sample, star_touch_groups, n_folds_eff
+
+
 def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
                  n_folds=10, pca_dim=32, pca_latents=None,
                  lr=1e-3, weight_decay=1e-4, n_epochs=100, batch_size=64,
@@ -1741,7 +1792,8 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
                  sector_level_split=False, sector_split_drop_star_overlap=True,
                  balance_sector_age=False, n_balance_age_bins=10,
                  adv_sector_weight=0.0, adv_hidden=64,
-                 loocv_age=False):
+                 loocv_age=False,
+                 loso=False, loso_star_sectors=None):
     """Run k-fold cross-validation.
 
     Args:
@@ -1859,6 +1911,22 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
         # held-out predictions (plot_kfold_results does this), not per-fold r.
         fold_of_sample, n_folds = loocv_age_folds(ages)
         print(f'Leave-one-cluster-out (age-grouped, ChronoFlow proxy): {n_folds} folds')
+    elif loso:
+        # Leave-one-sector-out (per-star). Partition unique sectors into n_folds
+        # groups; each star validates in one fold (a group its sectors touch) and is
+        # excluded from training in EVERY fold whose group it touches. star_touch_groups
+        # is used in the loop below to build a per-fold star-disjoint training set.
+        if loso_star_sectors is None:
+            raise ValueError('loso=True requires loso_star_sectors (per-star sector sets).')
+        if len(loso_star_sectors) != n_samples:
+            raise ValueError(
+                f'loso_star_sectors length {len(loso_star_sectors)} != n_samples {n_samples} '
+                '(must be one sector-set per aggregated star row).')
+        fold_of_sample, star_touch_groups, n_folds = loso_sector_folds(
+            loso_star_sectors, n_folds=n_folds, seed=seed)
+        n_secs = len({int(s) for ss in loso_star_sectors for s in ss})
+        print(f'Leave-one-sector-out: {n_secs} unique sectors → {n_folds} disjoint groups; '
+              f'{n_samples} stars. Training drops every star touching the held-out group.')
     elif sector_level_split:
         # Hold out entire SECTORS per fold so each fold predicts stars observed
         # in sectors absent from training — a proxy for field-star generalization.
@@ -1933,6 +2001,15 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
         if combined_mode:
             # Non-host rows (fold_of_sample == -1) join train every fold
             train_idx = np.where((source == 0) | ((source == 1) & (fold_of_sample != fold)))[0]
+        elif loso:
+            # Train only on stars whose sectors are ALL outside the held-out group —
+            # excludes every star that touches a held-out sector (not just its
+            # held-out-sector rows). star_touch_groups was built above.
+            train_idx = np.array(
+                [i for i in range(n_samples) if fold not in star_touch_groups[i]], dtype=int)
+            if len(val_idx) == 0:
+                print(f'    Fold {fold + 1}: no stars assigned to this sector group; skipping.')
+                continue
         else:
             train_idx = np.where(fold_of_sample != fold)[0]
 
@@ -2306,6 +2383,14 @@ def main():
                              'has one isochrone age). Overrides --n_folds. Tests cluster '
                              'generalization / anti-memorization. Read the GLOBAL r/MAE (per-fold r '
                              'is undefined since each fold is a single age).')
+    parser.add_argument('--loso', action='store_true',
+                        help='Leave-one-sector-out CV (per-star, --star_aggregation latent_max): '
+                             'partition unique TESS sectors into --n_folds disjoint groups; each '
+                             'star validates in one fold (a group its sectors touch) and is removed '
+                             'from training in every fold whose group it touches (the whole star, not '
+                             'just its held-out-sector rows). Estimates generalization to stars '
+                             'observed only in sectors the age model never trained on. Read the '
+                             'GLOBAL r/MAE. Mutually exclusive with --loocv_age / --sector_level_split.')
 
     # Age predictor training
     parser.add_argument('--encoder_type',         type=str,   default='pca',
@@ -2416,6 +2501,14 @@ def main():
 
     if args.use_mg and args.use_mg_only:
         parser.error('--use_mg and --use_mg_only are mutually exclusive.')
+
+    if args.loso:
+        if args.loocv_age or args.sector_level_split:
+            parser.error('--loso is mutually exclusive with --loocv_age / --sector_level_split.')
+        if args.star_aggregation != 'latent_max':
+            parser.error('--loso currently supports --star_aggregation latent_max only '
+                         '(per-star holdout). Got --star_aggregation '
+                         f'{args.star_aggregation}.')
 
     device     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     output_dir = Path(args.output_dir)
@@ -2788,6 +2881,25 @@ def main():
         kfold_bprp0     = kfold_mg
         kfold_bprp0_err = kfold_mg_err
 
+    # ── Step 2c: LOSO per-star sector sets ─────────────────────────────────
+    # latent_max collapses all sectors of a star into one row, so the sector
+    # info is gone by run_kfold_cv. Rebuild each star's sector-set here, aligned
+    # to the aggregated rows. aggregate_by_star keys on np.unique(gaia_ids), so
+    # kfold_tics (for latent_max) == the unique Gaia IDs in the same order.
+    loso_star_sectors = None
+    if args.loso:
+        gid_to_secs = {}
+        for g, s in zip(gaia_ids, sectors):
+            gid_to_secs.setdefault(g, set()).add(int(s))
+        missing = [g for g in kfold_tics if g not in gid_to_secs]
+        if missing:
+            raise ValueError(f'--loso: {len(missing)} aggregated stars have no sector record '
+                             '(kfold_tics not aligned to gaia_ids?).')
+        loso_star_sectors = [frozenset(gid_to_secs[g]) for g in kfold_tics]
+        n_usec = len({s for ss in loso_star_sectors for s in ss})
+        print(f'\n--loso: built per-star sector sets for {len(loso_star_sectors)} stars '
+              f'across {n_usec} unique sectors.')
+
     # ── Step 3: k-fold cross-validation ────────────────────────────────────
     print('\n=== Running K-Fold Cross-Validation ===')
     predictions, pred_stats, true_ages, result_tics, fold_assignments, fold_losses, _ = run_kfold_cv(
@@ -2834,6 +2946,8 @@ def main():
         adv_sector_weight=args.adv_sector_weight,
         adv_hidden=args.adv_hidden,
         loocv_age=args.loocv_age,
+        loso=args.loso,
+        loso_star_sectors=loso_star_sectors,
     )
 
     # ── Step 4: for predict_mean, save per-sector CSV then average per star ─

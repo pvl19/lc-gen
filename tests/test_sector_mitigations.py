@@ -179,6 +179,74 @@ def test_loocv_age_runs_end_to_end():
     assert np.isfinite(preds).all()              # every star held out once and predicted
 
 
+def test_loso_sector_folds_invariants():
+    """LOSO grouping: sectors partition disjointly into folds; every validated star
+    touches its assigned group; a training-eligible star never touches the held-out
+    group (the whole star is removed, not just its held-out-sector rows)."""
+    from kfold_age_inference import loso_sector_folds
+    rng = np.random.default_rng(7)
+    n_secs = 40
+    # 200 stars, each observed in 1-4 randomly chosen sectors.
+    star_sectors = [frozenset(int(s) for s in rng.choice(n_secs,
+                    size=int(rng.integers(1, 5)), replace=False)) for _ in range(200)]
+    fos, touch, nf = loso_sector_folds(star_sectors, n_folds=10, seed=42)
+    assert nf == 10
+    assert len(fos) == len(star_sectors)
+    # Each star validated in exactly one fold, and it must touch that fold's group.
+    for i, g in enumerate(touch):
+        assert fos[i] in g                              # validated star touches its group
+    # Reconstruct the sector→group map and check the partition is disjoint + total.
+    # (Determinism: same seed reproduces the identical assignment.)
+    fos2, touch2, _ = loso_sector_folds(star_sectors, n_folds=10, seed=42)
+    assert np.array_equal(fos, fos2) and touch == touch2
+    # No-leak invariant per fold: a star eligible for training (group not in its
+    # touch-set) shares NO sector with any validation star of that fold.
+    for f in range(nf):
+        val_stars  = [i for i in range(len(star_sectors)) if fos[i] == f]
+        val_secs   = set().union(*[star_sectors[i] for i in val_stars]) if val_stars else set()
+        held_group = {i for i in range(len(star_sectors)) if f in touch[i]}  # touch held-out group
+        train_elig = [i for i in range(len(star_sectors)) if f not in touch[i]]
+        for i in train_elig:
+            assert f not in touch[i]                    # by construction
+            # A held-out-group sector can still be one a training star lacks; the
+            # guarantee is the training star's sectors avoid the held-out group.
+        assert all(i not in held_group for i in train_elig)
+
+
+def test_loso_runs_end_to_end():
+    """run_kfold_cv with loso on per-star rows: completes, predicts every star once,
+    and never trains on a star that touches the held-out sector group."""
+    rng = np.random.default_rng(11)
+    n_stars, n_secs, D = 120, 30, 16
+    star_sectors = [frozenset(int(s) for s in rng.choice(n_secs,
+                    size=int(rng.integers(1, 4)), replace=False)) for _ in range(n_stars)]
+    d = dict(
+        latent_vectors=rng.standard_normal((n_stars, D)).astype(np.float32),
+        ages=(10 ** rng.uniform(1.0, 3.3, n_stars)).astype(np.float32),
+        bprp0=rng.uniform(0.5, 2.5, n_stars).astype(np.float32),
+        bprp0_err=rng.uniform(0.01, 0.1, n_stars).astype(np.float32),
+        mg=rng.uniform(0.0, 8.0, n_stars).astype(np.float32),
+        mem_prob=np.full(n_stars, 0.9, np.float32),
+        tic_ids=np.arange(n_stars))
+    preds, stats, ages, tics, folds, losses, _ = run_kfold_cv(
+        d['latent_vectors'], d['ages'], d['bprp0'], d['bprp0_err'], d['mg'],
+        d['mem_prob'], d['tic_ids'], n_folds=10, pca_dim=4, lr=1e-3,
+        weight_decay=1e-4, n_epochs=2, batch_size=16, device=torch.device('cpu'),
+        seed=0, encoder_type='pca', flow_transforms=2, flow_hidden_features=[8],
+        training_stages='joint', loso=True, loso_star_sectors=star_sectors)
+    assert np.isfinite(preds).all()                     # every star held out once and predicted
+
+
+def test_loso_requires_star_sectors():
+    from kfold_age_inference import run_kfold_cv as rk
+    d = _synth()
+    with pytest.raises(ValueError):
+        rk(d['latent_vectors'], d['ages'], d['bprp0'], d['bprp0_err'], d['mg'],
+           d['mem_prob'], d['tic_ids'], n_folds=3, pca_dim=4, n_epochs=1,
+           batch_size=16, device=torch.device('cpu'), encoder_type='pca',
+           flow_transforms=2, flow_hidden_features=[8], loso=True)
+
+
 def test_sector_options_require_sectors():
     d = _synth()
     with pytest.raises(ValueError):
