@@ -2499,6 +2499,15 @@ def main():
                         help='Load pre-computed latents from this npz file instead of '
                              'running the model. --model_path is not required when this '
                              'flag is set.')
+    parser.add_argument('--pca_latent_pool', type=str, nargs='+', default=None, metavar='PATH',
+                        help='In --load_latents mode, list of npz cache paths whose '
+                             'latent_vectors are concatenated to form the GLOBAL PCA fit pool '
+                             '(the basis used by every fold, instead of refitting per-fold on '
+                             'each X_train). Recommended: all three cache files '
+                             '(pretrain+hosts+thickdisk) so the basis spans the full encoder '
+                             'output space — not just the labeled-cluster subset. Critical for '
+                             'LOSO, where the per-fold training set systematically excludes '
+                             'CVZ-touching stars and a per-fold PCA basis would itself be OOD.')
 
     # Combined pretrain + host k-fold mode
     parser.add_argument('--combined_kfold', action='store_true',
@@ -2737,6 +2746,27 @@ def main():
              gaia_ids, tic_ids, sectors) = (
                 a[keep] for a in (latent_vectors, ages, bprp0, bprp0_err, mg, mg_err,
                                   mem_prob, gaia_ids, tic_ids, sectors))
+
+        # ── Global PCA fit pool (multi-cache) ──────────────────────────────
+        # Without this, run_kfold_cv (encoder_type=pca) refits PCA per-fold on
+        # X_train — fine for LOCO but problematic for LOSO, where each fold's
+        # training set systematically excludes CVZ-touching stars and thus each
+        # fold's basis is OOD on the held-out CVZ stars. Concatenating the three
+        # cache files (pretrain + hosts + thickdisk) gives a single basis that
+        # spans the full encoder output space, used identically by every fold.
+        # PCA is unsupervised, so including the labeled stars' latents in the
+        # fit pool introduces no target leakage.
+        if args.pca_latent_pool:
+            print(f'\n=== Loading PCA fit pool ({len(args.pca_latent_pool)} cache(s)) ===')
+            pools = []
+            for p in args.pca_latent_pool:
+                with np.load(p, allow_pickle=True) as data:
+                    lv = data['latent_vectors']
+                    pools.append(np.asarray(lv))
+                    print(f'  {p}: {pools[-1].shape}')
+            pca_latents = np.concatenate(pools, axis=0)
+            del pools
+            print(f'Global PCA pool: {len(pca_latents):,} latents x {pca_latents.shape[1]} dims')
     else:
         if args.model_path is None:
             parser.error('--model_path is required unless --load_latents is set.')

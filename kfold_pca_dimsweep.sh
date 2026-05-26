@@ -14,13 +14,22 @@
 # see final_model/parallel_fixed/e110/loocv/gyro/).
 
 LAT=final_model/sendit/e50/metaAll/latents_pretrain.npz
+HOSTS=final_model/sendit/e50/metaAll/latents_hosts.npz
+THICK=final_model/sendit/e50/metaAll/latents_thickdisk.npz
 BASE=final_model/sendit/e50/loocv_pcadim
+
+# Global PCA pool: ALL pretraining stars (pretrain + hosts + thickdisk). Fit once,
+# used by every fold — apples-to-apples with kfold_loso.sh, which uses the same
+# basis. The previous per-fold PCA fits introduced fold-to-fold basis noise that
+# we want to eliminate before picking the dim.
+PCA_POOL="--pca_latent_pool ${LAT} ${HOSTS} ${THICK}"
+
 COMMON="--load_latents ${LAT} --age_csv final_pretrain/metadata.csv --override_ages_from_csv \
   --pooling_mode multiscale --star_aggregation latent_max --use_metadata \
   --subset_col ref --subset_val ChronoFlow --subset_csv final_pretrain/metadata.csv \
   --loga_grid_size 1000 --seed 42 --batch_size 64 --lr 1e-3 --lr_decay_rate 0.97 \
   --flow_transforms 6 --flow_hidden_dims 64 64 \
-  --encoder_type pca --training_stages joint --n_epochs 100"
+  --encoder_type pca --training_stages joint --n_epochs 100 ${PCA_POOL}"
 
 # One in-distribution ceiling reference (dim 8, random 10-fold).
 echo "############## PCA dim 8 — random 10-fold (in-distribution ceiling) ##############"

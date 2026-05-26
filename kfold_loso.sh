@@ -30,8 +30,17 @@
 # per-sector structure that doesn't transfer to unseen sectors.
 
 LAT=final_model/sendit/e50/metaAll/latents_pretrain.npz
+HOSTS=final_model/sendit/e50/metaAll/latents_hosts.npz
+THICK=final_model/sendit/e50/metaAll/latents_thickdisk.npz
 SWEEP=final_model/sendit/e50/loocv_pcadim
 BASE=final_model/sendit/e50/loso
+
+# Global PCA pool: ALL pretraining stars' latents (pretrain + hosts + thickdisk).
+# Fit once; every fold uses the same basis. Without this, run_kfold_cv refits PCA
+# per-fold on each X_train — and LOSO's train set systematically excludes CVZ-
+# touching stars, so each fold's basis would itself be OOD on its val set,
+# confounding "model generalization" with "PCA-basis OOD".
+PCA_POOL="--pca_latent_pool ${LAT} ${HOSTS} ${THICK}"
 
 # --- Pick the PCA dim from the dim sweep (best LOCO correlation); fallback 8. ---
 PCA_DIM=$(python3 - <<PY
@@ -55,7 +64,7 @@ COMMON="--load_latents ${LAT} --age_csv final_pretrain/metadata.csv \
   --flow_transforms 6 --flow_hidden_dims 64 64 \
   --encoder_type pca --training_stages joint --n_epochs 100"
 
-python scripts/kfold_age_inference.py ${COMMON} \
+python scripts/kfold_age_inference.py ${COMMON} ${PCA_POOL} \
   --pca_dim ${PCA_DIM} --n_folds 10 --loso \
   --output_dir ${BASE}/pca${PCA_DIM}_loso || echo "  !! LOSO FAILED"
 
