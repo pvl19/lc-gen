@@ -7,7 +7,7 @@
 #   2. Update --epochs to your new target (e.g., 50 or 100)
 #   3. Training will continue from where it left off
 #
-#SBATCH --job-name=final-meta-mask-e100
+#SBATCH --job-name=final-meta-mask-sendit-2
 #### Change account to your allocation (e.g., abc123p)
 #SBATCH --account=phy260003p
 #SBATCH --partition=GPU-shared
@@ -32,9 +32,12 @@ OUTPUT_DIR="$PROJECT_DIR/output/$SLURM_JOBID-$SLURM_JOB_NAME"
 #### OPTIONAL: Set to resume training from a previous checkpoint
 #### Example: RESUME_FROM="checkpoints/resume/model.pt"
 #### Leave empty ("") for fresh training
-#### WARM RESTART e50 -> e100: resume the e50 rolling checkpoint. Architecture/data
-#### unchanged, so it loads cleanly. Paired with --fresh_scheduler + --epochs 100
-#### below to run a new OneCycle over the remaining 50 epochs.
+#### CONTINUATION e60 -> e100: the prior warm restart's fresh OneCycle stopped at
+#### e60 (patience 10) only 5 epochs past peak LR — we cut off ~90% of the decay
+#### phase where OneCycle does most of its work. Resume from the e60 rolling
+#### checkpoint and DROP --fresh_scheduler below so the scheduler state restores
+#### mid-decay (step 10/50) and finishes the decay through e100 without another
+#### disruptive ramp. Patience bumped to 25 + min_delta 1e-4 below.
 RESUME_FROM="checkpoints/resume/model.pt"
 
 # Define container
@@ -107,7 +110,6 @@ time -p singularity exec --nv --bind /ocean,$LOCAL,$HOME \
     --hidden_size 64 \
     --output_name model.pt \
     --epochs 100 \
-    --fresh_scheduler \
     --pct_start 0.1 \
     --lr 1e-4 \
     --lr_div_factor 2.0 \
@@ -127,8 +129,8 @@ time -p singularity exec --nv --bind /ocean,$LOCAL,$HOME \
     --num_workers 4 \
     --K 2880 \
     --k_spacing log \
-    --patience 10 \
-    --min_delta 0.0 \
+    --patience 25 \
+    --min_delta 1e-4 \
     --save_every 1 \
     --checkpoint_copy_dir $PROJECT_DIR/checkpoints/resume \
     $RESUME_FLAG
