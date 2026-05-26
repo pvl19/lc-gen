@@ -1888,7 +1888,7 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
                  balance_sector_age=False, n_balance_age_bins=10,
                  adv_sector_weight=0.0, adv_hidden=64,
                  loocv_age=False,
-                 loso=False, loso_star_sectors=None,
+                 loso=False, loso_star_sectors=None, loso_strict_train=True,
                  prefit_pca_bundle=None):
     """Run k-fold cross-validation.
 
@@ -2113,11 +2113,22 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
             # Non-host rows (fold_of_sample == -1) join train every fold
             train_idx = np.where((source == 0) | ((source == 1) & (fold_of_sample != fold)))[0]
         elif loso:
-            # Train only on stars whose sectors are ALL outside the held-out group —
-            # excludes every star that touches a held-out sector (not just its
-            # held-out-sector rows). star_touch_groups was built above.
-            train_idx = np.array(
-                [i for i in range(n_samples) if fold not in star_touch_groups[i]], dtype=int)
+            # Validation = stars assigned to fold f (touch its sector group).
+            # Training mode controlled by loso_strict_train:
+            #   True  (STRICT, default): train_idx = stars whose sectors are ALL outside
+            #         the held-out group. Excludes every star touching a held-out sector
+            #         (the whole star, not just its held-out-sector rows). The most
+            #         aggressive sector-disjoint test — also the most data-removing.
+            #   False (RELAXED): train_idx = all stars NOT in val_idx. Same val partition
+            #         as strict (stratified-by-sector-touching), but training keeps stars
+            #         that touch held-out sectors. At PCA dim 4 with a smooth flow there's
+            #         no per-star memorization, so this is a fair test of "sector-aware
+            #         validation, full training context".
+            if loso_strict_train:
+                train_idx = np.array(
+                    [i for i in range(n_samples) if fold not in star_touch_groups[i]], dtype=int)
+            else:
+                train_idx = np.where(fold_of_sample != fold)[0]
             if len(val_idx) == 0:
                 print(f'    Fold {fold + 1}: no stars assigned to this sector group; skipping.')
                 continue
@@ -2502,6 +2513,13 @@ def main():
                              'just its held-out-sector rows). Estimates generalization to stars '
                              'observed only in sectors the age model never trained on. Read the '
                              'GLOBAL r/MAE. Mutually exclusive with --loocv_age / --sector_level_split.')
+    parser.add_argument('--loso_relaxed_train', action='store_true',
+                        help='With --loso, RELAX the training-set rule: keep stars that touch '
+                             'held-out sectors in training (training = all stars NOT in val), '
+                             'rather than the strict default that excludes every touching star. '
+                             'Validation partition is unchanged. Tests sector-aware validation '
+                             'with full training context; sound at small PCA dims where per-star '
+                             'memorization is precluded by the smooth-flow-over-low-D-bottleneck.')
 
     # Age predictor training
     parser.add_argument('--encoder_type',         type=str,   default='pca',
@@ -3129,6 +3147,7 @@ def main():
         loocv_age=args.loocv_age,
         loso=args.loso,
         loso_star_sectors=loso_star_sectors,
+        loso_strict_train=(not args.loso_relaxed_train),
         prefit_pca_bundle=prefit_pca_bundle,
     )
 
