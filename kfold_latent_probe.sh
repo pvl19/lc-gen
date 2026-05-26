@@ -7,9 +7,16 @@
 
 set -euo pipefail
 
-LATENTS="final_model/parallel_fixed/e60/latents.npz"
+# All 3 sendit/e50 caches — pretrain + hosts + thickdisk. The probe script accepts
+# nargs='+' on --latents and concatenates row-wise, so the basis spans the full
+# encoder output space (~69K per-sector latents / ~21.5K unique stars), not just
+# the labeled-cluster subset. Pass as an unquoted variable below ($LATENTS) so
+# the shell splits on whitespace into three CLI args.
+LATENTS="final_model/sendit/e50/metaAll/latents_pretrain.npz \
+final_model/sendit/e50/metaAll/latents_hosts.npz \
+final_model/sendit/e50/metaAll/latents_thickdisk.npz"
 SECTOR_STATS_CSV="data/sector_stats.csv"
-OUT_ROOT="output/latent_probes"
+OUT_ROOT="output/latent_probes/sendit/e50"
 
 N_FOLDS=5
 HIDDEN_DIMS="256 128 64"
@@ -36,7 +43,7 @@ run_probe() {
     python scripts/kfold_latent_probe.py \
         --probe       "$probe" \
         --baseline    "$baseline" \
-        --latents          "$LATENTS" \
+        --latents          $LATENTS \
         --sector_stats_csv "$SECTOR_STATS_CSV" \
         --output_dir       "$out" \
         --n_folds     "$N_FOLDS" \

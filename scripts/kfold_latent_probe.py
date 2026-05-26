@@ -22,9 +22,15 @@ Usage:
     python scripts/kfold_latent_probe.py \\
         --probe flux_skew \\
         --baseline none \\
-        --latents final_model/parallel_fixed/e60/latents.npz \\
+        --latents final_model/sendit/e50/metaAll/latents_pretrain.npz \\
+                  final_model/sendit/e50/metaAll/latents_hosts.npz \\
+                  final_model/sendit/e50/metaAll/latents_thickdisk.npz \\
         --sector_stats_csv data/sector_stats.csv \\
-        --output_dir output/latent_probes/flux_skew/
+        --output_dir output/latent_probes/sendit/e50/flux_skew/
+
+--latents accepts multiple npz paths; their `latent_vectors`/`gaia_ids`/`tic_ids`/
+`sectors` arrays are concatenated row-wise to give the probe a broader sample
+(e.g. pretrain + hosts + thickdisk) without changing the per-row contract.
 """
 import argparse
 import json
@@ -229,7 +235,12 @@ def main():
     ap.add_argument('--probe', required=True, choices=list(PROBE_TRANSFORMS.keys()))
     ap.add_argument('--baseline', default='none',
                     choices=['none', 'MLP', 'gaussian', 'shuffle'])
-    ap.add_argument('--latents', default='final_model/parallel_fixed/e60/latents.npz')
+    ap.add_argument('--latents', nargs='+',
+                    default=['final_model/sendit/e50/metaAll/latents_pretrain.npz'],
+                    help='One or more npz cache paths; their latent_vectors / gaia_ids / '
+                         'tic_ids / sectors are concatenated row-wise. Pass all 3 sendit/e50 '
+                         'caches (pretrain + hosts + thickdisk) for full encoder-output-space '
+                         'coverage.')
     ap.add_argument('--sector_stats_csv', default='data/sector_stats.csv',
                     help='Per-(tic_id, sector) target CSV with all probe columns.')
     ap.add_argument('--output_dir', required=True)
@@ -252,16 +263,27 @@ def main():
 
     print(f'Probe: {args.probe}  baseline: {args.baseline}  device: {args.device}')
 
-    # ---- load latents + metadata ----------------------------------------
-    z = np.load(args.latents, allow_pickle=True)
-    if 'latent_vectors' in z.files:
-        X = z['latent_vectors'].astype(np.float32)
-    else:
-        X = z['latents'].astype(np.float32)
-    gaia_ids = z['gaia_ids']
-    sectors  = z['sectors'] if 'sectors' in z.files else np.zeros(len(X), dtype=np.int64)
-    tic_ids  = z['tic_ids'] if 'tic_ids' in z.files else np.zeros(len(X), dtype=np.int64)
-    print(f'  latents: {X.shape}')
+    # ---- load latents + metadata (concat across one or more caches) -----
+    paths = args.latents if isinstance(args.latents, list) else [args.latents]
+    X_parts, gaia_parts, sec_parts, tic_parts = [], [], [], []
+    for p in paths:
+        z = np.load(p, allow_pickle=True)
+        if 'latent_vectors' in z.files:
+            Xp = z['latent_vectors'].astype(np.float32)
+        else:
+            Xp = z['latents'].astype(np.float32)
+        nrows = len(Xp)
+        X_parts.append(Xp)
+        gaia_parts.append(np.asarray(z['gaia_ids']))
+        sec_parts.append(z['sectors'] if 'sectors' in z.files else np.zeros(nrows, dtype=np.int64))
+        tic_parts.append(z['tic_ids']  if 'tic_ids'  in z.files else np.zeros(nrows, dtype=np.int64))
+        print(f'  loaded {p}: latent_vectors {Xp.shape}, {nrows} per-sector rows')
+    X        = np.concatenate(X_parts, axis=0)
+    gaia_ids = np.concatenate(gaia_parts)
+    sectors  = np.concatenate(sec_parts)
+    tic_ids  = np.concatenate(tic_parts)
+    if len(paths) > 1:
+        print(f'  combined latents: {X.shape} (from {len(paths)} caches)')
 
     # ---- load + transform targets ---------------------------------------
     y_raw = load_targets(args.probe, tic_ids, gaia_ids, sectors,
