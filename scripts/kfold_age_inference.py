@@ -1157,6 +1157,75 @@ def load_latents_cache(cache_path: str):
 
 
 # ---------------------------------------------------------------------------
+# Global PCA artifact (compute once, reuse across sweep + LOSO runs)
+# ---------------------------------------------------------------------------
+
+def fit_global_pca_bundle(pca_latents, max_dim, whiten=True):
+    """Fit X-normalization stats + PCA at `max_dim` components on the global pool.
+
+    Returns (pca_obj, X_mean, X_std). The PCA is fit on z-scored latents — every
+    fold that uses this bundle just truncates pca_obj.components_ to its desired
+    dim and projects (after applying the same X normalization). Whiten matches
+    the per-fold behavior so downstream model code is unchanged.
+    """
+    pca_latents = np.asarray(pca_latents, dtype=np.float32)
+    X_mean = pca_latents.mean(axis=0).astype(np.float64)
+    X_std  = pca_latents.std(axis=0).astype(np.float64) + 1e-8
+    X_norm = ((pca_latents - X_mean) / X_std).astype(np.float32)
+    max_dim = int(min(max_dim, X_norm.shape[1], X_norm.shape[0]))
+    pca = PCA(n_components=max_dim, whiten=whiten)
+    pca.fit(X_norm)
+    var_expl = pca.explained_variance_ratio_.sum()
+    print(f'  Global PCA: fit {max_dim} components on {len(X_norm)} latents '
+          f'({100*var_expl:.1f}% cum. variance explained)')
+    return pca, X_mean, X_std
+
+
+def save_global_pca_artifact(path, pca, X_mean, X_std):
+    """Persist the bundle so subsequent runs reuse the exact same basis."""
+    np.savez(path,
+        pca_mean=pca.mean_,                        # (D,)  feature-wise mean used by PCA.transform
+        pca_components=pca.components_,            # (K, D)
+        pca_explained_variance=pca.explained_variance_,
+        pca_explained_variance_ratio=pca.explained_variance_ratio_,
+        pca_singular_values=pca.singular_values_,
+        pca_n_components=np.int64(pca.n_components_),
+        pca_n_features_in=np.int64(pca.n_features_in_),
+        pca_n_samples=np.int64(pca.n_samples_),
+        pca_noise_variance=np.float64(getattr(pca, 'noise_variance_', 0.0)),
+        pca_whiten=np.bool_(pca.whiten),
+        X_mean=X_mean, X_std=X_std)
+    print(f'  Saved global PCA artifact → {path}')
+
+
+def load_global_pca_artifact(path, want_dim):
+    """Reconstruct an sklearn PCA truncated to the first `want_dim` components."""
+    d = np.load(path, allow_pickle=False)
+    n_cached = int(d['pca_n_components'])
+    if want_dim > n_cached:
+        raise ValueError(
+            f'load_global_pca_artifact({path}): requested {want_dim} components '
+            f'but cache has only {n_cached}. Recompute with --pca_cache_max_dim '
+            f'>= {want_dim}.')
+    pca = PCA(n_components=want_dim, whiten=bool(d['pca_whiten']))
+    pca.mean_                    = d['pca_mean']
+    pca.components_              = d['pca_components'][:want_dim]
+    pca.explained_variance_      = d['pca_explained_variance'][:want_dim]
+    pca.explained_variance_ratio_= d['pca_explained_variance_ratio'][:want_dim]
+    pca.singular_values_         = d['pca_singular_values'][:want_dim]
+    pca.n_components_            = want_dim
+    pca.n_features_in_           = int(d['pca_n_features_in'])
+    pca.n_samples_               = int(d['pca_n_samples'])
+    pca.noise_variance_          = float(d['pca_noise_variance'])
+    X_mean = d['X_mean'].astype(np.float64)
+    X_std  = d['X_std'].astype(np.float64)
+    var_expl = pca.explained_variance_ratio_.sum()
+    print(f'  Loaded global PCA artifact ← {path} '
+          f'(took {want_dim}/{n_cached} components, {100*var_expl:.1f}% var explained)')
+    return pca, X_mean, X_std
+
+
+# ---------------------------------------------------------------------------
 # Star-level aggregation helpers
 # ---------------------------------------------------------------------------
 
@@ -1819,7 +1888,8 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
                  balance_sector_age=False, n_balance_age_bins=10,
                  adv_sector_weight=0.0, adv_hidden=64,
                  loocv_age=False,
-                 loso=False, loso_star_sectors=None):
+                 loso=False, loso_star_sectors=None,
+                 prefit_pca_bundle=None):
     """Run k-fold cross-validation.
 
     Args:
@@ -1867,7 +1937,17 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
     # the model's point-estimate predictions.
     y_central = y if y.ndim == 1 else y.mean(axis=1)
 
-    if pca_latents is not None:
+    # Pre-fit PCA artifact (computed once on the full pool, reused across the dim
+    # sweep + LOSO) takes priority over the inline `pca_latents`-based fit below.
+    if prefit_pca_bundle is not None:
+        global_pca, X_mean, X_std = prefit_pca_bundle
+        if encoder_type == 'pca' and global_pca.n_components_ != pca_dim:
+            raise ValueError(
+                f'prefit_pca_bundle has {global_pca.n_components_} components but '
+                f'--pca_dim={pca_dim}; truncate at load time so they match.')
+        print(f'Normalization + PCA basis from prefit_pca_bundle '
+              f'(no per-fold refit; identical basis across runs).')
+    elif pca_latents is not None:
         X_mean, X_std = pca_latents.mean(axis=0), pca_latents.std(axis=0) + 1e-8
         print(f'Normalization computed from {len(pca_latents)} all-star latents')
     else:
@@ -1888,17 +1968,22 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
         'input_dim': X.shape[1],
     }
 
-    # Fit a single global PCA on all-star latents (if provided), so every fold
-    # uses the same coordinate system rather than re-fitting per fold.
-    global_pca = None
-    if pca_latents is not None and encoder_type == 'pca':
-        pca_norm   = (pca_latents - X_mean) / X_std
-        global_pca = PCA(n_components=pca_dim, whiten=True)
-        global_pca.fit(pca_norm)
-        var_expl = global_pca.explained_variance_ratio_.sum()
-        print(f'Global PCA {pca_dim}D fitted on {len(pca_latents)} stars: '
-              f'{100*var_expl:.1f}% variance explained')
-        del pca_norm  # free the normalized copy; global_pca is now self-contained
+    # Fit a single global PCA on all-star latents (if provided AND no prefit
+    # bundle was passed in), so every fold uses the same coordinate system
+    # rather than re-fitting per fold. When prefit_pca_bundle is set, global_pca
+    # was already populated above.
+    if prefit_pca_bundle is not None:
+        pass  # global_pca already bound from the bundle
+    else:
+        global_pca = None
+        if pca_latents is not None and encoder_type == 'pca':
+            pca_norm   = (pca_latents - X_mean) / X_std
+            global_pca = PCA(n_components=pca_dim, whiten=True)
+            global_pca.fit(pca_norm)
+            var_expl = global_pca.explained_variance_ratio_.sum()
+            print(f'Global PCA {pca_dim}D fitted on {len(pca_latents)} stars: '
+                  f'{100*var_expl:.1f}% variance explained')
+            del pca_norm  # free the normalized copy; global_pca is now self-contained
 
     # Age grid for posterior inference
     G = loga_grid_size or LOGA_GRID_DEFAULT_SIZE
@@ -2508,6 +2593,18 @@ def main():
                              'output space — not just the labeled-cluster subset. Critical for '
                              'LOSO, where the per-fold training set systematically excludes '
                              'CVZ-touching stars and a per-fold PCA basis would itself be OOD.')
+    parser.add_argument('--pca_cache', type=str, default=None, metavar='PATH',
+                        help='Path to a persisted global PCA artifact (npz with X_mean/X_std + '
+                             'PCA components). If the file EXISTS, load it (truncated to '
+                             '--pca_dim) and skip pca_latents loading + the in-script PCA fit — '
+                             'every run uses bit-identical normalization + basis. If it does NOT '
+                             'exist, require --pca_latent_pool, fit a PCA at --pca_cache_max_dim '
+                             'on the pool, save to this path, then use it (truncated to --pca_dim). '
+                             'Lets the sweep + LOSO share one computed-once artifact.')
+    parser.add_argument('--pca_cache_max_dim', type=int, default=16,
+                        help='When --pca_cache file is being CREATED, fit and save this many '
+                             'PCA components (default 16). Any subsequent run can request '
+                             '--pca_dim <= this value and get the first --pca_dim components.')
 
     # Combined pretrain + host k-fold mode
     parser.add_argument('--combined_kfold', action='store_true',
@@ -2956,6 +3053,34 @@ def main():
         print(f'\n--loso: built per-star sector sets for {len(loso_star_sectors)} stars '
               f'across {n_usec} unique sectors.')
 
+    # ── Step 2d: global PCA cache (compute-once / load-once) ───────────────
+    # When --pca_cache is set, every run uses bit-identical X normalization +
+    # PCA basis: the first run computes from --pca_latent_pool and saves; later
+    # runs (sweep at other dims, LOSO) just load and truncate. Eliminates the
+    # per-fold PCA refit AND the numerical noise of refitting the global basis
+    # across runs.
+    prefit_pca_bundle = None
+    if args.pca_cache:
+        import os
+        if os.path.exists(args.pca_cache):
+            print(f'\n=== Loading global PCA cache: {args.pca_cache} ===')
+            pca_obj_c, X_mean_c, X_std_c = load_global_pca_artifact(args.pca_cache, args.pca_dim)
+            prefit_pca_bundle = (pca_obj_c, X_mean_c, X_std_c)
+            pca_latents = None  # bundle supersedes the inline fit
+        else:
+            if pca_latents is None:
+                parser.error('--pca_cache file does not exist and --pca_latent_pool was not '
+                             'provided; cannot compute the cache.')
+            print(f'\n=== Computing global PCA cache (max_dim={args.pca_cache_max_dim}) ===')
+            pca_full, Xm, Xs = fit_global_pca_bundle(pca_latents, args.pca_cache_max_dim)
+            save_global_pca_artifact(args.pca_cache, pca_full, Xm, Xs)
+            del pca_full
+            # Reload at the requested dim so the run uses the same code path as
+            # subsequent cache-hit runs.
+            pca_obj_c, X_mean_c, X_std_c = load_global_pca_artifact(args.pca_cache, args.pca_dim)
+            prefit_pca_bundle = (pca_obj_c, X_mean_c, X_std_c)
+            pca_latents = None
+
     # ── Step 3: k-fold cross-validation ────────────────────────────────────
     print('\n=== Running K-Fold Cross-Validation ===')
     predictions, pred_stats, true_ages, result_tics, fold_assignments, fold_losses, _ = run_kfold_cv(
@@ -3004,6 +3129,7 @@ def main():
         loocv_age=args.loocv_age,
         loso=args.loso,
         loso_star_sectors=loso_star_sectors,
+        prefit_pca_bundle=prefit_pca_bundle,
     )
 
     # ── Step 4: for predict_mean, save per-sector CSV then average per star ─

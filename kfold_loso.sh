@@ -35,12 +35,13 @@ THICK=final_model/sendit/e50/metaAll/latents_thickdisk.npz
 SWEEP=final_model/sendit/e50/loocv_pcadim
 BASE=final_model/sendit/e50/loso
 
-# Global PCA pool: ALL pretraining stars' latents (pretrain + hosts + thickdisk).
-# Fit once; every fold uses the same basis. Without this, run_kfold_cv refits PCA
-# per-fold on each X_train — and LOSO's train set systematically excludes CVZ-
-# touching stars, so each fold's basis would itself be OOD on its val set,
-# confounding "model generalization" with "PCA-basis OOD".
-PCA_POOL="--pca_latent_pool ${LAT} ${HOSTS} ${THICK}"
+# Global PCA: the dim sweep (kfold_pca_dimsweep.sh) writes a single cached basis
+# fit on ALL pretraining stars (pretrain + hosts + thickdisk) at dim 16. Loading
+# that artifact here gives LOSO the bit-identical basis used by the LOCO sweep —
+# isolates "model generalization" from "PCA-basis OOD on CVZ stars". --pca_latent_pool
+# is still passed so the cache can be built on a fresh run if the file is missing.
+PCA_CACHE=final_model/sendit/e50/global_pca_d16.npz
+PCA_POOL="--pca_latent_pool ${LAT} ${HOSTS} ${THICK} --pca_cache ${PCA_CACHE} --pca_cache_max_dim 16"
 
 # --- Pick the PCA dim from the dim sweep (best LOCO correlation); fallback 8. ---
 PCA_DIM=$(python3 - <<PY
