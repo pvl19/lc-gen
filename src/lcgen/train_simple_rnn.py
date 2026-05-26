@@ -469,12 +469,17 @@ def train(args):
         persistent_dir.mkdir(parents=True, exist_ok=True)
 
     # early stopping tracking
-    # If resuming, initialize best_val_loss from previous validation losses
+    # If resuming, initialize best_val_loss from previous validation losses, and
+    # bind best_epoch to the prior best's epoch so later code (early-stop print,
+    # post-loop save_dict) is safe even when this run finds no new improvement.
     if previous_val_losses:
         best_val_loss = min(previous_val_losses)
-        print(f"Initialized best_val_loss from previous training: {best_val_loss:.6f}")
+        best_epoch = int(np.argmin(previous_val_losses)) + 1
+        print(f"Initialized best_val_loss from previous training: {best_val_loss:.6f} "
+              f"(prior best at epoch {best_epoch})")
     else:
         best_val_loss = float('inf')
+        best_epoch = None
     epochs_without_improvement = 0
     best_model_state = None
     stopped_early = False
@@ -644,6 +649,7 @@ def train(args):
                 if args.patience > 0:
                     if val_loss < (best_val_loss - args.min_delta):
                         best_val_loss = val_loss
+                        best_epoch = epoch + 1
                         epochs_without_improvement = 0
                         # Deep-copy: state_dict() returns references to live
                         # tensors, so in-place optimizer updates on later epochs
@@ -665,7 +671,8 @@ def train(args):
 
                         if epochs_without_improvement >= args.patience:
                             print(f'\nEarly stopping triggered after {epoch+1} epochs (patience={args.patience})')
-                            print(f'Best validation loss: {best_val_loss:.6f} at epoch {epoch+1-args.patience}')
+                            be_str = str(best_epoch) if best_epoch is not None else 'unknown'
+                            print(f'Best validation loss: {best_val_loss:.6f} at epoch {be_str}')
                             stopped_early = True
                             _save_rolling_checkpoint(
                                 raw_model, optimizer, scheduler, epoch + 1,
@@ -695,12 +702,18 @@ def train(args):
             )
 
     if is_main:
-        # Restore best model if early stopping was used
+        # Restore best model if a new best was captured in memory this run. When
+        # resuming with no improvement (best_model_state stays None), we leave the
+        # model at its final state — the prior run's best_model.pt on disk still
+        # holds the historical best; we don't have it in memory here.
         if best_model_state is not None:
             raw_model.load_state_dict(best_model_state['model_state_dict'])
             optimizer.load_state_dict(best_model_state['optimizer_state_dict'])
             best_epoch = best_model_state['epoch']
             print(f'\nRestored best model from epoch {best_epoch}')
+        elif stopped_early:
+            print(f'\nEarly-stopped with no new best this run; keeping final weights '
+                  f'(prior best epoch {best_epoch} preserved on disk in a previous output dir).')
 
         # Concatenate losses with previous training session
         all_train_losses = previous_train_losses + train_epoch_losses
@@ -720,8 +733,10 @@ def train(args):
             'instr_emb_dim': raw_model.instr_emb_dim,
         }
         torch.save(checkpoint_dict, model_path)
-        if stopped_early:
+        if stopped_early and best_model_state is not None:
             print(f'Saved best model (epoch {best_epoch}) to {model_path}')
+        elif stopped_early:
+            print(f'Saved final-state model (epoch {len(all_train_losses)}, no new best this run) to {model_path}')
         else:
             print(f'Saved final model (epoch {len(all_train_losses)}) to {model_path}')
 
@@ -739,7 +754,11 @@ def train(args):
                 save_dict['k_std']  = np.array([s['std']  for s in k_stats_per_epoch], dtype=np.float32)
             if stopped_early:
                 save_dict['stopped_early'] = True
-                save_dict['best_epoch'] = best_epoch if best_model_state else len(all_train_losses) - epochs_without_improvement
+                # best_epoch is now always bound: from previous_val_losses on resume,
+                # or set when a new best was found this run. Fall back to a stop-time
+                # estimate only if neither path ran (shouldn't happen in practice).
+                save_dict['best_epoch'] = (best_epoch if best_epoch is not None
+                                           else len(all_train_losses) - epochs_without_improvement)
                 save_dict['best_val_loss'] = best_val_loss
             np.savez_compressed(losses_path, **save_dict)
             print('Saved epoch losses to', losses_path)
