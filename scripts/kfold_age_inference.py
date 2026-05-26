@@ -2598,10 +2598,13 @@ def main():
                         help='After extracting latents, save them (+ cross-sector latents) '
                              'to this npz file. Pass to --load_latents on subsequent runs '
                              'to skip model inference entirely.')
-    parser.add_argument('--load_latents', type=str, default=None, metavar='PATH',
-                        help='Load pre-computed latents from this npz file instead of '
-                             'running the model. --model_path is not required when this '
-                             'flag is set.')
+    parser.add_argument('--load_latents', type=str, nargs='+', default=None, metavar='PATH',
+                        help='Load pre-computed latents from one or more npz cache files '
+                             '(concatenated row-wise) instead of running the model. '
+                             '--model_path is not required when this flag is set. Multi-cache '
+                             'mode is incompatible with --override_ages_from_csv and '
+                             '--combined_kfold; cross-sector latents are dropped (use a single '
+                             'cache if --star_aggregation cross_sector).')
     parser.add_argument('--pca_latent_pool', type=str, nargs='+', default=None, metavar='PATH',
                         help='In --load_latents mode, list of npz cache paths whose '
                              'latent_vectors are concatenated to form the GLOBAL PCA fit pool '
@@ -2829,14 +2832,55 @@ def main():
         print(f'Combined dataset: {n_p} pretrain rows + {n_h} host rows = {n_p + n_h} total')
 
     elif args.load_latents:
-        print(f'\n=== Loading latents from cache: {args.load_latents} ===')
-        c = _load_cache_with_csv_fallback(args.load_latents, args.age_csv)
-        latent_vectors = c['latent_vectors']
-        ages, bprp0, bprp0_err = c['ages'], c['bprp0'], c['bprp0_err']
-        mg, mg_err, mem_prob = c['mg'], c['mg_err'], c['mem_prob']
-        gaia_ids, tic_ids, sectors = c['gaia_ids'], c['tic_ids'], c['sectors']
-        cached_cross_sector_latents = c['cross_sector_latents']
-        cached_cross_sector_tic_ids = c['cross_sector_tic_ids']
+        # --load_latents now accepts a list (nargs='+'); a single path arrives as
+        # a one-element list. For multi-cache, concat each field row-wise.
+        paths = args.load_latents if isinstance(args.load_latents, list) else [args.load_latents]
+        if len(paths) > 1:
+            if args.override_ages_from_csv:
+                parser.error('--override_ages_from_csv is not supported with multiple '
+                             '--load_latents (one override CSV cannot cover stars from '
+                             'different cache populations cleanly). Use cache ages instead.')
+            print(f'\n=== Loading {len(paths)} latents caches and concatenating ===')
+        else:
+            print(f'\n=== Loading latents from cache: {paths[0]} ===')
+        parts = []
+        for p in paths:
+            if len(paths) > 1:
+                print(f'  loading {p} ...')
+            parts.append(_load_cache_with_csv_fallback(p, args.age_csv))
+
+        def _concat(key, *, allow_missing=False):
+            arrs = [pp[key] for pp in parts]
+            if any(a is None for a in arrs):
+                if allow_missing:
+                    return None
+                raise ValueError(f'Cache field "{key}" missing in one of {paths}.')
+            return np.concatenate([np.asarray(a) for a in arrs], axis=0)
+
+        latent_vectors = _concat('latent_vectors')
+        ages           = _concat('ages')
+        bprp0          = _concat('bprp0')
+        bprp0_err      = _concat('bprp0_err')
+        mg             = _concat('mg')
+        mg_err         = _concat('mg_err')
+        mem_prob       = _concat('mem_prob')
+        gaia_ids       = _concat('gaia_ids')
+        tic_ids        = _concat('tic_ids')
+        sectors        = _concat('sectors')
+        # cross-sector fields: only sensible for a single cache (TIC ordering
+        # differs across caches and merging would double-count multi-cache stars).
+        if len(paths) == 1:
+            cached_cross_sector_latents = parts[0]['cross_sector_latents']
+            cached_cross_sector_tic_ids = parts[0]['cross_sector_tic_ids']
+        else:
+            cached_cross_sector_latents = None
+            cached_cross_sector_tic_ids = None
+            if args.star_aggregation == 'cross_sector':
+                parser.error('--star_aggregation cross_sector requires a single --load_latents '
+                             'cache (TIC ordering is cache-specific).')
+            print(f'  combined: {latent_vectors.shape[0]} per-sector rows '
+                  f'across {len(paths)} caches '
+                  f'({len(np.unique(gaia_ids))} unique stars)')
 
         if args.override_ages_from_csv:
             # Re-join ages from --age_csv (e.g. ChronoFlow isochrone ages) so LOCO
