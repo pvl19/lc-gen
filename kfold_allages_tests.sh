@@ -23,22 +23,23 @@
 LAT=final_model/sendit/e50/metaAll/latents_pretrain.npz
 HOSTS=final_model/sendit/e50/metaAll/latents_hosts.npz
 THICK=final_model/sendit/e50/metaAll/latents_thickdisk.npz
-PCA_CACHE=final_model/sendit/e50/global_pca_d16.npz
-SWEEP=final_model/sendit/e50/loocv_pcadim
+AGE_ROOT=final_model/sendit/e50/age_inference
+PCA_CACHE=${AGE_ROOT}/shared/global_pca_d16.npz
+SWEEP_LOCO=${AGE_ROOT}/chronoflow/loco
 
-BASE_RAND_LAT=final_model/sendit/e50/random_allages
-BASE_RAND_GYRO=final_model/sendit/e50/random_allages_gyro
-BASE_LOSO_LAT=final_model/sendit/e50/loso_allages
+BASE_RAND_LAT=${AGE_ROOT}/all_pretrain_plus_hosts/random_latent
+BASE_RAND_GYRO=${AGE_ROOT}/all_pretrain_plus_hosts/random_gyro
+BASE_LOSO_LAT=${AGE_ROOT}/all_pretrain_plus_hosts/loso
 
 PCA_POOL="--pca_latent_pool ${LAT} ${HOSTS} ${THICK} --pca_cache ${PCA_CACHE} --pca_cache_max_dim 16"
 
 # Pick PCA dim from the sweep (best LOCO r); fallback 8.
 PCA_DIM=$(python3 - <<PY
 import json, os
-sweep = "${SWEEP}"
+sweep_loco = "${SWEEP_LOCO}"
 best_d, best_r = None, -1e9
 for d in (4, 8, 16):
-    p = os.path.join(sweep, f"pca{d}_loco", "kfold_metrics.json")
+    p = os.path.join(sweep_loco, f"pca{d}", "kfold_metrics.json")
     if os.path.exists(p):
         r = json.load(open(p)).get("correlation", -1e9)
         if r > best_r:
@@ -58,7 +59,7 @@ python scripts/kfold_age_inference.py \
   --encoder_type pca --training_stages joint --n_epochs 100 \
   ${PCA_POOL} \
   --pca_dim ${PCA_DIM} --n_folds 10 \
-  --output_dir ${BASE_RAND_LAT}/pca${PCA_DIM}_random || echo "  !! LATENT random FAILED"
+  --output_dir ${BASE_RAND_LAT}/pca${PCA_DIM} || echo "  !! LATENT random FAILED"
 
 # ── 2) Gyro random (pretrain only; hosts have no Prot) ───────────────────
 echo ""
@@ -82,7 +83,7 @@ python scripts/kfold_age_inference.py \
   --encoder_type pca --training_stages joint --n_epochs 100 \
   ${PCA_POOL} \
   --pca_dim ${PCA_DIM} --n_folds 10 --loso \
-  --output_dir ${BASE_LOSO_LAT}/pca${PCA_DIM}_loso || echo "  !! LATENT LOSO FAILED"
+  --output_dir ${BASE_LOSO_LAT}/pca${PCA_DIM} || echo "  !! LATENT LOSO FAILED"
 
 # ── Summary: all-ages alongside ChronoFlow references ────────────────────
 echo ""
@@ -91,15 +92,15 @@ python3 - <<PY
 import json, os
 runs = [
     # ChronoFlow (N≈2,470) references for context
-    ("CHRONOFLOW LOCO latent", f"final_model/sendit/e50/loocv_pcadim/pca${PCA_DIM}_loco/kfold_metrics.json"),
-    ("CHRONOFLOW LOCO gyro",   "final_model/parallel_fixed/e110/loocv/gyro/kfold_metrics.json"),
-    ("CHRONOFLOW LOSO latent", f"final_model/sendit/e50/loso_chronoflow/pca${PCA_DIM}_loso/kfold_metrics.json"),
-    ("CHRONOFLOW RAND latent", f"final_model/sendit/e50/random_chronoflow/pca${PCA_DIM}_random/kfold_metrics.json"),
-    ("CHRONOFLOW RAND gyro",   "final_model/sendit/e50/random_chronoflow_gyro/kfold_metrics.json"),
+    ("CHRONOFLOW LOCO latent", f"${SWEEP_LOCO}/pca${PCA_DIM}/kfold_metrics.json"),
+    ("CHRONOFLOW LOCO gyro",   f"${AGE_ROOT}/chronoflow/loco_gyro_reference/kfold_metrics.json"),
+    ("CHRONOFLOW LOSO latent", f"${AGE_ROOT}/chronoflow/loso/pca${PCA_DIM}/kfold_metrics.json"),
+    ("CHRONOFLOW RAND latent", f"${AGE_ROOT}/chronoflow/random_latent/pca${PCA_DIM}/kfold_metrics.json"),
+    ("CHRONOFLOW RAND gyro",   f"${AGE_ROOT}/chronoflow/random_gyro/kfold_metrics.json"),
     # All-ages (this run)
-    ("ALL-AGES   RAND latent", f"${BASE_RAND_LAT}/pca${PCA_DIM}_random/kfold_metrics.json"),
+    ("ALL-AGES   RAND latent", f"${BASE_RAND_LAT}/pca${PCA_DIM}/kfold_metrics.json"),
     ("ALL-AGES   RAND gyro",   "${BASE_RAND_GYRO}/kfold_metrics.json"),
-    ("ALL-AGES   LOSO latent", f"${BASE_LOSO_LAT}/pca${PCA_DIM}_loso/kfold_metrics.json"),
+    ("ALL-AGES   LOSO latent", f"${BASE_LOSO_LAT}/pca${PCA_DIM}/kfold_metrics.json"),
 ]
 print(f"{'run':>30}{'N':>8}{'r':>9}{'MAE':>9}")
 print("-"*56)

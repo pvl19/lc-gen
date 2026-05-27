@@ -16,7 +16,7 @@
 # leaking memorized stellar ages.
 #
 # Comparison points (sendit/e50, PCA dim 4, global PCA cache, ages from cache):
-#   strict LOSO   (final_model/sendit/e50/loso/pca4_loso/):       r=0.454 MAE=0.542 N=9221
+#   strict LOSO   (age_inference/all_pretrain/loso_strict/pca4/): r=0.454 MAE=0.542 N=9221
 #   in-distribution ceiling (ChronoFlow N=2470, random 10-fold):  r=0.828
 # If relaxed-LOSO is close to the strict number → the gap is the val-side sector
 # partition itself, not the train-side data removal. If it's close to the ceiling
@@ -25,19 +25,21 @@
 LAT=final_model/sendit/e50/metaAll/latents_pretrain.npz
 HOSTS=final_model/sendit/e50/metaAll/latents_hosts.npz
 THICK=final_model/sendit/e50/metaAll/latents_thickdisk.npz
-SWEEP=final_model/sendit/e50/loocv_pcadim
-BASE=final_model/sendit/e50/loso_relaxed
+AGE_ROOT=final_model/sendit/e50/age_inference
+SWEEP_LOCO=${AGE_ROOT}/chronoflow/loco
+BASE=${AGE_ROOT}/all_pretrain/loso_relaxed
+STRICT_REF=${AGE_ROOT}/all_pretrain/loso_strict
 
-PCA_CACHE=final_model/sendit/e50/global_pca_d16.npz
+PCA_CACHE=${AGE_ROOT}/shared/global_pca_d16.npz
 PCA_POOL="--pca_latent_pool ${LAT} ${HOSTS} ${THICK} --pca_cache ${PCA_CACHE} --pca_cache_max_dim 16"
 
 # Pick the PCA dim from the dim sweep (best LOCO r); fallback 8.
 PCA_DIM=$(python3 - <<PY
 import json, os
-sweep = "${SWEEP}"
+sweep_loco = "${SWEEP_LOCO}"
 best_d, best_r = None, -1e9
 for d in (4, 8, 16):
-    p = os.path.join(sweep, f"pca{d}_loco", "kfold_metrics.json")
+    p = os.path.join(sweep_loco, f"pca{d}", "kfold_metrics.json")
     if os.path.exists(p):
         r = json.load(open(p)).get("correlation", -1e9)
         if r > best_r:
@@ -55,21 +57,21 @@ COMMON="--load_latents ${LAT} --age_csv final_pretrain/metadata.csv \
 
 python scripts/kfold_age_inference.py ${COMMON} ${PCA_POOL} \
   --pca_dim ${PCA_DIM} --n_folds 10 --loso --loso_relaxed_train \
-  --output_dir ${BASE}/pca${PCA_DIM}_loso || echo "  !! RELAXED LOSO FAILED"
+  --output_dir ${BASE}/pca${PCA_DIM} || echo "  !! RELAXED LOSO FAILED"
 
 echo ""
 echo "================ RELAXED LOSO SUMMARY (sendit/e50, all labeled stars) ================"
 python3 - <<PY
 import json, os
 import pandas as pd, numpy as np
-base = "${BASE}"; d = "pca${PCA_DIM}_loso"
+base = "${BASE}"; d = "pca${PCA_DIM}"
 p = os.path.join(base, d, "kfold_metrics.json")
 print(f"{'run':22}{'N':>7}{'r':>9}{'MAE':>9}")
 if os.path.exists(p):
     m = json.load(open(p))
     print(f"{d+' (relaxed)':22}{m['n_samples']:>7}{m['correlation']:>9.3f}{m['mae_dex']:>9.3f}")
 # Also report the strict number for direct comparison
-ps = os.path.join("final_model/sendit/e50/loso", d, "kfold_metrics.json")
+ps = os.path.join("${STRICT_REF}", d, "kfold_metrics.json")
 if os.path.exists(ps):
     m = json.load(open(ps))
     print(f"{d+' (strict, ref)':22}{m['n_samples']:>7}{m['correlation']:>9.3f}{m['mae_dex']:>9.3f}")

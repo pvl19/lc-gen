@@ -32,24 +32,25 @@
 LAT=final_model/sendit/e50/metaAll/latents_pretrain.npz
 HOSTS=final_model/sendit/e50/metaAll/latents_hosts.npz
 THICK=final_model/sendit/e50/metaAll/latents_thickdisk.npz
-SWEEP=final_model/sendit/e50/loocv_pcadim
-BASE=final_model/sendit/e50/loso
+AGE_ROOT=final_model/sendit/e50/age_inference
+SWEEP_LOCO=${AGE_ROOT}/chronoflow/loco
+BASE=${AGE_ROOT}/all_pretrain/loso_strict
 
 # Global PCA: the dim sweep (kfold_pca_dimsweep.sh) writes a single cached basis
 # fit on ALL pretraining stars (pretrain + hosts + thickdisk) at dim 16. Loading
 # that artifact here gives LOSO the bit-identical basis used by the LOCO sweep —
 # isolates "model generalization" from "PCA-basis OOD on CVZ stars". --pca_latent_pool
 # is still passed so the cache can be built on a fresh run if the file is missing.
-PCA_CACHE=final_model/sendit/e50/global_pca_d16.npz
+PCA_CACHE=${AGE_ROOT}/shared/global_pca_d16.npz
 PCA_POOL="--pca_latent_pool ${LAT} ${HOSTS} ${THICK} --pca_cache ${PCA_CACHE} --pca_cache_max_dim 16"
 
 # --- Pick the PCA dim from the dim sweep (best LOCO correlation); fallback 8. ---
 PCA_DIM=$(python3 - <<PY
-import json, os, glob
-sweep = "${SWEEP}"
+import json, os
+sweep_loco = "${SWEEP_LOCO}"
 best_d, best_r = None, -1e9
 for d in (4, 8, 16):
-    p = os.path.join(sweep, f"pca{d}_loco", "kfold_metrics.json")
+    p = os.path.join(sweep_loco, f"pca{d}", "kfold_metrics.json")
     if os.path.exists(p):
         r = json.load(open(p)).get("correlation", -1e9)
         if r > best_r:
@@ -67,14 +68,14 @@ COMMON="--load_latents ${LAT} --age_csv final_pretrain/metadata.csv \
 
 python scripts/kfold_age_inference.py ${COMMON} ${PCA_POOL} \
   --pca_dim ${PCA_DIM} --n_folds 10 --loso \
-  --output_dir ${BASE}/pca${PCA_DIM}_loso || echo "  !! LOSO FAILED"
+  --output_dir ${BASE}/pca${PCA_DIM} || echo "  !! LOSO FAILED"
 
 echo ""
 echo "================ LOSO SUMMARY (sendit/e50, all labeled stars) ================"
 python3 - <<PY
 import json, os
 import pandas as pd, numpy as np
-base = "${BASE}"; d = "pca${PCA_DIM}_loso"
+base = "${BASE}"; d = "pca${PCA_DIM}"
 p = os.path.join(base, d, "kfold_metrics.json")
 print(f"{'run':18}{'N':>7}{'r':>9}{'MAE':>9}")
 if os.path.exists(p):

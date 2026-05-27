@@ -19,22 +19,23 @@
 LAT=final_model/sendit/e50/metaAll/latents_pretrain.npz
 HOSTS=final_model/sendit/e50/metaAll/latents_hosts.npz
 THICK=final_model/sendit/e50/metaAll/latents_thickdisk.npz
-SWEEP=final_model/sendit/e50/loocv_pcadim
-BASE=final_model/sendit/e50/loso_chronoflow
+AGE_ROOT=final_model/sendit/e50/age_inference
+SWEEP_LOCO=${AGE_ROOT}/chronoflow/loco
+BASE=${AGE_ROOT}/chronoflow/loso
 
 # Same global PCA cache as the dim sweep + full-set LOSO — the basis is
 # population-agnostic, so the ChronoFlow restriction only narrows the kfold
 # sample, not the projection.
-PCA_CACHE=final_model/sendit/e50/global_pca_d16.npz
+PCA_CACHE=${AGE_ROOT}/shared/global_pca_d16.npz
 PCA_POOL="--pca_latent_pool ${LAT} ${HOSTS} ${THICK} --pca_cache ${PCA_CACHE} --pca_cache_max_dim 16"
 
 # Pick the PCA dim from the dim sweep (best LOCO r); fallback 8.
 PCA_DIM=$(python3 - <<PY
 import json, os
-sweep = "${SWEEP}"
+sweep_loco = "${SWEEP_LOCO}"
 best_d, best_r = None, -1e9
 for d in (4, 8, 16):
-    p = os.path.join(sweep, f"pca{d}_loco", "kfold_metrics.json")
+    p = os.path.join(sweep_loco, f"pca{d}", "kfold_metrics.json")
     if os.path.exists(p):
         r = json.load(open(p)).get("correlation", -1e9)
         if r > best_r:
@@ -57,7 +58,7 @@ COMMON="--load_latents ${LAT} --age_csv final_pretrain/metadata.csv --override_a
 
 python scripts/kfold_age_inference.py ${COMMON} ${PCA_POOL} \
   --pca_dim ${PCA_DIM} --n_folds 10 --loso \
-  --output_dir ${BASE}/pca${PCA_DIM}_loso || echo "  !! LOSO-ChronoFlow FAILED"
+  --output_dir ${BASE}/pca${PCA_DIM} || echo "  !! LOSO-ChronoFlow FAILED"
 
 echo ""
 echo "================ LOSO-ChronoFlow SUMMARY ================"
@@ -65,9 +66,9 @@ python3 - <<PY
 import json, os
 import pandas as pd, numpy as np
 runs = [
-    ("LOCO (ChronoFlow)",     "final_model/sendit/e50/loocv_pcadim/pca${PCA_DIM}_loco/kfold_metrics.json"),
-    ("LOSO (ALL labeled)",    "final_model/sendit/e50/loso/pca${PCA_DIM}_loso/kfold_metrics.json"),
-    ("LOSO (ChronoFlow)",     "${BASE}/pca${PCA_DIM}_loso/kfold_metrics.json"),
+    ("LOCO (ChronoFlow)",     "${SWEEP_LOCO}/pca${PCA_DIM}/kfold_metrics.json"),
+    ("LOSO (ALL labeled)",    "${AGE_ROOT}/all_pretrain/loso_strict/pca${PCA_DIM}/kfold_metrics.json"),
+    ("LOSO (ChronoFlow)",     "${BASE}/pca${PCA_DIM}/kfold_metrics.json"),
 ]
 print(f"{'run':>22}{'N':>7}{'r':>9}{'MAE':>9}")
 for name, p in runs:
@@ -77,7 +78,7 @@ for name, p in runs:
     else:
         print(f"{name:>22}{'(missing)':>7}")
 print("\nPer-fold (sector-group) MAE/r [LOSO-ChronoFlow]:")
-csv = "${BASE}/pca${PCA_DIM}_loso/kfold_predictions.csv"
+csv = "${BASE}/pca${PCA_DIM}/kfold_predictions.csv"
 if os.path.exists(csv):
     df = pd.read_csv(csv)
     tcol = 'log10_true_age' if 'log10_true_age' in df.columns else [c for c in df.columns if 'true' in c.lower()][0]

@@ -8,6 +8,14 @@ exop_hosts/lc_data.h5
 final_pretrain/*
 final_pretrain_robust/
 final_model/*
+# Allow the age-inference results README through (it's docs, not data).
+!final_model/sendit/
+final_model/sendit/*
+!final_model/sendit/e50/
+final_model/sendit/e50/*
+!final_model/sendit/e50/age_inference/
+final_model/sendit/e50/age_inference/*
+!final_model/sendit/e50/age_inference/README.md
 checkpoints/*
 .DS_Store
 *.npz
