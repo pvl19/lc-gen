@@ -12,6 +12,7 @@
 # Main toggles (all explained inline below):
 #   PREDICTION_MODE       nle (Bayes-grid posterior) | npe (direct age flow)
 #   NPE_STANDARDIZE_TARGET z-score the NPE age target (lifts the ±5-spline cap)
+#   BALANCE_AGE           flatten the age prior (de-piles NPE's data-mode pull)
 #   AGE_SPACE             gyr | log10_myr | passthrough
 #   EIV                   errors-in-variables on noisy literature ages
 #   K_AGE_SAMPLES         Gaussian age-error propagation (mutually excl. w/ EIV)
@@ -57,9 +58,36 @@ PCA_CACHE=${AGE_ROOT}/shared/global_pca_d16.npz
 PCA_POOL_OR_CACHE="--pca_latent_pool ${LAT_PRETRAIN} ${LAT_HOSTS} ${LAT_THICK} \
   --pca_cache ${PCA_CACHE} --pca_cache_max_dim 16"
 
-ENCODER_TYPE=pca
+# Encoder over the 1536-dim latent:
+#   pca         — fixed PCA projection (uses the shared PCA cache below).
+#   mlp / linear — a LEARNED encoder that compresses the FULL 1536-dim latent to
+#                  BOTTLENECK_DIM, trained jointly with the flow. An auxiliary age
+#                  head + variance reg keep the bottleneck from collapsing. The PCA
+#                  cache is ignored. EIV works here too, but joint-training only
+#                  (forced below); use K_AGE_SAMPLES>1 as the alternative.
+ENCODER_TYPE=mlp
 BOTTLENECK_DIM=4
-TRAINING_STAGES=joint            # no learnable encoder to pre-train when PCA
+TRAINING_STAGES=joint            # joint | two_stage | three_stage (mlp/linear only)
+
+# Learned-encoder (mlp/linear) hyperparameters — ignored when ENCODER_TYPE=pca.
+#   DROPOUT       — dropout after each hidden layer.
+#   INPUT_DROPOUT — input feature masking on the raw 1536-d latent (a stronger
+#                   regularizer for the wide input; 0.0 = off). Bump for stability
+#                   if the train/val NLL gap is wide.
+MLP_ENCODER_HIDDEN="256 128"
+AUX_LOSS_WEIGHT=1.0
+DROPOUT=0.1
+INPUT_DROPOUT=0.1
+VARIANCE_REG_WEIGHT=0.25
+
+# EIV works for pca AND mlp/linear (the flow consumes the learnable latent age;
+# the mlp aux head keeps targeting y_obs), but ONLY with joint training — staged
+# schedules need per-stage y_obs/y_latent routing that isn't wired. Force joint
+# when EIV is on so the script stays runnable.
+if [ "${EIV}" = "true" ] && [ "${TRAINING_STAGES}" != "joint" ]; then
+  echo "EIV requires TRAINING_STAGES=joint; forcing joint (was ${TRAINING_STAGES})."
+  TRAINING_STAGES=joint
+fi
 
 # Prediction mode (the toggle):
 #   nle — flow models p(z_pca | age, colour, colour_err); age posterior recovered
@@ -77,6 +105,18 @@ PREDICTION_MODE=npe
 # predictions stay in AGE_SPACE units, no manual re-standardization on reload.
 # Safe to leave on; only set false if AGE_SPACE already fits ±5 (e.g. log10_myr).
 NPE_STANDARDIZE_TARGET=true
+
+# Age-marginal balancing (mainly for NPE). NPE learns p(age|z) ∝ p(z|age)·p(age),
+# so a peaked training age distribution (hosts pile up ~4 Gyr) drags weakly-
+# conditioned predictions toward that mode. true = WeightedRandomSampler flattens
+# the age histogram so the flow sees a ~flat prior → behaves like a likelihood
+# (flat-prior) estimator, de-piling the mode. BALANCE_AGE_TEMP sets the strength:
+# 1.0 fully flattens; <1 softens (less oversampling of the sparse old tail →
+# lower variance); 0 ≡ off. Output dir gets a _balageT<temp> suffix so balanced
+# and unbalanced runs don't clobber each other.
+BALANCE_AGE=true
+N_BALANCE_AGE_BINS=10
+BALANCE_AGE_TEMP=1.0
 
 STAR_AGGREGATION=latent_max
 USE_MG=false
@@ -100,19 +140,38 @@ LOGA_GRID_SIZE=1000
 
 TRAIN_FULL=true
 
-OUTPUT_DIR=${AGE_ROOT}/hosts/pca${BOTTLENECK_DIM}_${STAR_AGGREGATION}_${AGE_SPACE}_K${K_AGE_SAMPLES}
+# Encoder-specific CLI args: PCA feeds the shared cache; mlp/linear feed the
+# learned-encoder hyperparameters (and ignore the cache entirely).
+if [ "${ENCODER_TYPE}" = "pca" ]; then
+  ENCODER_EXTRA_ARGS="${PCA_POOL_OR_CACHE}"
+else
+  ENCODER_EXTRA_ARGS="--mlp_encoder_hidden ${MLP_ENCODER_HIDDEN} \
+    --aux_loss_weight ${AUX_LOSS_WEIGHT} --dropout ${DROPOUT} \
+    --input_dropout ${INPUT_DROPOUT} --variance_reg_weight ${VARIANCE_REG_WEIGHT}"
+fi
+
+OUTPUT_DIR=${AGE_ROOT}/hosts/${ENCODER_TYPE}${BOTTLENECK_DIM}_${STAR_AGGREGATION}_${AGE_SPACE}_K${K_AGE_SAMPLES}
 if [ "${PREDICTION_MODE}" != "nle" ]; then OUTPUT_DIR="${OUTPUT_DIR}_${PREDICTION_MODE}"; fi
 if [ "${EIV}" = "true" ]; then OUTPUT_DIR="${OUTPUT_DIR}_EIV"; fi
+if [ "${BALANCE_AGE}" = "true" ]; then OUTPUT_DIR="${OUTPUT_DIR}_balageT${BALANCE_AGE_TEMP}"; fi
+if [ "${ENCODER_TYPE}" != "pca" ] && [ "${INPUT_DROPOUT}" != "0" ] && [ "${INPUT_DROPOUT}" != "0.0" ]; then
+  OUTPUT_DIR="${OUTPUT_DIR}_indrop${INPUT_DROPOUT}"
+fi
 
-echo "Running k-fold $(echo "${PREDICTION_MODE}" | tr '[:lower:]' '[:upper:]') age inference (hosts, sendit/e50 PCA${BOTTLENECK_DIM}):"
+echo "Running k-fold $(echo "${PREDICTION_MODE}" | tr '[:lower:]' '[:upper:]') age inference (hosts, sendit/e50 ${ENCODER_TYPE}${BOTTLENECK_DIM}):"
 echo "  Latents:          ${LAT_HOSTS}"
 echo "  Host age CSV:     ${HOST_AGE_CSV}  col=${HOST_AGE_COL}  err_col=${HOST_AGE_ERR_COL}"
 echo "  Age space:        ${AGE_SPACE}  (K=${K_AGE_SAMPLES} Gaussian samples per star)"
 echo "  Prediction mode:  ${PREDICTION_MODE}  (npe target standardize=${NPE_STANDARDIZE_TARGET}, EIV=${EIV})"
+echo "  Age balancing:    ${BALANCE_AGE}  (bins=${N_BALANCE_AGE_BINS}, T=${BALANCE_AGE_TEMP})"
 echo "  Host metadata:    ${HOST_METADATA_CSV}"
-echo "  PCA cache:        ${PCA_CACHE}"
+if [ "${ENCODER_TYPE}" = "pca" ]; then
+  echo "  PCA cache:        ${PCA_CACHE}"
+  echo "  Encoder:          pca  dim=${BOTTLENECK_DIM}"
+else
+  echo "  Encoder:          ${ENCODER_TYPE}  1536->[${MLP_ENCODER_HIDDEN}]->${BOTTLENECK_DIM}  (aux=${AUX_LOSS_WEIGHT}, drop=${DROPOUT}, in_drop=${INPUT_DROPOUT}, var_reg=${VARIANCE_REG_WEIGHT}, stages=${TRAINING_STAGES})"
+fi
 echo "  Star aggregation: ${STAR_AGGREGATION}"
-echo "  Encoder:          ${ENCODER_TYPE}  dim=${BOTTLENECK_DIM}"
 echo "  Folds / seed:     ${N_FOLDS} / ${SEED}"
 echo "  Output:           ${OUTPUT_DIR}"
 
@@ -139,7 +198,7 @@ CMD="python scripts/kfold_nle_age_inference_hosts.py \
   --flow_transforms ${FLOW_TRANSFORMS} \
   --flow_hidden_dims ${FLOW_HIDDEN_DIMS} \
   --loga_grid_size ${LOGA_GRID_SIZE} \
-  ${PCA_POOL_OR_CACHE}"
+  ${ENCODER_EXTRA_ARGS}"
 
 if [ "${USE_MG}"     = "true" ]; then CMD="${CMD} --use_mg"; fi
 if [ "${TRAIN_FULL}" = "true" ]; then CMD="${CMD} --train_full"; fi
@@ -153,6 +212,9 @@ if [ "${NPE_STANDARDIZE_TARGET}" = "true" ]; then
   CMD="${CMD} --npe_standardize_target"
 else
   CMD="${CMD} --no-npe_standardize_target"
+fi
+if [ "${BALANCE_AGE}" = "true" ]; then
+  CMD="${CMD} --balance_age --n_balance_age_bins ${N_BALANCE_AGE_BINS} --balance_age_temp ${BALANCE_AGE_TEMP}"
 fi
 
 eval $CMD

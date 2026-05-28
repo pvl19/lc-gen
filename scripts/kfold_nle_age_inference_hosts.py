@@ -143,6 +143,18 @@ def main():
                              "full model; baked into model buffers. No-op for NLE. Disable "
                              "with --no-npe_standardize_target (e.g. age_space=log10_myr, "
                              "whose 0–4.14 range already fits the spline).")
+    parser.add_argument('--balance_age', action='store_true',
+                        help="Flatten the training AGE marginal with a WeightedRandomSampler so "
+                             "the (NPE) flow stops collapsing weakly-conditioned predictions onto "
+                             "the data mode (p(age|z) ∝ p(z|age)·p(age); a peaked p(age) biases "
+                             "predictions toward ~the mean age). Makes NPE behave like a flat-prior "
+                             "(likelihood) estimator. Sector-free; works for the host PCA path.")
+    parser.add_argument('--n_balance_age_bins', type=int, default=10,
+                        help='Number of age bins used by --balance_age (default 10).')
+    parser.add_argument('--balance_age_temp', type=float, default=1.0,
+                        help="Balancing temperature: sample weight ∝ (1/bin_count)^T. T=1 fully "
+                             "flattens; T<1 softens (less oversampling of the sparse old-age tail "
+                             "→ lower variance); T=0 ≡ no balancing. Default 1.0.")
 
     parser.add_argument('--n_folds', type=int, default=10)
     parser.add_argument('--seed', type=int, default=42)
@@ -154,7 +166,12 @@ def main():
                         help='PCA dim or MLP bottleneck dim (passed to run_kfold_cv as pca_dim).')
     parser.add_argument('--mlp_encoder_hidden', type=int, nargs='+', default=[128, 64])
     parser.add_argument('--aux_loss_weight', type=float, default=1.0)
-    parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--dropout', type=float, default=0.1,
+                        help='Dropout after each MLP encoder hidden layer.')
+    parser.add_argument('--input_dropout', type=float, default=0.0,
+                        help='Input feature masking: dropout applied to the raw 1536-d latent '
+                             'before the MLP encoder (mlp/linear only). A stronger regularizer '
+                             'than hidden dropout for the wide input; 0.0 disables it.')
     parser.add_argument('--variance_reg_weight', type=float, default=0.25)
 
     # Training stages
@@ -388,6 +405,7 @@ def main():
         use_mg=args.use_mg,
         lr_decay_rate=args.lr_decay_rate,
         dropout=args.dropout,
+        input_dropout=args.input_dropout,
         variance_reg_weight=args.variance_reg_weight,
         training_stages=args.training_stages,
         encoder_pretrain_epochs=args.encoder_pretrain_epochs,
@@ -408,6 +426,10 @@ def main():
         # global loc/scale shared across all folds; predictions stay in input
         # units). Gated to npe+pca inside run_kfold_cv; no-op for NLE.
         npe_standardize_target=args.npe_standardize_target,
+        # Age-marginal flattening (removes the NPE prior-mode pull).
+        balance_age=args.balance_age,
+        n_balance_age_bins=args.n_balance_age_bins,
+        balance_age_temp=args.balance_age_temp,
     )
 
     # 3. Plots + predictions. The "true" axis is the transformed central age;

@@ -216,6 +216,7 @@ class AgePredictorMLP(nn.Module):
                  aux_loss_weight: float = 1.0,
                  use_mg: bool = False,
                  dropout: float = 0.1,
+                 input_dropout: float = 0.0,
                  variance_reg_weight: float = 0.0,
                  n_sectors: int = 0,
                  adv_hidden: int = 64):
@@ -233,8 +234,14 @@ class AgePredictorMLP(nn.Module):
         self.use_mg              = use_mg
         context_dim              = 4 if use_mg else 3
 
-        # MLP encoder
+        # MLP encoder. Optional input dropout masks raw latent dims during
+        # training (a stronger regularizer than hidden dropout for a wide input
+        # like the 1536-d latent — forces the encoder to spread reliance across
+        # dims rather than memorize a few). Off (0.0) by default; only prepended
+        # when >0 so existing checkpoints keep identical module indices.
         layers = []
+        if input_dropout > 0:
+            layers.append(nn.Dropout(input_dropout))
         prev = input_dim
         for h in mlp_hidden:
             layers += [nn.Linear(prev, h), nn.ReLU(), nn.Dropout(dropout)]
@@ -335,7 +342,8 @@ class AgePredictorMLP(nn.Module):
                 bprp0: torch.Tensor, log_bprp0_err: torch.Tensor,
                 log_mg: torch.Tensor = None, mem_prob: torch.Tensor = None,
                 loss_mode: str = 'full',
-                sector_idx: torch.Tensor = None, adv_lambda: float = 0.0) -> torch.Tensor:
+                sector_idx: torch.Tensor = None, adv_lambda: float = 0.0,
+                aux_log_age: torch.Tensor = None) -> torch.Tensor:
         """Compute loss.
 
         loss_mode:
@@ -348,12 +356,19 @@ class AgePredictorMLP(nn.Module):
         over K when multi-sample); per-sample MC on the aux head would just
         add noise without changing the L1 minimizer in expectation.
 
+        aux_log_age: optional separate target for the aux head. Defaults to
+        `log_age`. Under EIV the flow consumes the learnable latent age
+        (`log_age`) while the aux head must keep regressing the FIXED observed
+        age (`aux_log_age=y_obs`) — otherwise aux_head(z) and the latent
+        co-adapt and the collapse guard is defeated.
+
         sector_idx / adv_lambda: when the GRL adversary is enabled, add its
         cross-entropy to the encoder-training losses ('full', 'aux_only'). Skipped
         for 'nll_only' (the encoder is frozen there, so the GRL push is moot).
         """
         z         = self.encoder(x)
-        aux_target = log_age.mean(dim=1) if log_age.dim() == 2 else log_age
+        aux_src   = log_age if aux_log_age is None else aux_log_age
+        aux_target = aux_src.mean(dim=1) if aux_src.dim() == 2 else aux_src
 
         if loss_mode == 'aux_only':
             aux  = torch.mean(torch.abs(self.aux_age_head(z).squeeze(1) - aux_target))
@@ -446,8 +461,10 @@ class AgePredictorNPE(nn.Module):
                  aux_loss_weight: float = 1.0,
                  use_mg: bool = False,
                  dropout: float = 0.1,
+                 input_dropout: float = 0.0,
                  variance_reg_weight: float = 0.0,
-                 age_grid_range: tuple = PRIOR_LOGA_MYR):
+                 age_grid_range: tuple = PRIOR_LOGA_MYR,
+                 age_loc: float = 0.0, age_scale: float = 1.0):
         super().__init__()
         if zuko is None:
             raise ImportError("zuko is required for the flow head. Install with: pip install zuko")
@@ -464,12 +481,23 @@ class AgePredictorNPE(nn.Module):
                              torch.tensor(float(age_grid_range[0]), dtype=torch.float32))
         self.register_buffer('_grid_max',
                              torch.tensor(float(age_grid_range[1]), dtype=torch.float32))
+        # Fixed target standardization (see AgePredictorPCANPE docstring): the
+        # NSF spline's ±5 support caps the *modelled* age, so z-score the target
+        # before the flow and undo it at predict time. (loc, scale) are buffers
+        # → saved/reloaded; default (0, 1) is identity (back-compatible).
+        self.register_buffer('_age_loc',
+                             torch.tensor(float(age_loc), dtype=torch.float32))
+        self.register_buffer('_age_scale',
+                             torch.tensor(float(max(age_scale, 1e-6)), dtype=torch.float32))
 
         n_color     = 3 if use_mg else 2  # bprp0, log_bprp0_err [, log_mg]
         context_dim = bottleneck_dim + n_color
 
-        # MLP encoder (mirrors AgePredictorMLP)
+        # MLP encoder (mirrors AgePredictorMLP). Optional input dropout masks raw
+        # latent dims during training (see AgePredictorMLP); prepended only when >0.
         layers = []
+        if input_dropout > 0:
+            layers.append(nn.Dropout(input_dropout))
         prev = input_dim
         for h in mlp_hidden:
             layers += [nn.Linear(prev, h), nn.ReLU(), nn.Dropout(dropout)]
@@ -497,6 +525,12 @@ class AgePredictorNPE(nn.Module):
         if self.use_mg:
             parts.append(log_mg.unsqueeze(-1))
         return torch.cat(parts, dim=-1)
+
+    def _standardize(self, y: torch.Tensor) -> torch.Tensor:
+        return (y - self._age_loc) / self._age_scale
+
+    def _log_jacobian(self) -> torch.Tensor:
+        return -torch.log(self._age_scale)
 
     def _per_sample_nll(self, log_prob_flow: torch.Tensor,
                          mem_prob: torch.Tensor = None) -> torch.Tensor:
@@ -530,24 +564,29 @@ class AgePredictorNPE(nn.Module):
             B, K   = log_age.shape
             ctx    = self._build_context(z, bprp0, log_bprp0_err, log_mg)         # (B, C)
             ctx_f  = ctx.unsqueeze(1).expand(B, K, -1).reshape(B * K, -1)
-            target = log_age.reshape(B * K, 1)
+            target = self._standardize(log_age).reshape(B * K, 1)
             mp_f   = (mem_prob.unsqueeze(1).expand(B, K).reshape(B * K)
                       if mem_prob is not None else None)
-            log_prob   = self.flow(ctx_f).log_prob(target)
+            log_prob   = self.flow(ctx_f).log_prob(target) + self._log_jacobian()
             per_sample = self._per_sample_nll(log_prob, mp_f)
             return per_sample.reshape(B, K).mean(dim=1).mean()
 
         ctx      = self._build_context(z, bprp0, log_bprp0_err, log_mg)
-        target   = log_age.unsqueeze(-1)
-        log_prob = self.flow(ctx).log_prob(target)
+        target   = self._standardize(log_age).unsqueeze(-1)
+        log_prob = self.flow(ctx).log_prob(target) + self._log_jacobian()
         return self._per_sample_nll(log_prob, mem_prob).mean()
 
     def forward(self, x: torch.Tensor, log_age: torch.Tensor,
                 bprp0: torch.Tensor, log_bprp0_err: torch.Tensor,
                 log_mg: torch.Tensor = None, mem_prob: torch.Tensor = None,
-                loss_mode: str = 'full') -> torch.Tensor:
+                loss_mode: str = 'full',
+                aux_log_age: torch.Tensor = None) -> torch.Tensor:
+        # aux_log_age: optional separate aux-head target (defaults to log_age).
+        # Under EIV the flow consumes the learnable latent age (log_age) while
+        # the aux head keeps regressing the fixed observed age (aux_log_age).
         z          = self.encoder(x)
-        aux_target = log_age.mean(dim=1) if log_age.dim() == 2 else log_age
+        aux_src    = log_age if aux_log_age is None else aux_log_age
+        aux_target = aux_src.mean(dim=1) if aux_src.dim() == 2 else aux_src
 
         if loss_mode == 'aux_only':
             aux  = torch.mean(torch.abs(self.aux_age_head(z).squeeze(1) - aux_target))
@@ -581,9 +620,12 @@ class AgePredictorNPE(nn.Module):
         ctx = self._build_context(z, bprp0, log_bprp0_err, log_mg)            # (B, C)
         C   = ctx.shape[-1]
 
+        grid_std = self._standardize(loga_grid)                              # (G,)
         ctx_exp  = ctx.unsqueeze(1).expand(B, G, C).reshape(B * G, C)
-        grid_exp = loga_grid.unsqueeze(0).expand(B, G).reshape(B * G, 1)
+        grid_exp = grid_std.unsqueeze(0).expand(B, G).reshape(B * G, 1)
 
+        # Jacobian is constant over the grid → cancels in the row normalization;
+        # stats are read off the ORIGINAL loga_grid so predictions stay in input units.
         log_prob   = self.flow(ctx_exp).log_prob(grid_exp).reshape(B, G)
         log_post   = log_prob - torch.logsumexp(log_prob, dim=1, keepdim=True)
         posterior  = log_post.exp()
@@ -1630,13 +1672,14 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
                       flow_transforms=8, flow_hidden_features=None, loga_grid=None,
                       encoder_type='pca', mlp_encoder_hidden=None, aux_loss_weight=1.0,
                       use_mg=False, lr_decay_rate=None, global_pca=None,
-                      dropout=0.1, variance_reg_weight=0.0,
+                      dropout=0.1, input_dropout=0.0, variance_reg_weight=0.0,
                       training_stages='joint', encoder_pretrain_epochs=100,
                       joint_finetune_epochs=50, finetune_encoder_lr_mult=0.01,
                       finetune_flow_lr_mult=0.1,
                       prediction_mode='nle',
                       sectors_idx_train=None, n_sectors=0,
                       balance_sector_age=False, n_balance_age_bins=10,
+                      balance_age=False, balance_age_temp=1.0,
                       adv_sector_weight=0.0, adv_hidden=64,
                       eiv=False, eiv_sigma_train=None,
                       npe_age_loc=0.0, npe_age_scale=1.0):
@@ -1670,22 +1713,21 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
     # Sector-aware training switches (both need the NLE MLP/linear encoder).
     use_adv     = adv_sector_weight > 0 and n_sectors > 0 and sectors_idx_train is not None
     use_balance = balance_sector_age and sectors_idx_train is not None
+    # Age-only prior flattening (sector-free; used by the host NPE path). The
+    # sector × age balance takes precedence if both are set and sectors exist.
+    use_age_balance = balance_age and not use_balance
     if use_adv and (encoder_type == 'pca' or prediction_mode != 'nle'):
         raise ValueError("adv_sector_weight requires encoder_type in {mlp, linear} and "
                          "prediction_mode='nle' (the adversary attaches to the MLP bottleneck).")
 
 
     # Errors-in-variables (LatentNN-style): treat the literature age as a noisy
-    # observation of a learnable per-star latent. Currently only wired for the
-    # PCA + joint single-stage path (the host use case) — that path has no aux
-    # head, so the only place `y` enters the loss is the flow NLL, which is
-    # exactly what should consume `y_latent`. Re-enabling for MLP/linear
-    # encoders would need to thread `y_obs` through the aux head while routing
-    # `y_latent` only into the flow.
+    # observation of a learnable per-star latent. The flow consumes `y_latent`;
+    # the aux head (mlp/linear only) keeps regressing the fixed `y_obs` via the
+    # forward's `aux_log_age` argument, so aux_head(z) and the latent can't
+    # co-adapt and defeat the collapse guard. Joint-only — staged training would
+    # need per-stage y_obs/y_latent routing.
     if eiv:
-        if encoder_type != 'pca':
-            raise ValueError("eiv=True currently requires encoder_type='pca' "
-                             "(aux head + latent y are not yet untangled).")
         if training_stages != 'joint':
             raise ValueError("eiv=True currently requires training_stages='joint' "
                              "(staged training needs separate routing for y_obs/y_latent).")
@@ -1740,6 +1782,7 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
                   f'({prediction_mode.upper()})')
         if prediction_mode == 'npe':
             grid_range = (float(loga_grid.min().item()), float(loga_grid.max().item()))
+            print(f'    NPE target z-score loc={npe_age_loc:.3f} scale={npe_age_scale:.3f}')
             model = AgePredictorNPE(
                 input_dim=input_dim,
                 bottleneck_dim=pca_dim,
@@ -1749,8 +1792,10 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
                 aux_loss_weight=aux_loss_weight,
                 use_mg=use_mg,
                 dropout=dropout,
+                input_dropout=input_dropout,
                 variance_reg_weight=variance_reg_weight,
                 age_grid_range=grid_range,
+                age_loc=npe_age_loc, age_scale=npe_age_scale,
             ).to(device)
         else:
             model = AgePredictorMLP(
@@ -1762,6 +1807,7 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
                 aux_loss_weight=aux_loss_weight,
                 use_mg=use_mg,
                 dropout=dropout,
+                input_dropout=input_dropout,
                 variance_reg_weight=variance_reg_weight,
                 n_sectors=(n_sectors if use_adv else 0),
                 adv_hidden=adv_hidden,
@@ -1810,6 +1856,25 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
         train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
         print(f'    balance_sector_age: flattening {len(uniq_cell)} (sector × age-bin) '
               f'cells over {len(Z_train)} rows.')
+    elif use_age_balance:
+        # Flatten the AGE marginal so the (NPE) flow doesn't learn the training
+        # prior's mode (NPE: p(age|z) ∝ p(z|age)·p(age); a peaked p(age) pulls
+        # weakly-conditioned predictions to the data mode). Weight ∝ (1/count)^T
+        # over age bins: T=1 fully flattens; T<1 softens (less oversampling of
+        # the sparse old-age tail → lower variance). T=0 ≡ no balancing.
+        from torch.utils.data import WeightedRandomSampler
+        y_bin_src = y_train if y_train.ndim == 1 else y_train.mean(axis=1)
+        edges   = np.linspace(np.min(y_bin_src), np.max(y_bin_src) + 1e-6, n_balance_age_bins + 1)
+        age_bin = np.clip(np.digitize(y_bin_src, edges) - 1, 0, n_balance_age_bins - 1)
+        uniq_bin, counts = np.unique(age_bin, return_counts=True)
+        bin_count = dict(zip(uniq_bin.tolist(), counts.tolist()))
+        w = np.array([(1.0 / bin_count[int(b)]) ** float(balance_age_temp) for b in age_bin],
+                     dtype=np.float64)
+        sampler = WeightedRandomSampler(torch.as_tensor(w / w.sum(), dtype=torch.double),
+                                        num_samples=len(Z_train), replacement=True)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
+        print(f'    balance_age: flattening {len(uniq_bin)} age bins (T={balance_age_temp}) '
+              f'over {len(Z_train)} rows.')
     else:
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
@@ -1864,19 +1929,23 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
                 opt.zero_grad()
                 # EIV: replace the observed y_b with the learnable latent for
                 # the flow NLL; add the Gaussian-prior regularizer that ties
-                # each latent to its observation.
+                # each latent to its observation. The aux head (mlp/linear) keeps
+                # targeting the fixed y_obs via aux_log_age so it can't co-adapt
+                # with the latent.
                 if eiv and y_latent_param is not None:
                     y_b_for_loss = y_latent_param[idx_b]
+                    aux_y        = y_b
                 else:
                     y_b_for_loss = y_b
+                    aux_y        = None
                 if isinstance(model, AgePredictorMLP):
                     loss = model(Z_b, y_b_for_loss, bprp0_b, bprp0_err_b, mg_b, mem_prob_b,
                                  loss_mode=loss_mode,
                                  sector_idx=(sec_b if use_adv else None),
-                                 adv_lambda=cur_lambda)
+                                 adv_lambda=cur_lambda, aux_log_age=aux_y)
                 elif isinstance(model, AgePredictorNPE):
                     loss = model(Z_b, y_b_for_loss, bprp0_b, bprp0_err_b, mg_b, mem_prob_b,
-                                 loss_mode=loss_mode)
+                                 loss_mode=loss_mode, aux_log_age=aux_y)
                 else:
                     loss = model(Z_b, y_b_for_loss, bprp0_b, bprp0_err_b, mg_b, mem_prob_b)
                 if eiv and y_latent_param is not None:
@@ -2116,7 +2185,7 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
                  flow_transforms=8, flow_hidden_features=None, loga_grid_size=None,
                  encoder_type='pca', mlp_encoder_hidden=None, aux_loss_weight=1.0,
                  use_mg=False, lr_decay_rate=None,
-                 dropout=0.1, variance_reg_weight=0.0,
+                 dropout=0.1, input_dropout=0.0, variance_reg_weight=0.0,
                  training_stages='joint', encoder_pretrain_epochs=100,
                  joint_finetune_epochs=50, finetune_encoder_lr_mult=0.01,
                  finetune_flow_lr_mult=0.1,
@@ -2127,6 +2196,7 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
                  sectors=None,
                  sector_level_split=False, sector_split_drop_star_overlap=True,
                  balance_sector_age=False, n_balance_age_bins=10,
+                 balance_age=False, balance_age_temp=1.0,
                  adv_sector_weight=0.0, adv_hidden=64,
                  loocv_age=False,
                  eiv=False, eiv_sigma_floor_frac=0.05,
@@ -2180,20 +2250,21 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
     # the model's point-estimate predictions.
     y_central = y if y.ndim == 1 else y.mean(axis=1)
 
-    # NPE target standardization (PCA-NPE only). The NSF spline's ±5 support
-    # caps the *modelled* age (raw Gyr overflows it → ~5 Gyr ceiling), so we
-    # z-score the age target. Compute ONE GLOBAL (loc, scale) over all labeled
-    # stars and hand the SAME pair to every fold + the deployment model, so the
-    # normalization is identical across folds (no fold-to-fold drift) and is
-    # baked into each saved model as buffers — predictions stay in input units
-    # and no manual re-standardization is needed on reload. Default (0, 1) is a
-    # no-op so other prediction modes / encoders are unaffected.
+    # NPE target standardization (all NPE encoders: PCA, MLP, linear). The NSF
+    # spline's ±5 support caps the *modelled* age (raw Gyr overflows it → ~5 Gyr
+    # ceiling), so we z-score the age target. Compute ONE GLOBAL (loc, scale)
+    # over all labeled stars and hand the SAME pair to every fold + the
+    # deployment model, so the normalization is identical across folds (no
+    # fold-to-fold drift) and is baked into each saved model as buffers —
+    # predictions stay in input units and no manual re-standardization is needed
+    # on reload. Default (0, 1) is a no-op so NLE is unaffected.
     npe_age_loc, npe_age_scale = 0.0, 1.0
-    if npe_standardize_target and prediction_mode == 'npe' and encoder_type == 'pca':
+    if npe_standardize_target and prediction_mode == 'npe':
         npe_age_loc   = float(np.mean(y_central))
         npe_age_scale = float(np.std(y_central))
-        print(f'NPE target standardization (GLOBAL over {len(y_central)} stars): '
-              f'loc={npe_age_loc:.4f}  scale={npe_age_scale:.4f} (shared across all folds).')
+        print(f'NPE target standardization (GLOBAL over {len(y_central)} stars, '
+              f'encoder={encoder_type}): loc={npe_age_loc:.4f}  scale={npe_age_scale:.4f} '
+              f'(shared across all folds).')
 
     # EIV (LatentNN-style) setup: per-train-star σ in target units, σ-floored
     # so stars with NaN/0 literature error don't blow up the regularizer. Floor
@@ -2207,9 +2278,9 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
         if age_err is None:
             raise ValueError('eiv=True requires age_err (per-star σ in the SAME '
                              'units as ages — already on the flow target scale).')
-        if encoder_type != 'pca' or training_stages != 'joint':
-            raise ValueError("eiv=True currently requires encoder_type='pca' "
-                             "and training_stages='joint'.")
+        if training_stages != 'joint':
+            raise ValueError("eiv=True currently requires training_stages='joint' "
+                             "(staged training needs separate y_obs/y_latent routing).")
         sigma_floor = float(eiv_sigma_floor_frac * np.std(y_central))
         raw_sigma   = np.where(np.isnan(age_err), 0.0,
                                np.maximum(age_err, 0.0)).astype(np.float32)
@@ -2455,7 +2526,7 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
             aux_loss_weight=aux_loss_weight, use_mg=use_mg,
             lr_decay_rate=lr_decay_rate,
             global_pca=global_pca,
-            dropout=dropout, variance_reg_weight=variance_reg_weight,
+            dropout=dropout, input_dropout=input_dropout, variance_reg_weight=variance_reg_weight,
             training_stages=training_stages,
             encoder_pretrain_epochs=encoder_pretrain_epochs,
             joint_finetune_epochs=joint_finetune_epochs,
@@ -2464,6 +2535,7 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
             prediction_mode=prediction_mode,
             sectors_idx_train=sec_idx_train, n_sectors=n_sectors,
             balance_sector_age=balance_sector_age, n_balance_age_bins=n_balance_age_bins,
+            balance_age=balance_age, balance_age_temp=balance_age_temp,
             adv_sector_weight=adv_sector_weight, adv_hidden=adv_hidden,
             eiv=eiv,
             eiv_sigma_train=(eiv_sigma_full[train_idx] if eiv_sigma_full is not None else None),
@@ -2534,7 +2606,7 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
             aux_loss_weight=aux_loss_weight, use_mg=use_mg,
             lr_decay_rate=lr_decay_rate,
             global_pca=global_pca,
-            dropout=dropout, variance_reg_weight=variance_reg_weight,
+            dropout=dropout, input_dropout=input_dropout, variance_reg_weight=variance_reg_weight,
             training_stages=training_stages,
             encoder_pretrain_epochs=encoder_pretrain_epochs,
             joint_finetune_epochs=joint_finetune_epochs,
@@ -2543,6 +2615,7 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
             prediction_mode=prediction_mode,
             sectors_idx_train=sec_idx_all, n_sectors=n_sectors,
             balance_sector_age=balance_sector_age, n_balance_age_bins=n_balance_age_bins,
+            balance_age=balance_age, balance_age_temp=balance_age_temp,
             adv_sector_weight=adv_sector_weight, adv_hidden=adv_hidden,
             eiv=eiv,
             eiv_sigma_train=eiv_sigma_full,
