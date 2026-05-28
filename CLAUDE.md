@@ -69,7 +69,10 @@ Two encoder types for compressing autoencoder latents before the age flow:
 1. **PCA** (`--encoder_type pca`): fixed PCA projection, no learnable params
 2. **MLP** (`--encoder_type mlp`): learned encoder with auxiliary age L1 loss to prevent collapse
 
-Age flow: NSF models `p(z | log10_age, BPRP0, log10(BPRP0_err), [log10(MG)])`.
+Age flow direction (`--prediction_mode`):
+- `nle` (default): NSF models `p(z | log10_age, BPRP0, log10(BPRP0_err), [log10(MG)])`; the age posterior is recovered by Bayes-inverting a likelihood grid over the age context.
+- `npe`: NSF conditions on the bottleneck **+** colours and outputs age directly — `p(log10_age | z, BPRP0, log10(BPRP0_err), [log10(MG)])` — so the prediction is read off the flow's own 1D density (the grid only discretizes that output pdf for percentiles, no Bayes inversion). Supported for both learned encoders (`AgePredictorNPE`, mlp/linear) **and** the fixed PCA projection (`AgePredictorPCANPE` — PCA features fed straight in as flow context, no learned encoder). `predictions.csv` format is identical across modes.
+
 Inference: likelihood on 1000-point grid, normalize to posterior, extract stats.
 
 Star aggregation modes: `none`, `predict_mean`, `latent_mean`, `latent_median`, `latent_max`, `latent_mean_std`, `cross_sector`.

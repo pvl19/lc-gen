@@ -1,92 +1,121 @@
 #!/bin/bash
-# K-fold normalizing-flow age inference for exoplanet hosts.
+# K-fold NLE age inference for exoplanet hosts on the FINAL sendit/e50 latents.
 #
-# Same NSF-flow architecture and 3-stage training as kfold_age_inference.sh, but
-# with host-specific data loading (cached host latents + archive_ages CSV by
-# GaiaDR3_ID). Outputs include the posterior median, p16, and p84 per star.
+# Mirrors the PCA4 pretrain workflow (kfold_pca_dimsweep.sh / kfold_loso.sh):
+#   - PCA encoder, dim 4
+#   - Global PCA basis from the shared cache (fit on pretrain+hosts+thickdisk
+#     at dim 16, truncated to 4) — bit-identical to the pretrain PCA4 runs
+#   - latent_max per-star aggregation
+#   - st_age (Gyr, auto-log10) as the training target — same log-age space as
+#     the pretrain age flow
+#   - Simple stratified 10-fold by star (single per-star prediction)
+#
 # All parameters hardcoded per project convention.
 
-LOAD_LATENTS="final_model/parallel_fixed/e110/latents_hosts.npz"
-HOST_AGE_CSV="exop_hosts/archive_ages_normalized.csv"
-HOST_AGE_COL="st_age_norm"        # column in HOST_AGE_CSV carrying age (normalized or Gyr)
-HOST_AGE_ERR_COL="st_ageerr_norm" # 1σ for HOST_AGE_COL; used when K_AGE_SAMPLES > 1
-K_AGE_SAMPLES=10                  # 10 Gaussian draws per star; loss = mean over K, then mean over batch
-HOST_METADATA_CSV="final_pretrain/host_all_metadata.csv"
+LAT_HOSTS=final_model/sendit/e50/metaAll/latents_hosts.npz
+LAT_PRETRAIN=final_model/sendit/e50/metaAll/latents_pretrain.npz
+LAT_THICK=final_model/sendit/e50/metaAll/latents_thickdisk.npz
 
-STAR_AGGREGATION="latent_max"   # latent_mean | latent_median | latent_max | latent_mean_std
-USE_MG="false"                   # also include log10(MG_quick) as 4th flow context
-P_CLUSTER_MEM=1.0                # per-star inlier prior; 1.0 = rely on static 5% outlier model
+HOST_AGE_CSV=exop_hosts/archive_ages_normalized.csv
+HOST_METADATA_CSV=final_pretrain/host_all_metadata.csv
 
-# nle: 1D-or-bottleneck flow models p(z | age, colours); posterior via Bayes on grid.
-# npe: 1D age flow conditioned on (bottleneck ∥ colours) — direct posterior, no Bayes flip.
-#      NPE requires ENCODER_TYPE=mlp or linear (PCA-only NPE is not supported).
-PREDICTION_MODE="npe"
+# Age target / sampling configuration. Flip these to switch variants:
+#   AGE_SPACE=log10_myr  HOST_AGE_COL=st_age      HOST_AGE_ERR_COL=st_ageerr      (default; matches pretrain log-age space)
+#   AGE_SPACE=gyr        HOST_AGE_COL=st_age      HOST_AGE_ERR_COL=st_ageerr      (flow learns Gyr directly)
+#   AGE_SPACE=passthrough HOST_AGE_COL=st_age_norm HOST_AGE_ERR_COL=st_ageerr_norm (Bouma-normalized; column fed as-is)
+# K_AGE_SAMPLES=1 disables Gaussian age sampling; K_AGE_SAMPLES=10 propagates the per-star σ
+# from HOST_AGE_ERR_COL by drawing 10 samples in CSV units, transforming each per AGE_SPACE,
+# and averaging the per-star NLL over the K draws.
+#
+# EIV=true enables errors-in-variables (LatentNN-style): each star gets a learnable age
+# latent jointly optimized with the flow, plus a Gaussian-prior regularizer
+# ((y_obs−y_latent)/σ)² that anchors it to the literature value. Mutually exclusive with
+# K_AGE_SAMPLES>1 (forced to 1 below when EIV=true). Currently PCA + joint stages only.
+AGE_SPACE=gyr
+HOST_AGE_COL=st_age
+HOST_AGE_ERR_COL=st_ageerr
+K_AGE_SAMPLES=1
+EIV=true
+EIV_SIGMA_FLOOR_FRAC=0.05
+
+if [ "${EIV}" = "true" ] && [ "${K_AGE_SAMPLES}" -gt 1 ]; then
+  echo "EIV=true is mutually exclusive with K_AGE_SAMPLES>1; forcing K_AGE_SAMPLES=1."
+  K_AGE_SAMPLES=1
+fi
+
+# Shared global PCA artifact (created by kfold_pca_dimsweep.sh on its first
+# pretrain run; reused as-is here if it exists, else built from the same
+# 3-cache pool so this script is self-bootstrapping).
+AGE_ROOT=final_model/sendit/e50/age_inference
+PCA_CACHE=${AGE_ROOT}/shared/global_pca_d16.npz
+PCA_POOL_OR_CACHE="--pca_latent_pool ${LAT_PRETRAIN} ${LAT_HOSTS} ${LAT_THICK} \
+  --pca_cache ${PCA_CACHE} --pca_cache_max_dim 16"
+
+ENCODER_TYPE=pca
+BOTTLENECK_DIM=4
+TRAINING_STAGES=joint            # no learnable encoder to pre-train when PCA
+
+# Prediction mode (the toggle):
+#   nle — flow models p(z_pca | age, colour, colour_err); age posterior recovered
+#         by Bayes-inverting a likelihood grid over the age context (the default).
+#   npe — flow conditioned on the 4-dim PCA + colour + colour_err DIRECTLY, with
+#         age as the 1D flow output. The age prediction is read straight off the
+#         flow's own density (no grid inversion). Same PCA features, same
+#         predictions.csv format; only the conditioning direction flips.
+PREDICTION_MODE=npe
+
+STAR_AGGREGATION=latent_max
+USE_MG=false
+
+# Note: the static-outlier mixture (P_OUTLIER, P_CLUSTER_MEM) is HARDCODED OFF
+# inside scripts/kfold_nle_age_inference_hosts.py — hosts have no cluster-
+# membership concept, so the training NLL is the pure flow log-prob.
 
 N_FOLDS=10
 SEED=42
 
-ENCODER_TYPE="mlp"               # pca | mlp | linear
-BOTTLENECK_DIM=4
-MLP_ENCODER_HIDDEN="128 64"
-AUX_LOSS_WEIGHT=1.0
-DROPOUT=0.1
-VARIANCE_REG_WEIGHT=0.25
-
-TRAINING_STAGES="three_stage"    # joint | two_stage | three_stage
-ENCODER_PRETRAIN_EPOCHS=100
-JOINT_FINETUNE_EPOCHS=100
-FINETUNE_ENCODER_LR_MULT=0.001
-FINETUNE_FLOW_LR_MULT=0.1
-
 LR=1e-3
 LR_DECAY_RATE=0.97
 WEIGHT_DECAY=1e-4
-N_EPOCHS=300
+N_EPOCHS=100                     # joint-only training; matches kfold_loso.sh / kfold_pca_dimsweep.sh
 BATCH_SIZE=64
 
 FLOW_TRANSFORMS=6
 FLOW_HIDDEN_DIMS="64 64"
 LOGA_GRID_SIZE=1000
 
-TRAIN_FULL="true"
+TRAIN_FULL=true
 
-OUTPUT_DIR="final_model/parallel_fixed/e110/nle_age_hosts/${PREDICTION_MODE}/${STAR_AGGREGATION}"
+OUTPUT_DIR=${AGE_ROOT}/hosts/pca${BOTTLENECK_DIM}_${STAR_AGGREGATION}_${AGE_SPACE}_K${K_AGE_SAMPLES}
+if [ "${PREDICTION_MODE}" != "nle" ]; then OUTPUT_DIR="${OUTPUT_DIR}_${PREDICTION_MODE}"; fi
+if [ "${EIV}" = "true" ]; then OUTPUT_DIR="${OUTPUT_DIR}_EIV"; fi
 
-echo "Running k-fold NLE age inference (hosts):"
-echo "  Latents cache:    ${LOAD_LATENTS}"
-echo "  Host age CSV:     ${HOST_AGE_CSV}"
+echo "Running k-fold NLE age inference (hosts, sendit/e50 PCA${BOTTLENECK_DIM}):"
+echo "  Latents:          ${LAT_HOSTS}"
+echo "  Host age CSV:     ${HOST_AGE_CSV}  col=${HOST_AGE_COL}  err_col=${HOST_AGE_ERR_COL}"
+echo "  Age space:        ${AGE_SPACE}  (K=${K_AGE_SAMPLES} Gaussian samples per star)"
 echo "  Host metadata:    ${HOST_METADATA_CSV}"
+echo "  PCA cache:        ${PCA_CACHE}"
 echo "  Star aggregation: ${STAR_AGGREGATION}"
-echo "  Prediction mode:  ${PREDICTION_MODE}"
-echo "  Encoder type:     ${ENCODER_TYPE}  (bottleneck=${BOTTLENECK_DIM})"
-echo "  Training stages:  ${TRAINING_STAGES}"
+echo "  Encoder:          ${ENCODER_TYPE}  dim=${BOTTLENECK_DIM}"
 echo "  Folds / seed:     ${N_FOLDS} / ${SEED}"
 echo "  Output:           ${OUTPUT_DIR}"
 
 CMD="python scripts/kfold_nle_age_inference_hosts.py \
-  --load_latents ${LOAD_LATENTS} \
+  --load_latents ${LAT_HOSTS} \
   --host_age_csv ${HOST_AGE_CSV} \
   --host_age_col ${HOST_AGE_COL} \
-  --host_age_err_col ${HOST_AGE_ERR_COL} \
+  --age_space ${AGE_SPACE} \
   --k_age_samples ${K_AGE_SAMPLES} \
   --host_metadata_csv ${HOST_METADATA_CSV} \
   --output_dir ${OUTPUT_DIR} \
   --star_aggregation ${STAR_AGGREGATION} \
-  --p_cluster_mem ${P_CLUSTER_MEM} \
   --prediction_mode ${PREDICTION_MODE} \
   --n_folds ${N_FOLDS} \
   --seed ${SEED} \
   --encoder_type ${ENCODER_TYPE} \
   --bottleneck_dim ${BOTTLENECK_DIM} \
-  --mlp_encoder_hidden ${MLP_ENCODER_HIDDEN} \
-  --aux_loss_weight ${AUX_LOSS_WEIGHT} \
-  --dropout ${DROPOUT} \
-  --variance_reg_weight ${VARIANCE_REG_WEIGHT} \
   --training_stages ${TRAINING_STAGES} \
-  --encoder_pretrain_epochs ${ENCODER_PRETRAIN_EPOCHS} \
-  --joint_finetune_epochs ${JOINT_FINETUNE_EPOCHS} \
-  --finetune_encoder_lr_mult ${FINETUNE_ENCODER_LR_MULT} \
-  --finetune_flow_lr_mult ${FINETUNE_FLOW_LR_MULT} \
   --lr ${LR} \
   --lr_decay_rate ${LR_DECAY_RATE} \
   --weight_decay ${WEIGHT_DECAY} \
@@ -94,9 +123,16 @@ CMD="python scripts/kfold_nle_age_inference_hosts.py \
   --batch_size ${BATCH_SIZE} \
   --flow_transforms ${FLOW_TRANSFORMS} \
   --flow_hidden_dims ${FLOW_HIDDEN_DIMS} \
-  --loga_grid_size ${LOGA_GRID_SIZE}"
+  --loga_grid_size ${LOGA_GRID_SIZE} \
+  ${PCA_POOL_OR_CACHE}"
 
 if [ "${USE_MG}"     = "true" ]; then CMD="${CMD} --use_mg"; fi
 if [ "${TRAIN_FULL}" = "true" ]; then CMD="${CMD} --train_full"; fi
+if [ "${K_AGE_SAMPLES}" -gt 1 ] || [ "${EIV}" = "true" ]; then
+  CMD="${CMD} --host_age_err_col ${HOST_AGE_ERR_COL}"
+fi
+if [ "${EIV}" = "true" ]; then
+  CMD="${CMD} --eiv --eiv_sigma_floor_frac ${EIV_SIGMA_FLOOR_FRAC}"
+fi
 
 eval $CMD

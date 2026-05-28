@@ -605,6 +605,137 @@ class AgePredictorNPE(nn.Module):
         }
 
 
+class AgePredictorPCANPE(nn.Module):
+    """Neural Posterior Estimation on a fixed PCA projection (no learned encoder).
+
+    The PCA-encoder analogue of AgePredictorNPE: models
+    p(log10_age | z_pca, BPRP0, log10(BPRP0_err), [log10(MG)]) directly. The
+    fixed PCA latent and the colour features are concatenated into the flow
+    context; the flow's 1D output IS the age density. Unlike the NLE model
+    AgePredictor — which makes the flow learn p(z | age, …) and recovers a
+    posterior by Bayes-inverting a likelihood grid over the age *context* — here
+    age is the flow output, so a point estimate is read straight off the flow's
+    own 1D density (the grid in predict_stats only discretizes that output pdf to
+    pull percentiles; it is not a Bayes inversion).
+
+    No encoder, no aux head, no learnable params before the flow — the 4-dim PCA
+    is the conditioning, mirroring AgePredictor's "fixed projection" philosophy.
+    The uniform-over-grid outlier mixture matches AgePredictorNPE; with the
+    module-level P_OUTLIER=0 (hosts) it reduces to the pure flow log-prob.
+    """
+
+    def __init__(self, pca_dim: int, flow_transforms: int = 8,
+                 flow_hidden_features: list = None, use_mg: bool = False,
+                 age_grid_range: tuple = PRIOR_LOGA_MYR):
+        super().__init__()
+        if zuko is None:
+            raise ImportError("zuko is required for the flow head. Install with: pip install zuko")
+        if flow_hidden_features is None:
+            flow_hidden_features = [64, 64]
+
+        self.pca_dim = pca_dim
+        self.use_mg  = use_mg
+        self.register_buffer('_grid_min',
+                             torch.tensor(float(age_grid_range[0]), dtype=torch.float32))
+        self.register_buffer('_grid_max',
+                             torch.tensor(float(age_grid_range[1]), dtype=torch.float32))
+
+        n_color     = 3 if use_mg else 2  # bprp0, log_bprp0_err [, log_mg]
+        context_dim = pca_dim + n_color
+        self.flow = zuko.flows.NSF(
+            features=1,
+            context=context_dim,
+            transforms=flow_transforms,
+            hidden_features=flow_hidden_features,
+        )
+
+    def _build_context(self, z: torch.Tensor, bprp0: torch.Tensor,
+                       log_bprp0_err: torch.Tensor,
+                       log_mg: torch.Tensor = None) -> torch.Tensor:
+        parts = [z, bprp0.unsqueeze(-1), log_bprp0_err.unsqueeze(-1)]
+        if self.use_mg:
+            parts.append(log_mg.unsqueeze(-1))
+        return torch.cat(parts, dim=-1)
+
+    def _per_sample_nll(self, log_prob_flow: torch.Tensor,
+                        mem_prob: torch.Tensor = None) -> torch.Tensor:
+        """Per-sample NLL under the flow + uniform-over-grid outlier mixture."""
+        if mem_prob is None:
+            p_mem = P_CLUSTER_MEM
+        else:
+            p_mem = torch.where(torch.isnan(mem_prob),
+                                torch.full_like(mem_prob, P_CLUSTER_MEM), mem_prob)
+        nf_weight    = p_mem * (1.0 - P_OUTLIER)
+        ln_p_outlier = -torch.log(self._grid_max - self._grid_min)
+        ln_p_outlier = ln_p_outlier.expand_as(log_prob_flow)
+        ln_p_combined = torch.logsumexp(
+            torch.stack([
+                torch.log(nf_weight)       + log_prob_flow,
+                torch.log(1.0 - nf_weight) + ln_p_outlier,
+            ], dim=0), dim=0
+        )
+        return -ln_p_combined  # (N,)
+
+    def forward(self, z: torch.Tensor, log_age: torch.Tensor,
+                bprp0: torch.Tensor, log_bprp0_err: torch.Tensor,
+                log_mg: torch.Tensor = None, mem_prob: torch.Tensor = None) -> torch.Tensor:
+        # Signature mirrors AgePredictor (PCA NLE) so train_single_fold's PCA
+        # branch drives both with the same call. log_age (B,) → batch mean NLL;
+        # (B, K) → expand context over K samples, mean per star then per batch.
+        if log_age.dim() == 2:
+            B, K   = log_age.shape
+            ctx    = self._build_context(z, bprp0, log_bprp0_err, log_mg)         # (B, C)
+            ctx_f  = ctx.unsqueeze(1).expand(B, K, -1).reshape(B * K, -1)
+            target = log_age.reshape(B * K, 1)
+            mp_f   = (mem_prob.unsqueeze(1).expand(B, K).reshape(B * K)
+                      if mem_prob is not None else None)
+            log_prob   = self.flow(ctx_f).log_prob(target)
+            per_sample = self._per_sample_nll(log_prob, mp_f)
+            return per_sample.reshape(B, K).mean(dim=1).mean()
+
+        ctx      = self._build_context(z, bprp0, log_bprp0_err, log_mg)
+        target   = log_age.unsqueeze(-1)
+        log_prob = self.flow(ctx).log_prob(target)
+        return self._per_sample_nll(log_prob, mem_prob).mean()
+
+    def predict_stats(self, z: torch.Tensor, bprp0: torch.Tensor,
+                      log_bprp0_err: torch.Tensor, log_mg: torch.Tensor,
+                      loga_grid: torch.Tensor) -> dict:
+        """Summarize the flow's 1D age density (median, mean, map, p16, p84).
+
+        The grid only discretizes p(log_age | context) to read off percentiles —
+        no Bayes inversion. Same return interface as the NLE predictors so the
+        batching / CSV code downstream is unchanged.
+        """
+        B   = z.shape[0]
+        G   = loga_grid.shape[0]
+        ctx = self._build_context(z, bprp0, log_bprp0_err, log_mg)            # (B, C)
+        C   = ctx.shape[-1]
+
+        ctx_exp  = ctx.unsqueeze(1).expand(B, G, C).reshape(B * G, C)
+        grid_exp = loga_grid.unsqueeze(0).expand(B, G).reshape(B * G, 1)
+
+        log_prob   = self.flow(ctx_exp).log_prob(grid_exp).reshape(B, G)
+        log_post   = log_prob - torch.logsumexp(log_prob, dim=1, keepdim=True)
+        posterior  = log_post.exp()
+
+        map_idx = posterior.argmax(dim=1)
+        map_est = loga_grid[map_idx]
+        mean    = (posterior * loga_grid.unsqueeze(0)).sum(dim=1)
+        cdf     = posterior.cumsum(dim=1)
+
+        def pct(p: float) -> torch.Tensor:
+            return loga_grid[(cdf >= p).float().argmax(dim=1)]
+
+        return {
+            'median': pct(0.5),
+            'mean':   mean,
+            'map':    map_est,
+            'p16':    pct(0.16),
+            'p84':    pct(0.84),
+        }
+
+
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
@@ -1467,7 +1598,8 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
                       prediction_mode='nle',
                       sectors_idx_train=None, n_sectors=0,
                       balance_sector_age=False, n_balance_age_bins=10,
-                      adv_sector_weight=0.0, adv_hidden=64):
+                      adv_sector_weight=0.0, adv_hidden=64,
+                      eiv=False, eiv_sigma_train=None):
     """Train one fold of NLE *or* NPE model.
 
     prediction_mode:
@@ -1502,10 +1634,33 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
         raise ValueError("adv_sector_weight requires encoder_type in {mlp, linear} and "
                          "prediction_mode='nle' (the adversary attaches to the MLP bottleneck).")
 
-    if prediction_mode == 'npe' and encoder_type == 'pca':
-        raise ValueError("prediction_mode='npe' requires encoder_type='mlp' or 'linear' "
-                         "(NPE conditions on a learned bottleneck — PCA-only NPE is "
-                         "not supported).")
+
+    # Errors-in-variables (LatentNN-style): treat the literature age as a noisy
+    # observation of a learnable per-star latent. Currently only wired for the
+    # PCA + joint single-stage path (the host use case) — that path has no aux
+    # head, so the only place `y` enters the loss is the flow NLL, which is
+    # exactly what should consume `y_latent`. Re-enabling for MLP/linear
+    # encoders would need to thread `y_obs` through the aux head while routing
+    # `y_latent` only into the flow.
+    if eiv:
+        if encoder_type != 'pca':
+            raise ValueError("eiv=True currently requires encoder_type='pca' "
+                             "(aux head + latent y are not yet untangled).")
+        if training_stages != 'joint':
+            raise ValueError("eiv=True currently requires training_stages='joint' "
+                             "(staged training needs separate routing for y_obs/y_latent).")
+        if not (isinstance(y_train, np.ndarray) and y_train.ndim == 1):
+            raise ValueError("eiv=True is incompatible with K-Gaussian-sampled targets; "
+                             "pass a 1D y_train (set k_age_samples=1 upstream).")
+        if eiv_sigma_train is None:
+            raise ValueError("eiv=True requires eiv_sigma_train (per-train-star σ in "
+                             "target units, already floored).")
+        if len(eiv_sigma_train) != len(y_train):
+            raise ValueError(
+                f"eiv_sigma_train shape {eiv_sigma_train.shape} != y_train shape {y_train.shape}.")
+        print(f'    EIV mode: learnable per-star age latents (N={len(y_train)}), '
+              f'σ range [{float(np.min(eiv_sigma_train)):.3f}, '
+              f'{float(np.max(eiv_sigma_train)):.3f}] in target units.')
 
     if encoder_type == 'pca':
         if global_pca is not None:
@@ -1518,9 +1673,17 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
             Z_val    = fold_pca.transform(X_val).astype(np.float32)
         var_expl  = fold_pca.explained_variance_ratio_.sum()
         print(f'    PCA {pca_dim}D: {100*var_expl:.1f}% variance explained')
-        model = AgePredictor(pca_dim, flow_transforms=flow_transforms,
-                             flow_hidden_features=flow_hidden_features,
-                             use_mg=use_mg).to(device)
+        if prediction_mode == 'npe':
+            grid_range = (float(loga_grid.min().item()), float(loga_grid.max().item()))
+            print(f'    PCA {pca_dim}D → NPE flow: p(age | z_pca, colours) '
+                  f'[grid {grid_range[0]:.2f}, {grid_range[1]:.2f}]')
+            model = AgePredictorPCANPE(pca_dim, flow_transforms=flow_transforms,
+                                       flow_hidden_features=flow_hidden_features,
+                                       use_mg=use_mg, age_grid_range=grid_range).to(device)
+        else:
+            model = AgePredictor(pca_dim, flow_transforms=flow_transforms,
+                                 flow_hidden_features=flow_hidden_features,
+                                 use_mg=use_mg).to(device)
     else:  # mlp or linear
         Z_train = X_train.astype(np.float32)
         Z_val   = X_val.astype(np.float32)
@@ -1563,7 +1726,9 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
             ).to(device)
 
     # Sector index per row (zeros placeholder when sector-aware training is off);
-    # always present so the batch loop can unpack a fixed-width tuple.
+    # always present so the batch loop can unpack a fixed-width tuple. A row-
+    # index column is appended so the batch loop can look up per-star EIV
+    # latents (placeholder zeros when EIV is off — eight-tuple either way).
     sec_train_np = (sectors_idx_train.astype(np.int64) if sectors_idx_train is not None
                     else np.zeros(len(Z_train), dtype=np.int64))
     train_dataset = TensorDataset(
@@ -1574,7 +1739,19 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
         torch.tensor(mg_train,        dtype=torch.float32, device=device),
         torch.tensor(mem_prob_train,  dtype=torch.float32, device=device),
         torch.tensor(sec_train_np,    dtype=torch.long,    device=device),
+        torch.arange(len(Z_train),    dtype=torch.long,    device=device),
     )
+
+    # EIV state: learnable per-star latents (init at observation) + frozen
+    # σ-floored observation tensors used by the regularizer. When eiv=False
+    # these stay as None and the train loop falls back to the batched y_b.
+    y_latent_param  = None
+    y_obs_t         = None
+    sigma_eiv_t     = None
+    if eiv:
+        y_obs_t        = torch.tensor(y_train,         dtype=torch.float32, device=device)
+        sigma_eiv_t    = torch.tensor(eiv_sigma_train, dtype=torch.float32, device=device)
+        y_latent_param = nn.Parameter(y_obs_t.clone().detach())
     if use_balance:
         # Flatten the (sector × age-bin) joint so over-represented cluster cells
         # stop dominating the gradient and the model can't lean on sector→age.
@@ -1617,8 +1794,18 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
         Returns the optimizer used so the caller can pass it to the next stage.
         """
         nonlocal best_loss, best_state, epochs_done
-        opt = optimizer if optimizer is not None else optim.AdamW(
-            params, lr=stage_lr, weight_decay=weight_decay)
+        if optimizer is not None:
+            opt = optimizer
+        elif eiv and y_latent_param is not None:
+            # Separate param groups: model gets weight_decay; y_latent gets none
+            # (its regularization comes from the EIV Gaussian prior term, not
+            # from AdamW's decoupled L2).
+            opt = optim.AdamW([
+                {'params': list(params),     'weight_decay': weight_decay},
+                {'params': [y_latent_param], 'weight_decay': 0.0},
+            ], lr=stage_lr)
+        else:
+            opt = optim.AdamW(params, lr=stage_lr, weight_decay=weight_decay)
         sched = CombinedLRScheduler(opt, n_epochs=n_stage_epochs, initial_lr=stage_lr,
                                     decay_rate=lr_decay_rate)
         for _ in range(n_stage_epochs):
@@ -1631,18 +1818,30 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
                 cur_lambda = 0.0
             model.train()
             epoch_loss = 0.0
-            for Z_b, y_b, bprp0_b, bprp0_err_b, mg_b, mem_prob_b, sec_b in train_loader:
+            for Z_b, y_b, bprp0_b, bprp0_err_b, mg_b, mem_prob_b, sec_b, idx_b in train_loader:
                 opt.zero_grad()
+                # EIV: replace the observed y_b with the learnable latent for
+                # the flow NLL; add the Gaussian-prior regularizer that ties
+                # each latent to its observation.
+                if eiv and y_latent_param is not None:
+                    y_b_for_loss = y_latent_param[idx_b]
+                else:
+                    y_b_for_loss = y_b
                 if isinstance(model, AgePredictorMLP):
-                    loss = model(Z_b, y_b, bprp0_b, bprp0_err_b, mg_b, mem_prob_b,
+                    loss = model(Z_b, y_b_for_loss, bprp0_b, bprp0_err_b, mg_b, mem_prob_b,
                                  loss_mode=loss_mode,
                                  sector_idx=(sec_b if use_adv else None),
                                  adv_lambda=cur_lambda)
                 elif isinstance(model, AgePredictorNPE):
-                    loss = model(Z_b, y_b, bprp0_b, bprp0_err_b, mg_b, mem_prob_b,
+                    loss = model(Z_b, y_b_for_loss, bprp0_b, bprp0_err_b, mg_b, mem_prob_b,
                                  loss_mode=loss_mode)
                 else:
-                    loss = model(Z_b, y_b, bprp0_b, bprp0_err_b, mg_b, mem_prob_b)
+                    loss = model(Z_b, y_b_for_loss, bprp0_b, bprp0_err_b, mg_b, mem_prob_b)
+                if eiv and y_latent_param is not None:
+                    eiv_reg = 0.5 * (
+                        (y_obs_t[idx_b] - y_latent_param[idx_b]) / sigma_eiv_t[idx_b]
+                    ).pow(2).mean()
+                    loss = loss + eiv_reg
                 loss.backward()
                 opt.step()
                 epoch_loss += loss.item() * len(Z_b)
@@ -1888,6 +2087,7 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
                  balance_sector_age=False, n_balance_age_bins=10,
                  adv_sector_weight=0.0, adv_hidden=64,
                  loocv_age=False,
+                 eiv=False, eiv_sigma_floor_frac=0.05,
                  loso=False, loso_star_sectors=None, loso_strict_train=True,
                  prefit_pca_bundle=None):
     """Run k-fold cross-validation.
@@ -1936,6 +2136,30 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
     # Per-star central age (1D), for printable metrics that compare against
     # the model's point-estimate predictions.
     y_central = y if y.ndim == 1 else y.mean(axis=1)
+
+    # EIV (LatentNN-style) setup: per-train-star σ in target units, σ-floored
+    # so stars with NaN/0 literature error don't blow up the regularizer. Floor
+    # is `eiv_sigma_floor_frac × std(y_central)`. Default 5%: clean-label stars
+    # are still strongly anchored but the gradient stays well-behaved.
+    eiv_sigma_full = None
+    if eiv:
+        if k_age_samples > 1:
+            raise ValueError('eiv=True is incompatible with k_age_samples > 1 '
+                             '(both target the same problem). Set k_age_samples=1.')
+        if age_err is None:
+            raise ValueError('eiv=True requires age_err (per-star σ in the SAME '
+                             'units as ages — already on the flow target scale).')
+        if encoder_type != 'pca' or training_stages != 'joint':
+            raise ValueError("eiv=True currently requires encoder_type='pca' "
+                             "and training_stages='joint'.")
+        sigma_floor = float(eiv_sigma_floor_frac * np.std(y_central))
+        raw_sigma   = np.where(np.isnan(age_err), 0.0,
+                               np.maximum(age_err, 0.0)).astype(np.float32)
+        eiv_sigma_full = np.maximum(raw_sigma, sigma_floor).astype(np.float32)
+        n_floored = int(np.sum(raw_sigma < sigma_floor))
+        print(f'EIV mode: per-star σ floored at {sigma_floor:.4f} target-units '
+              f'(5% of dataset std={np.std(y_central):.4f}); '
+              f'{n_floored}/{len(eiv_sigma_full)} stars hit the floor.')
 
     # Pre-fit PCA artifact (computed once on the full pool, reused across the dim
     # sweep + LOSO) takes priority over the inline `pca_latents`-based fit below.
@@ -2183,6 +2407,8 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
             sectors_idx_train=sec_idx_train, n_sectors=n_sectors,
             balance_sector_age=balance_sector_age, n_balance_age_bins=n_balance_age_bins,
             adv_sector_weight=adv_sector_weight, adv_hidden=adv_hidden,
+            eiv=eiv,
+            eiv_sigma_train=(eiv_sigma_full[train_idx] if eiv_sigma_full is not None else None),
         )
         fold_models.append({
             'state_dict': model_state, 'pca': fold_pca,
@@ -2259,6 +2485,8 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
             sectors_idx_train=sec_idx_all, n_sectors=n_sectors,
             balance_sector_age=balance_sector_age, n_balance_age_bins=n_balance_age_bins,
             adv_sector_weight=adv_sector_weight, adv_hidden=adv_hidden,
+            eiv=eiv,
+            eiv_sigma_train=eiv_sigma_full,
         )
 
         torch.save({
