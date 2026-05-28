@@ -1,16 +1,22 @@
 #!/bin/bash
-# K-fold NLE age inference for exoplanet hosts on the FINAL sendit/e50 latents.
+# K-fold NLE / NPE age inference for exoplanet hosts on the FINAL sendit/e50 latents.
+# (Canonical configurable host launcher — edit the variables below for any test.)
 #
 # Mirrors the PCA4 pretrain workflow (kfold_pca_dimsweep.sh / kfold_loso.sh):
 #   - PCA encoder, dim 4
 #   - Global PCA basis from the shared cache (fit on pretrain+hosts+thickdisk
 #     at dim 16, truncated to 4) — bit-identical to the pretrain PCA4 runs
 #   - latent_max per-star aggregation
-#   - st_age (Gyr, auto-log10) as the training target — same log-age space as
-#     the pretrain age flow
 #   - Simple stratified 10-fold by star (single per-star prediction)
 #
-# All parameters hardcoded per project convention.
+# Main toggles (all explained inline below):
+#   PREDICTION_MODE       nle (Bayes-grid posterior) | npe (direct age flow)
+#   NPE_STANDARDIZE_TARGET z-score the NPE age target (lifts the ±5-spline cap)
+#   AGE_SPACE             gyr | log10_myr | passthrough
+#   EIV                   errors-in-variables on noisy literature ages
+#   K_AGE_SAMPLES         Gaussian age-error propagation (mutually excl. w/ EIV)
+#
+# All parameters hardcoded per project convention. Calls scripts/kfold_nle_age_inference_hosts.py.
 
 LAT_HOSTS=final_model/sendit/e50/metaAll/latents_hosts.npz
 LAT_PRETRAIN=final_model/sendit/e50/metaAll/latents_pretrain.npz
@@ -64,6 +70,14 @@ TRAINING_STAGES=joint            # no learnable encoder to pre-train when PCA
 #         predictions.csv format; only the conditioning direction flips.
 PREDICTION_MODE=npe
 
+# NPE target standardization (NPE only; no-op for NLE). The NSF spline has a hard
+# ±5 support, so an NPE flow modelling age DIRECTLY caps at ~5 Gyr unless the
+# target is z-scored. true = z-score by ONE global (loc, scale) over all stars,
+# shared across folds + the full model and baked into the saved model buffers;
+# predictions stay in AGE_SPACE units, no manual re-standardization on reload.
+# Safe to leave on; only set false if AGE_SPACE already fits ±5 (e.g. log10_myr).
+NPE_STANDARDIZE_TARGET=true
+
 STAR_AGGREGATION=latent_max
 USE_MG=false
 
@@ -90,10 +104,11 @@ OUTPUT_DIR=${AGE_ROOT}/hosts/pca${BOTTLENECK_DIM}_${STAR_AGGREGATION}_${AGE_SPAC
 if [ "${PREDICTION_MODE}" != "nle" ]; then OUTPUT_DIR="${OUTPUT_DIR}_${PREDICTION_MODE}"; fi
 if [ "${EIV}" = "true" ]; then OUTPUT_DIR="${OUTPUT_DIR}_EIV"; fi
 
-echo "Running k-fold NLE age inference (hosts, sendit/e50 PCA${BOTTLENECK_DIM}):"
+echo "Running k-fold $(echo "${PREDICTION_MODE}" | tr '[:lower:]' '[:upper:]') age inference (hosts, sendit/e50 PCA${BOTTLENECK_DIM}):"
 echo "  Latents:          ${LAT_HOSTS}"
 echo "  Host age CSV:     ${HOST_AGE_CSV}  col=${HOST_AGE_COL}  err_col=${HOST_AGE_ERR_COL}"
 echo "  Age space:        ${AGE_SPACE}  (K=${K_AGE_SAMPLES} Gaussian samples per star)"
+echo "  Prediction mode:  ${PREDICTION_MODE}  (npe target standardize=${NPE_STANDARDIZE_TARGET}, EIV=${EIV})"
 echo "  Host metadata:    ${HOST_METADATA_CSV}"
 echo "  PCA cache:        ${PCA_CACHE}"
 echo "  Star aggregation: ${STAR_AGGREGATION}"
@@ -133,6 +148,11 @@ if [ "${K_AGE_SAMPLES}" -gt 1 ] || [ "${EIV}" = "true" ]; then
 fi
 if [ "${EIV}" = "true" ]; then
   CMD="${CMD} --eiv --eiv_sigma_floor_frac ${EIV_SIGMA_FLOOR_FRAC}"
+fi
+if [ "${NPE_STANDARDIZE_TARGET}" = "true" ]; then
+  CMD="${CMD} --npe_standardize_target"
+else
+  CMD="${CMD} --no-npe_standardize_target"
 fi
 
 eval $CMD

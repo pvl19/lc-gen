@@ -622,11 +622,25 @@ class AgePredictorPCANPE(nn.Module):
     is the conditioning, mirroring AgePredictor's "fixed projection" philosophy.
     The uniform-over-grid outlier mixture matches AgePredictorNPE; with the
     module-level P_OUTLIER=0 (hosts) it reduces to the pure flow log-prob.
+
+    Target standardization (age_loc / age_scale): the zuko NSF spline has a
+    hard ±5 support (MonotonicRQSTransform bound=5), so the *modelled* variable
+    must live inside ≈[-5, 5]. Raw ages in Gyr (0–15) overflow that and get
+    squashed to a ~5 Gyr ceiling. We therefore z-score the age target by a
+    FIXED (loc, scale) before the flow and undo it at predict time, so:
+      * predictions remain in the ORIGINAL units (Gyr) — predict_stats reports
+        statistics against the unmodified `loga_grid`;
+      * (loc, scale) are stored as buffers → saved in the state_dict → reloaded
+        automatically (no manual re-standardization for deployment / reruns);
+      * passing ONE global (loc, scale) to every fold + the deployment model
+        guarantees identical normalization across folds (no fold-to-fold drift).
+    Defaults (0, 1) are identity — backward-compatible with un-standardized use.
     """
 
     def __init__(self, pca_dim: int, flow_transforms: int = 8,
                  flow_hidden_features: list = None, use_mg: bool = False,
-                 age_grid_range: tuple = PRIOR_LOGA_MYR):
+                 age_grid_range: tuple = PRIOR_LOGA_MYR,
+                 age_loc: float = 0.0, age_scale: float = 1.0):
         super().__init__()
         if zuko is None:
             raise ImportError("zuko is required for the flow head. Install with: pip install zuko")
@@ -639,6 +653,12 @@ class AgePredictorPCANPE(nn.Module):
                              torch.tensor(float(age_grid_range[0]), dtype=torch.float32))
         self.register_buffer('_grid_max',
                              torch.tensor(float(age_grid_range[1]), dtype=torch.float32))
+        # Fixed target standardization (see class docstring). scale floored to
+        # avoid div-by-zero for a degenerate constant-age dataset.
+        self.register_buffer('_age_loc',
+                             torch.tensor(float(age_loc), dtype=torch.float32))
+        self.register_buffer('_age_scale',
+                             torch.tensor(float(max(age_scale, 1e-6)), dtype=torch.float32))
 
         n_color     = 3 if use_mg else 2  # bprp0, log_bprp0_err [, log_mg]
         context_dim = pca_dim + n_color
@@ -656,6 +676,16 @@ class AgePredictorPCANPE(nn.Module):
         if self.use_mg:
             parts.append(log_mg.unsqueeze(-1))
         return torch.cat(parts, dim=-1)
+
+    def _standardize(self, y: torch.Tensor) -> torch.Tensor:
+        """Original age units → standardized space the flow models over."""
+        return (y - self._age_loc) / self._age_scale
+
+    def _log_jacobian(self) -> torch.Tensor:
+        """log|d(standardized)/d(original)| = -log(scale); makes the flow density
+        a correct pdf in the ORIGINAL units so it is comparable to the
+        original-space uniform outlier density in the mixture."""
+        return -torch.log(self._age_scale)
 
     def _per_sample_nll(self, log_prob_flow: torch.Tensor,
                         mem_prob: torch.Tensor = None) -> torch.Tensor:
@@ -682,20 +712,22 @@ class AgePredictorPCANPE(nn.Module):
         # Signature mirrors AgePredictor (PCA NLE) so train_single_fold's PCA
         # branch drives both with the same call. log_age (B,) → batch mean NLL;
         # (B, K) → expand context over K samples, mean per star then per batch.
+        # The age target is standardized before the flow; the Jacobian keeps the
+        # NLL a correct density in the original units.
         if log_age.dim() == 2:
             B, K   = log_age.shape
             ctx    = self._build_context(z, bprp0, log_bprp0_err, log_mg)         # (B, C)
             ctx_f  = ctx.unsqueeze(1).expand(B, K, -1).reshape(B * K, -1)
-            target = log_age.reshape(B * K, 1)
+            target = self._standardize(log_age).reshape(B * K, 1)
             mp_f   = (mem_prob.unsqueeze(1).expand(B, K).reshape(B * K)
                       if mem_prob is not None else None)
-            log_prob   = self.flow(ctx_f).log_prob(target)
+            log_prob   = self.flow(ctx_f).log_prob(target) + self._log_jacobian()
             per_sample = self._per_sample_nll(log_prob, mp_f)
             return per_sample.reshape(B, K).mean(dim=1).mean()
 
         ctx      = self._build_context(z, bprp0, log_bprp0_err, log_mg)
-        target   = log_age.unsqueeze(-1)
-        log_prob = self.flow(ctx).log_prob(target)
+        target   = self._standardize(log_age).unsqueeze(-1)
+        log_prob = self.flow(ctx).log_prob(target) + self._log_jacobian()
         return self._per_sample_nll(log_prob, mem_prob).mean()
 
     def predict_stats(self, z: torch.Tensor, bprp0: torch.Tensor,
@@ -706,14 +738,21 @@ class AgePredictorPCANPE(nn.Module):
         The grid only discretizes p(log_age | context) to read off percentiles —
         no Bayes inversion. Same return interface as the NLE predictors so the
         batching / CSV code downstream is unchanged.
+
+        The flow models the STANDARDIZED age, so the grid is standardized before
+        evaluation; every returned statistic is read off the ORIGINAL `loga_grid`
+        (e.g. Gyr), so predictions come back in the input units. The Jacobian is
+        a constant over the grid and cancels in the per-row posterior
+        normalization, so it is omitted here.
         """
         B   = z.shape[0]
         G   = loga_grid.shape[0]
         ctx = self._build_context(z, bprp0, log_bprp0_err, log_mg)            # (B, C)
         C   = ctx.shape[-1]
 
+        grid_std = self._standardize(loga_grid)                              # (G,)
         ctx_exp  = ctx.unsqueeze(1).expand(B, G, C).reshape(B * G, C)
-        grid_exp = loga_grid.unsqueeze(0).expand(B, G).reshape(B * G, 1)
+        grid_exp = grid_std.unsqueeze(0).expand(B, G).reshape(B * G, 1)
 
         log_prob   = self.flow(ctx_exp).log_prob(grid_exp).reshape(B, G)
         log_post   = log_prob - torch.logsumexp(log_prob, dim=1, keepdim=True)
@@ -1599,7 +1638,8 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
                       sectors_idx_train=None, n_sectors=0,
                       balance_sector_age=False, n_balance_age_bins=10,
                       adv_sector_weight=0.0, adv_hidden=64,
-                      eiv=False, eiv_sigma_train=None):
+                      eiv=False, eiv_sigma_train=None,
+                      npe_age_loc=0.0, npe_age_scale=1.0):
     """Train one fold of NLE *or* NPE model.
 
     prediction_mode:
@@ -1676,10 +1716,12 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
         if prediction_mode == 'npe':
             grid_range = (float(loga_grid.min().item()), float(loga_grid.max().item()))
             print(f'    PCA {pca_dim}D → NPE flow: p(age | z_pca, colours) '
-                  f'[grid {grid_range[0]:.2f}, {grid_range[1]:.2f}]')
+                  f'[grid {grid_range[0]:.2f}, {grid_range[1]:.2f}]  '
+                  f'target z-score loc={npe_age_loc:.3f} scale={npe_age_scale:.3f}')
             model = AgePredictorPCANPE(pca_dim, flow_transforms=flow_transforms,
                                        flow_hidden_features=flow_hidden_features,
-                                       use_mg=use_mg, age_grid_range=grid_range).to(device)
+                                       use_mg=use_mg, age_grid_range=grid_range,
+                                       age_loc=npe_age_loc, age_scale=npe_age_scale).to(device)
         else:
             model = AgePredictor(pca_dim, flow_transforms=flow_transforms,
                                  flow_hidden_features=flow_hidden_features,
@@ -2088,6 +2130,7 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
                  adv_sector_weight=0.0, adv_hidden=64,
                  loocv_age=False,
                  eiv=False, eiv_sigma_floor_frac=0.05,
+                 npe_standardize_target=False,
                  loso=False, loso_star_sectors=None, loso_strict_train=True,
                  prefit_pca_bundle=None):
     """Run k-fold cross-validation.
@@ -2136,6 +2179,21 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
     # Per-star central age (1D), for printable metrics that compare against
     # the model's point-estimate predictions.
     y_central = y if y.ndim == 1 else y.mean(axis=1)
+
+    # NPE target standardization (PCA-NPE only). The NSF spline's ±5 support
+    # caps the *modelled* age (raw Gyr overflows it → ~5 Gyr ceiling), so we
+    # z-score the age target. Compute ONE GLOBAL (loc, scale) over all labeled
+    # stars and hand the SAME pair to every fold + the deployment model, so the
+    # normalization is identical across folds (no fold-to-fold drift) and is
+    # baked into each saved model as buffers — predictions stay in input units
+    # and no manual re-standardization is needed on reload. Default (0, 1) is a
+    # no-op so other prediction modes / encoders are unaffected.
+    npe_age_loc, npe_age_scale = 0.0, 1.0
+    if npe_standardize_target and prediction_mode == 'npe' and encoder_type == 'pca':
+        npe_age_loc   = float(np.mean(y_central))
+        npe_age_scale = float(np.std(y_central))
+        print(f'NPE target standardization (GLOBAL over {len(y_central)} stars): '
+              f'loc={npe_age_loc:.4f}  scale={npe_age_scale:.4f} (shared across all folds).')
 
     # EIV (LatentNN-style) setup: per-train-star σ in target units, σ-floored
     # so stars with NaN/0 literature error don't blow up the regularizer. Floor
@@ -2409,6 +2467,7 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
             adv_sector_weight=adv_sector_weight, adv_hidden=adv_hidden,
             eiv=eiv,
             eiv_sigma_train=(eiv_sigma_full[train_idx] if eiv_sigma_full is not None else None),
+            npe_age_loc=npe_age_loc, npe_age_scale=npe_age_scale,
         )
         fold_models.append({
             'state_dict': model_state, 'pca': fold_pca,
@@ -2487,6 +2546,7 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
             adv_sector_weight=adv_sector_weight, adv_hidden=adv_hidden,
             eiv=eiv,
             eiv_sigma_train=eiv_sigma_full,
+            npe_age_loc=npe_age_loc, npe_age_scale=npe_age_scale,
         )
 
         torch.save({
