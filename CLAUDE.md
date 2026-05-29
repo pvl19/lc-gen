@@ -30,6 +30,8 @@ k-fold cross-validation.
 | `scripts/plot_umap_latent.py` | Latent extraction, `load_ages()`, UMAP plotting |
 | `scripts/plot_reconstructions.py` | Flow-based reconstructions at a given offset (random / Gaia ID / TIC ID), output to `output/reconstructions/` |
 | `plot_reconstructions.sh` | Shell wrapper for reconstructions |
+| `scripts/extract_split_latents_s97_98.py` | Re-extract latents for sectors 97/98 with each ~60-day light curve split in half; writes sidecar npz with extra `subsector`/`orig_h5_idx` fields, does NOT overwrite the main latents |
+| `extract_split_latents_s97_98.sh` | Shell wrapper for the above |
 | `output/reconstructions/plot_reconstructions.ipynb` | Interactive notebook mirror of the above (reuses its helpers) |
 | `src/lcgen/models/mlp_baseline.py` | MLP local-window baseline (Gaussian + plumbed NSF heads) |
 | `scripts/baseline_comparison.py` | RNN-vs-baseline comparison: `split` / `train_gaussian` subcommands |
