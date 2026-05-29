@@ -31,7 +31,9 @@ k-fold cross-validation.
 | `scripts/plot_reconstructions.py` | Flow-based reconstructions at a given offset (random / Gaia ID / TIC ID), output to `output/reconstructions/` |
 | `plot_reconstructions.sh` | Shell wrapper for reconstructions |
 | `scripts/extract_split_latents_s97_98.py` | Re-extract latents for sectors 97/98 with each ~60-day light curve split in half; writes sidecar npz with extra `subsector`/`orig_h5_idx` fields, does NOT overwrite the main latents |
-| `extract_split_latents_s97_98.sh` | Shell wrapper for the above |
+| `extract_split_latents_s97_98.sh` | Shell wrapper for the above (default model: sendit/e100) |
+| `scripts/merge_split_latents_s97_98.py` | Drop sector 97/98 rows from a main latents npz and replace with the per-half split rows; writes a new merged npz (does NOT overwrite). Main + split must come from the same model checkpoint. |
+| `merge_split_latents_s97_98.sh` | Shell wrapper: merges the three (pretrain/hosts/thickdisk) banks into `*_merged.npz` under the same `LATENT_BASE` |
 | `output/reconstructions/plot_reconstructions.ipynb` | Interactive notebook mirror of the above (reuses its helpers) |
 | `src/lcgen/models/mlp_baseline.py` | MLP local-window baseline (Gaussian + plumbed NSF heads) |
 | `scripts/baseline_comparison.py` | RNN-vs-baseline comparison: `split` / `train_gaussian` subcommands |

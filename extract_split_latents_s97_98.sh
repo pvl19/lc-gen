@@ -8,12 +8,13 @@
 # (subsector=0 first half, subsector=1 second half), sharing gaia_id / tic_id /
 # sector / age / bprp0 / etc. Schema is otherwise the canonical kfold format.
 #
-# Defaults mirror plot_umap.sh (sendit/e50 model, locked-in pooling:
-# uniform / equal_count / dt, trim_edges=10, metaAll). Edit MODEL_PATH /
-# LATENT_BASE below to point at a different model variant.
+# Defaults mirror plot_umap.sh (sendit/e100 official bank, locked-in pooling:
+# uniform / equal_count / dt, trim_edges=10). The model MUST match whichever
+# bank you intend to merge into — e100 split latents only make sense if the
+# main e100 latents were also extracted with e100.
 
-MODEL_PATH="final_model/sendit/e50/best_model.pt"
-LATENT_BASE="final_model/sendit/e50/metaAll"
+MODEL_PATH="final_model/sendit/e100/best_model.pt"
+LATENT_BASE="final_model/sendit/e100"
 
 H5_PATHS="final_pretrain/timeseries_pretrain.h5 final_pretrain/timeseries_exop_hosts.h5 final_pretrain/timeseries_thickdisk.h5"
 AGE_CSVS="final_pretrain/metadata.csv final_pretrain/host_all_metadata.csv"
