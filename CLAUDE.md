@@ -34,6 +34,7 @@ k-fold cross-validation.
 | `extract_split_latents_s97_98.sh` | Shell wrapper for the above (default model: sendit/e100) |
 | `scripts/merge_split_latents_s97_98.py` | Drop sector 97/98 rows from a main latents npz and replace with the per-half split rows; writes a new merged npz (does NOT overwrite). Main + split must come from the same model checkpoint. |
 | `merge_split_latents_s97_98.sh` | Shell wrapper: merges the three (pretrain/hosts/thickdisk) banks into `*_merged.npz` under the same `LATENT_BASE` |
+| `scripts/split_sector_stats_s97_98.py` | Build a new `data/sector_stats_s97s98_split.csv` mirroring the latent split: sector-97/98 rows split into two halves with recomputed `flux_skew`/`flux_kurt`; adds a `subsector` column (-1 unchanged, 0/1 halves) that joins to the merged latents npz. Other stats copied unchanged. |
 | `output/reconstructions/plot_reconstructions.ipynb` | Interactive notebook mirror of the above (reuses its helpers) |
 | `src/lcgen/models/mlp_baseline.py` | MLP local-window baseline (Gaussian + plumbed NSF heads) |
 | `scripts/baseline_comparison.py` | RNN-vs-baseline comparison: `split` / `train_gaussian` subcommands |
