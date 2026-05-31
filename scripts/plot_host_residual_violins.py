@@ -76,13 +76,78 @@ def bin_pool(residuals: np.ndarray, true_age: np.ndarray,
     return data, labels, np.asarray(counts, dtype=np.int64)
 
 
+def load_residuals(npz_path: Path, n_samples: int, seed: int) -> tuple[np.ndarray, np.ndarray, int]:
+    """Load a heldout_posteriors.npz, return (residuals, true_age, K) where
+    residuals has shape (N, K). Prefers saved posterior_samples; falls back to
+    inverse-CDF sampling from the grid posterior.
+    """
+    print(f'Loading {npz_path}')
+    d = np.load(npz_path, allow_pickle=True)
+    keys = set(d.keys())
+    print(f'  keys: {sorted(keys)}')
+    if 'y_obs' not in keys:
+        raise SystemExit(f'{npz_path}: no `y_obs` — cannot bin')
+    true_age = np.asarray(d['y_obs'], dtype=np.float32)
+
+    if 'posterior_samples' in keys:
+        samples = np.asarray(d['posterior_samples'], dtype=np.float32)
+        if samples.shape[0] != len(true_age):
+            raise SystemExit(f'{npz_path}: posterior_samples shape {samples.shape} '
+                             f'does not align with y_obs ({len(true_age)})')
+        print(f'  using saved posterior_samples: shape={samples.shape}')
+    elif 'posterior' in keys and 'grid' in keys:
+        post = np.asarray(d['posterior'], dtype=np.float64)
+        grid = np.asarray(d['grid'], dtype=np.float64)
+        print(f'  posterior_samples not saved — sampling {n_samples}/star from grid '
+              f'(shape={post.shape}, seed={seed})')
+        samples = draw_samples_from_grid(post, grid, n_samples, seed)
+    else:
+        raise SystemExit(
+            f'{npz_path}: lacks both `posterior_samples` and (`posterior` + `grid`) — '
+            'nothing to plot.')
+
+    valid = np.isfinite(true_age) & np.isfinite(samples).any(axis=1)
+    n_drop = int((~valid).sum())
+    if n_drop:
+        print(f'  dropping {n_drop} stars with NaN true_age or all-NaN samples')
+    true_age = true_age[valid]
+    samples = samples[valid]
+    return samples - true_age[:, None], true_age, samples.shape[1]
+
+
+def draw_violin_group(ax, plot_data, positions, face_color, label,
+                      width, show_mean):
+    parts = ax.violinplot(plot_data, positions=positions, showmedians=True,
+                          showextrema=False, widths=width)
+    for body in parts['bodies']:
+        body.set_facecolor(face_color)
+        body.set_edgecolor('black')
+        body.set_alpha(0.65)
+        body.set_linewidth(0.6)
+    if 'cmedians' in parts:
+        parts['cmedians'].set_color('black')
+        parts['cmedians'].set_linewidth(1.0)
+    handle = plt.matplotlib.patches.Patch(
+        facecolor=face_color, edgecolor='black', alpha=0.65, label=label)
+    if show_mean:
+        means = [float(np.mean(d_)) if len(d_) else np.nan for d_ in plot_data]
+        ax.scatter(positions, means, marker='o', s=20, facecolor='white',
+                   edgecolor='black', linewidth=0.8, zorder=3)
+    return handle
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--npz', required=True,
                    help='Path to heldout_posteriors.npz (or its containing directory).')
+    p.add_argument('--noise_npz', default=None,
+                   help='Optional second heldout_posteriors.npz from the noise-baseline '
+                        'run. When given, its residuals are plotted as a second violin '
+                        'per bin (side-by-side) so the two are directly comparable.')
     p.add_argument('--out', default=None,
-                   help='Output PNG path. Default: <npz_dir>/residual_violins_by_age_bin.png')
+                   help='Output PNG path. Default: <npz_dir>/residual_violins_by_age_bin'
+                        '[_vs_noise].png')
     p.add_argument('--bin_edges', default='0,0.5,1.5,2.5,3.5,4.5,5.5,6.5,7.5,8.5,10,12,14',
                    help='Bin edges in Gyr. Either comma-separated ("0,0.5,1.5,...") '
                         'or numpy-style "start:stop:step". Default: 1-Gyr bins '
@@ -95,99 +160,96 @@ def main():
                    help='Label suffix for the axes (default: Gyr).')
     p.add_argument('--show_mean', action='store_true',
                    help='Also overplot per-bin mean residual (white circle).')
+    p.add_argument('--latent_label', default='latent',
+                   help='Legend label for the primary --npz violins (default: "latent").')
+    p.add_argument('--noise_label', default='noise baseline',
+                   help='Legend label for the --noise_npz violins (default: "noise baseline").')
     args = p.parse_args()
 
-    npz_path = Path(args.npz)
-    if npz_path.is_dir():
-        npz_path = npz_path / 'heldout_posteriors.npz'
-    if not npz_path.exists():
-        raise SystemExit(f'npz not found: {npz_path}')
-    out_path = Path(args.out) if args.out else npz_path.parent / 'residual_violins_by_age_bin.png'
+    def resolve(path_str):
+        p_ = Path(path_str)
+        if p_.is_dir():
+            p_ = p_ / 'heldout_posteriors.npz'
+        if not p_.exists():
+            raise SystemExit(f'npz not found: {p_}')
+        return p_
 
-    print(f'Loading {npz_path}')
-    d = np.load(npz_path, allow_pickle=True)
-    keys = set(d.keys())
-    print(f'  keys: {sorted(keys)}')
-
-    if 'y_obs' not in keys:
-        raise SystemExit('npz has no `y_obs` (true age) — cannot bin')
-    true_age = np.asarray(d['y_obs'], dtype=np.float32)
-    N = len(true_age)
-
-    if 'posterior_samples' in keys:
-        samples = np.asarray(d['posterior_samples'], dtype=np.float32)
-        if samples.shape[0] != N:
-            raise SystemExit(
-                f'posterior_samples shape {samples.shape} does not align with y_obs ({N})')
-        print(f'  using saved posterior_samples: shape={samples.shape}')
-    elif 'posterior' in keys and 'grid' in keys:
-        post = np.asarray(d['posterior'], dtype=np.float64)
-        grid = np.asarray(d['grid'], dtype=np.float64)
-        print(f'  posterior_samples not saved — sampling {args.n_samples}/star from grid '
-              f'(shape={post.shape}, seed={args.seed})')
-        samples = draw_samples_from_grid(post, grid, args.n_samples, args.seed)
-    else:
-        raise SystemExit(
-            'npz lacks both `posterior_samples` and (`posterior` + `grid`) — '
-            'nothing to plot. Re-run with --n_posterior_samples or include '
-            'save_heldout_posteriors=True.')
-
-    valid = np.isfinite(true_age) & np.isfinite(samples).any(axis=1)
-    n_drop = int((~valid).sum())
-    if n_drop:
-        print(f'  dropping {n_drop} stars with NaN true_age or all-NaN samples')
-    true_age = true_age[valid]
-    samples = samples[valid]
-
-    residuals = samples - true_age[:, None]    # (N, K)
+    npz_path = resolve(args.npz)
+    noise_path = resolve(args.noise_npz) if args.noise_npz else None
 
     edges = parse_edges(args.bin_edges)
     if len(edges) < 2:
         raise SystemExit('--bin_edges must define at least one bin')
-    print(f'  bin edges ({args.age_unit}): {list(edges)}')
+    print(f'\nbin edges ({args.age_unit}): {list(edges)}\n')
 
-    data, labels, counts = bin_pool(residuals, true_age, edges)
-    n_total = int(counts.sum())
-    print(f'  pooled {n_total} stars across {len(data)} bins  '
-          f'(per-bin star counts: {counts.tolist()})')
+    # Primary (latent) series.
+    residuals_a, true_age_a, K_a = load_residuals(npz_path, args.n_samples, args.seed)
+    data_a, labels_a, counts_a = bin_pool(residuals_a, true_age_a, edges)
+    print(f'  pooled {int(counts_a.sum())} stars across {len(data_a)} bins  '
+          f'(per-bin: {counts_a.tolist()})\n')
 
-    nonempty = [(i, d_, lab) for i, (d_, lab) in enumerate(zip(data, labels)) if len(d_) > 0]
-    if not nonempty:
-        raise SystemExit('All bins empty — check --bin_edges vs the true-age range')
-    idxs, plot_data, plot_labels = zip(*nonempty)
+    # Optional noise series (must use the SAME bin edges so positions align).
+    data_b = labels_b = counts_b = K_b = None
+    if noise_path is not None:
+        residuals_b, true_age_b, K_b = load_residuals(noise_path, args.n_samples, args.seed)
+        data_b, labels_b, counts_b = bin_pool(residuals_b, true_age_b, edges)
+        print(f'  pooled {int(counts_b.sum())} stars across {len(data_b)} bins  '
+              f'(per-bin: {counts_b.tolist()})\n')
 
-    fig, ax = plt.subplots(figsize=(1.0 * len(plot_data) + 2.5, 5.0))
-    positions = list(range(1, len(plot_data) + 1))
-    parts = ax.violinplot(plot_data, positions=positions, showmedians=True,
-                          showextrema=False, widths=0.85)
-    for body in parts['bodies']:
-        body.set_facecolor('#4c72b0')
-        body.set_edgecolor('black')
-        body.set_alpha(0.6)
-    if 'cmedians' in parts:
-        parts['cmedians'].set_color('black')
-        parts['cmedians'].set_linewidth(1.2)
+    # Default output filename reflects single vs. comparison mode.
+    if args.out:
+        out_path = Path(args.out)
+    else:
+        stem = 'residual_violins_by_age_bin' + ('_vs_noise' if noise_path else '')
+        out_path = npz_path.parent / f'{stem}.png'
 
-    if args.show_mean:
-        means = [float(np.mean(d_)) for d_ in plot_data]
-        ax.scatter(positions, means, marker='o', s=22, facecolor='white',
-                   edgecolor='black', linewidth=0.8, zorder=3, label='mean')
+    # Drop bins that are empty in BOTH series (keeps positions consistent).
+    keep = [(len(d_) > 0) or (data_b is not None and len(data_b[i]) > 0)
+            for i, d_ in enumerate(data_a)]
+    if not any(keep):
+        raise SystemExit('All bins empty — check --bin_edges vs the true-age range.')
+    idxs = [i for i, k in enumerate(keep) if k]
+    plot_labels = [labels_a[i] for i in idxs]
+    plot_data_a = [data_a[i] for i in idxs]
+    plot_data_b = [data_b[i] for i in idxs] if data_b is not None else None
+
+    fig, ax = plt.subplots(figsize=(1.05 * len(idxs) + 2.8, 5.2))
+    positions = np.arange(1, len(idxs) + 1)
+
+    if plot_data_b is None:
+        h_a = draw_violin_group(ax, plot_data_a, positions, '#4c72b0',
+                                args.latent_label, width=0.85,
+                                show_mean=args.show_mean)
+        handles = [h_a]
+    else:
+        # Side-by-side violins per bin: offset by ±0.22; widths shrunk to 0.42.
+        off = 0.22
+        h_a = draw_violin_group(ax, plot_data_a, positions - off, '#4c72b0',
+                                args.latent_label, width=0.42,
+                                show_mean=args.show_mean)
+        h_b = draw_violin_group(ax, plot_data_b, positions + off, '#bdbdbd',
+                                args.noise_label, width=0.42,
+                                show_mean=args.show_mean)
+        handles = [h_a, h_b]
 
     ax.axhline(0.0, color='red', linewidth=0.8, linestyle='--', alpha=0.7)
     ax.set_xticks(positions)
     ax.set_xticklabels(plot_labels, fontsize=9)
     ax.set_xlabel(f'True age bin ({args.age_unit})')
     ax.set_ylabel(f'Residual: posterior sample − true ({args.age_unit})')
-    title = f'{npz_path.parent.name}\nposterior residuals by true-age bin '
-    title += f'({n_total} stars, {samples.shape[1]} samples/star)'
-    ax.set_title(title, fontsize=10)
+
+    title = f'{npz_path.parent.name}'
+    if noise_path is not None:
+        title += f'  vs  {noise_path.parent.name}'
+    title += (f'\nposterior residuals by true-age bin '
+              f'({int(counts_a.sum())} stars, {K_a} samples/star)')
+    ax.set_title(title, fontsize=9)
     ax.grid(alpha=0.3, axis='y')
-    if args.show_mean:
-        ax.legend(loc='best', fontsize=8, frameon=False)
+    ax.legend(handles=handles, loc='best', fontsize=9, frameon=True)
     fig.tight_layout()
     fig.savefig(out_path, dpi=140)
     plt.close(fig)
-    print(f'\nWrote {out_path}')
+    print(f'Wrote {out_path}')
 
 
 if __name__ == '__main__':

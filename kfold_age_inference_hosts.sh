@@ -145,6 +145,16 @@ LOGA_GRID_SIZE=1000
 # 100-star bin pools to 20k samples per violin, far above what KDE needs.
 N_POSTERIOR_SAMPLES=200
 
+# Noise-baseline mode: when true, substitute LAT_HOSTS for a sidecar npz where
+# `latent_vectors` is replaced by per-feature mean/std-matched Gaussian noise
+# (all identifiers / ages / metadata preserved). The whole pipeline — encoder,
+# flow, EIV, balance, posterior sampling — runs unchanged on the noise; the
+# resulting metrics + heldout_posteriors.npz become the "is our latent better
+# than random features of the same scale" control. Output is routed to a
+# parallel `_NOISE` subdir so it doesn't clobber the real run. The sidecar is
+# generated on first use (seeded by SEED for reproducibility).
+NOISE_BASELINE=false
+
 TRAIN_FULL=true
 
 # Encoder-specific CLI args: PCA feeds the shared cache; mlp/linear feed the
@@ -157,6 +167,26 @@ else
     --input_dropout ${INPUT_DROPOUT} --variance_reg_weight ${VARIANCE_REG_WEIGHT}"
 fi
 
+# Noise-baseline path swap: generate the sidecar if missing, then redirect the
+# host latents input. Done BEFORE OUTPUT_DIR is built so the _NOISE suffix gets
+# tacked on. Keeps the original LAT_HOSTS path so the real bank stays the source
+# of truth for the per-feature mean/std match.
+if [ "${NOISE_BASELINE}" = "true" ]; then
+  REAL_LAT_HOSTS=${LAT_HOSTS}
+  NOISE_LAT_HOSTS="${REAL_LAT_HOSTS%.npz}_noise_seed${SEED}.npz"
+  if [ ! -f "${NOISE_LAT_HOSTS}" ]; then
+    echo "Generating noise-baseline latents -> ${NOISE_LAT_HOSTS}"
+    python scripts/make_noise_baseline_latents.py \
+      --in_npz "${REAL_LAT_HOSTS}" \
+      --out_npz "${NOISE_LAT_HOSTS}" \
+      --seed ${SEED} --match per_feature \
+      || { echo "  !! NOISE BASELINE GENERATION FAILED"; exit 1; }
+  else
+    echo "Reusing existing noise-baseline latents: ${NOISE_LAT_HOSTS}"
+  fi
+  LAT_HOSTS=${NOISE_LAT_HOSTS}
+fi
+
 OUTPUT_DIR=${AGE_ROOT}/hosts/${ENCODER_TYPE}${BOTTLENECK_DIM}_${STAR_AGGREGATION}_${AGE_SPACE}_K${K_AGE_SAMPLES}
 if [ "${PREDICTION_MODE}" != "nle" ]; then OUTPUT_DIR="${OUTPUT_DIR}_${PREDICTION_MODE}"; fi
 if [ "${EIV}" = "true" ]; then OUTPUT_DIR="${OUTPUT_DIR}_EIV"; fi
@@ -165,6 +195,7 @@ if [ "${ENCODER_TYPE}" != "pca" ] && [ "${INPUT_DROPOUT}" != "0" ] && [ "${INPUT
   OUTPUT_DIR="${OUTPUT_DIR}_indrop${INPUT_DROPOUT}"
 fi
 if [ "${USE_MG}" = "true" ]; then OUTPUT_DIR="${OUTPUT_DIR}_MG"; fi
+if [ "${NOISE_BASELINE}" = "true" ]; then OUTPUT_DIR="${OUTPUT_DIR}_NOISE"; fi
 
 echo "Running k-fold $(echo "${PREDICTION_MODE}" | tr '[:lower:]' '[:upper:]') age inference (hosts, sendit/e100 ${ENCODER_TYPE}${BOTTLENECK_DIM}):"
 echo "  Latents:          ${LAT_HOSTS}"
