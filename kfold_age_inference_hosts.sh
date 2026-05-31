@@ -1,5 +1,5 @@
 #!/bin/bash
-# K-fold NLE / NPE age inference for exoplanet hosts on the FINAL sendit/e50 latents.
+# K-fold NLE / NPE age inference for exoplanet hosts on the FINAL sendit/e100 latents.
 # (Canonical configurable host launcher — edit the variables below for any test.)
 #
 # Mirrors the PCA4 pretrain workflow (kfold_pca_dimsweep.sh / kfold_loso.sh):
@@ -19,9 +19,9 @@
 #
 # All parameters hardcoded per project convention. Calls scripts/kfold_nle_age_inference_hosts.py.
 
-LAT_HOSTS=final_model/sendit/e50/metaAll/latents_hosts.npz
-LAT_PRETRAIN=final_model/sendit/e50/metaAll/latents_pretrain.npz
-LAT_THICK=final_model/sendit/e50/metaAll/latents_thickdisk.npz
+LAT_HOSTS=final_model/sendit/e100/latents_hosts_merged.npz
+LAT_PRETRAIN=final_model/sendit/e100/latents_pretrain_merged.npz
+LAT_THICK=final_model/sendit/e100/latents_thickdisk_merged.npz
 
 HOST_AGE_CSV=exop_hosts/archive_ages_normalized.csv
 HOST_METADATA_CSV=final_pretrain/host_all_metadata.csv
@@ -53,7 +53,7 @@ fi
 # Shared global PCA artifact (created by kfold_pca_dimsweep.sh on its first
 # pretrain run; reused as-is here if it exists, else built from the same
 # 3-cache pool so this script is self-bootstrapping).
-AGE_ROOT=final_model/sendit/e50/age_inference
+AGE_ROOT=final_model/sendit/e100/age_inference
 PCA_CACHE=${AGE_ROOT}/shared/global_pca_d16.npz
 PCA_POOL_OR_CACHE="--pca_latent_pool ${LAT_PRETRAIN} ${LAT_HOSTS} ${LAT_THICK} \
   --pca_cache ${PCA_CACHE} --pca_cache_max_dim 16"
@@ -157,8 +157,9 @@ if [ "${BALANCE_AGE}" = "true" ]; then OUTPUT_DIR="${OUTPUT_DIR}_balageT${BALANC
 if [ "${ENCODER_TYPE}" != "pca" ] && [ "${INPUT_DROPOUT}" != "0" ] && [ "${INPUT_DROPOUT}" != "0.0" ]; then
   OUTPUT_DIR="${OUTPUT_DIR}_indrop${INPUT_DROPOUT}"
 fi
+if [ "${USE_MG}" = "true" ]; then OUTPUT_DIR="${OUTPUT_DIR}_MG"; fi
 
-echo "Running k-fold $(echo "${PREDICTION_MODE}" | tr '[:lower:]' '[:upper:]') age inference (hosts, sendit/e50 ${ENCODER_TYPE}${BOTTLENECK_DIM}):"
+echo "Running k-fold $(echo "${PREDICTION_MODE}" | tr '[:lower:]' '[:upper:]') age inference (hosts, sendit/e100 ${ENCODER_TYPE}${BOTTLENECK_DIM}):"
 echo "  Latents:          ${LAT_HOSTS}"
 echo "  Host age CSV:     ${HOST_AGE_CSV}  col=${HOST_AGE_COL}  err_col=${HOST_AGE_ERR_COL}"
 echo "  Age space:        ${AGE_SPACE}  (K=${K_AGE_SAMPLES} Gaussian samples per star)"
