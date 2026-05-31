@@ -43,6 +43,7 @@ k-fold cross-validation.
 | `baseline_comparison_eval.sh` | Shell wrapper: eval all methods on the eval-10% split |
 | `kfold_age_inference.sh` | Shell wrapper for age inference |
 | `kfold_sector_robust.sh` | Shell wrapper: sector-confound-robust age inference (3 mitigations) |
+| `kfold_e100_age_tests.sh` | Run all 5 latent-based age-inference tests on the e100 merged latents bank at pca4 (ChronoFlow LOCO/LOSO/RAND + all_pretrain LOSO-relaxed/RAND); first-time use creates the shared global PCA cache under `final_model/sendit/e100/age_inference/shared/`. Gyro baselines are encoder-independent and not rerun. |
 | `slurm_bridges2.sh` | SLURM job script for PSC Bridges-2 |
 | `sync_to_bridges2.sh` | Rsync project to Bridges-2 |
 | `final_pretrain/all_ages.csv` | Age + photometry CSV (GaiaDR3_ID, age, BPRP0, BPRP0_err, MG_quick, mem_prob_val) |
