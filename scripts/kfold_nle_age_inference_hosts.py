@@ -430,6 +430,11 @@ def main():
         balance_age=args.balance_age,
         n_balance_age_bins=args.n_balance_age_bins,
         balance_age_temp=args.balance_age_temp,
+        # Save the held-out per-star grid posteriors (NLE or NPE) + EIV true ages
+        # so we can fuse the literature prior in below and inspect y_latent. For
+        # NLE the grid posterior is ∝ likelihood, so fusing the archive Gaussian
+        # exactly replaces the uniform prior with the archive prior.
+        save_heldout_posteriors=True,
     )
 
     # 3. Plots + predictions. The "true" axis is the transformed central age;
@@ -473,6 +478,86 @@ def main():
     if len(keep) > 1:
         df_out = df_out.merge(df_arch[keep].drop_duplicates('GaiaDR3_ID'),
                               on='GaiaDR3_ID', how='left')
+
+    # ── Literature-prior fusion + EIV "true" ages (NPE) ──────────────────────
+    # run_kfold_cv saved the held-out per-star grid posteriors (and, under EIV,
+    # the full-model y_latent). Here we fuse the leakage-free held-out posterior
+    # p(age | light curve) with the literature age as a Gaussian prior
+    # N(y_obs, σ_lit) — an exact pointwise product on the grid (no Gaussian
+    # approximation of the flow side) — and add the fused stats + y_latent to the
+    # CSV. With BALANCE_AGE on, the held-out posterior ≈ likelihood, so this is a
+    # clean likelihood × prior combination.
+    post_npz = output_dir / 'heldout_posteriors.npz'
+    if post_npz.exists():
+        with np.load(post_npz, allow_pickle=True) as pz:
+            npz_ids = np.asarray(pz['tic_ids']).astype(str)
+            grid    = np.asarray(pz['grid'], dtype=np.float64)              # (G,) target units
+            y_obs_g = np.asarray(pz['y_obs'], dtype=np.float64)            # (N,) target units
+            posterior = pz['posterior'].astype(np.float64) if 'posterior' in pz else None
+            eiv_latent = (np.asarray(pz['eiv_y_latent'], dtype=np.float64)
+                          if 'eiv_y_latent' in pz else None)
+
+        add = {'GaiaDR3_ID': npz_ids}
+
+        # σ_lit in TARGET units, aligned to the npz/star order. Reuse the EIV σ if
+        # present, else look it up from the age CSV by GaiaDR3_ID.
+        sigma_lit = None
+        if args.host_age_err_col is not None:
+            if star_age_err is not None and len(star_age_err) == len(npz_ids):
+                sig_csv = star_age_err
+            else:
+                _dfe = pd.read_csv(args.host_age_csv)
+                _dfe['GaiaDR3_ID'] = _dfe['GaiaDR3_ID'].astype(str)
+                if args.host_age_err_col in _dfe.columns:
+                    _m = dict(zip(_dfe['GaiaDR3_ID'], _dfe[args.host_age_err_col]))
+                    sig_csv = np.array([_m.get(g, np.nan) for g in npz_ids], dtype=np.float64)
+                else:
+                    sig_csv = None
+            if sig_csv is not None:
+                # age in CSV units for the delta-method σ transform: y_obs_g is in
+                # target units, so map back only when needed. sigma_to_target_space
+                # takes (age_csv, sigma_csv); reconstruct age_csv from star order.
+                age_csv = (star_age if (star_age is not None and len(star_age) == len(npz_ids))
+                           else None)
+                sigma_lit = (sigma_to_target_space(age_csv, sig_csv) if age_csv is not None
+                             else sig_csv.astype(np.float64))
+
+        if posterior is not None and sigma_lit is not None:
+            G = grid.shape[0]
+            sig = np.asarray(sigma_lit, dtype=np.float64)
+            lit = np.ones_like(posterior)                                  # flat where σ invalid
+            ok  = np.isfinite(sig) & (sig > 0)
+            if ok.any():
+                lit[ok] = np.exp(-0.5 * ((grid[None, :] - y_obs_g[ok, None])
+                                         / sig[ok, None]) ** 2)
+            fused = posterior * lit
+            s = fused.sum(axis=1, keepdims=True)
+            bad = (~np.isfinite(s[:, 0])) | (s[:, 0] <= 0)                 # fall back to posterior
+            fused[bad] = posterior[bad]
+            s = fused.sum(axis=1, keepdims=True)
+            fused = np.divide(fused, s, out=np.zeros_like(fused), where=s > 0)
+
+            cdf = np.cumsum(fused, axis=1)
+            pct = lambda p: grid[np.argmax(cdf >= p, axis=1)]
+            sp = args.age_space
+            add[f'fused_{sp}_median'] = pct(0.5)
+            add[f'fused_{sp}_p16']    = pct(0.16)
+            add[f'fused_{sp}_p84']    = pct(0.84)
+            add[f'fused_{sp}_mean']   = (fused * grid[None, :]).sum(axis=1)
+            add[f'fused_{sp}_map']    = grid[np.argmax(fused, axis=1)]
+            n_fused = int(ok.sum())
+            print(f'Literature fusion: {n_fused}/{len(npz_ids)} stars had a usable σ '
+                  f'(rest keep the unfused posterior).')
+
+        if eiv_latent is not None:
+            add[f'eiv_true_{args.age_space}'] = eiv_latent
+            add[f'eiv_shift_{args.age_space}'] = eiv_latent - y_obs_g
+            print(f'EIV true ages (y_latent): median |shift| = '
+                  f'{np.nanmedian(np.abs(eiv_latent - y_obs_g)):.3f} {args.age_space}.')
+
+        if len(add) > 1:
+            df_out = df_out.merge(pd.DataFrame(add).drop_duplicates('GaiaDR3_ID'),
+                                  on='GaiaDR3_ID', how='left')
 
     pred_path = output_dir / 'predictions.csv'
     df_out.to_csv(pred_path, index=False)
