@@ -193,6 +193,13 @@ def main():
     parser.add_argument('--flow_transforms', type=int, default=6)
     parser.add_argument('--flow_hidden_dims', type=int, nargs='+', default=[64, 64])
     parser.add_argument('--loga_grid_size', type=int, default=1000)
+    parser.add_argument('--n_posterior_samples', type=int, default=0,
+                        help='If >0, draw K samples per star from the held-out '
+                             'grid posterior (inverse CDF) and save as '
+                             '`posterior_samples` in heldout_posteriors.npz. '
+                             'Useful for pooled-residual binning / violin plots; '
+                             '0 = skip (backward compat). Deterministic for the '
+                             'configured --seed.')
 
     parser.add_argument('--train_full', action='store_true',
                         help='After k-fold, train one deployment model on all stars.')
@@ -435,6 +442,7 @@ def main():
         # NLE the grid posterior is ∝ likelihood, so fusing the archive Gaussian
         # exactly replaces the uniform prior with the archive prior.
         save_heldout_posteriors=True,
+        n_posterior_samples=args.n_posterior_samples,
     )
 
     # 3. Plots + predictions. The "true" axis is the transformed central age;

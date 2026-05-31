@@ -161,8 +161,15 @@ class AgePredictor(nn.Module):
 
     def predict_stats(self, z: torch.Tensor, bprp0: torch.Tensor,
                       log_bprp0_err: torch.Tensor, log_mg: torch.Tensor,
-                      loga_grid: torch.Tensor) -> dict:
-        """Grid-based posterior: p(age | z, bprp0) ∝ p(z | age, bprp0) · p(age)."""
+                      loga_grid: torch.Tensor, return_posterior: bool = False) -> dict:
+        """Grid-based posterior: p(age | z, bprp0) ∝ p(z | age, bprp0) · p(age).
+
+        The grid posterior is the likelihood over age × a uniform prior (the
+        constant cancels in the normalization), so it is ∝ p(z | age). With
+        return_posterior=True it is added under 'posterior' (B, G) — multiplying
+        it by an archive-age Gaussian and renormalizing replaces the uniform
+        prior with the archive prior (an exact Bayesian update; the uniform
+        factor cancels)."""
         B, D = z.shape
         G    = loga_grid.shape[0]
 
@@ -187,13 +194,16 @@ class AgePredictor(nn.Module):
         def pct(p: float) -> torch.Tensor:
             return loga_grid[(cdf >= p).float().argmax(dim=1)]
 
-        return {
+        out = {
             'median': pct(0.5),
             'mean':   mean,
             'map':    map_est,
             'p16':    pct(0.16),
             'p84':    pct(0.84),
         }
+        if return_posterior:
+            out['posterior'] = posterior
+        return out
 
 
 class AgePredictorMLP(nn.Module):
@@ -394,8 +404,11 @@ class AgePredictorMLP(nn.Module):
 
     def predict_stats(self, x: torch.Tensor, bprp0: torch.Tensor,
                       log_bprp0_err: torch.Tensor, log_mg: torch.Tensor,
-                      loga_grid: torch.Tensor) -> dict:
-        """Grid-based posterior (same interface as AgePredictor.predict_stats)."""
+                      loga_grid: torch.Tensor, return_posterior: bool = False) -> dict:
+        """Grid-based posterior (same interface as AgePredictor.predict_stats).
+
+        With return_posterior=True the full per-star grid posterior (∝ likelihood
+        × uniform prior) is added under 'posterior' (B, G) for archive-prior fusion."""
         z = self.encoder(x)
         B, D = z.shape
         G    = loga_grid.shape[0]
@@ -421,13 +434,16 @@ class AgePredictorMLP(nn.Module):
         def pct(p: float) -> torch.Tensor:
             return loga_grid[(cdf >= p).float().argmax(dim=1)]
 
-        return {
+        out = {
             'median': pct(0.5),
             'mean':   mean,
             'map':    map_est,
             'p16':    pct(0.16),
             'p84':    pct(0.84),
         }
+        if return_posterior:
+            out['posterior'] = posterior
+        return out
 
 
 class AgePredictorNPE(nn.Module):
@@ -608,11 +624,14 @@ class AgePredictorNPE(nn.Module):
 
     def predict_stats(self, x: torch.Tensor, bprp0: torch.Tensor,
                       log_bprp0_err: torch.Tensor, log_mg: torch.Tensor,
-                      loga_grid: torch.Tensor) -> dict:
+                      loga_grid: torch.Tensor, return_posterior: bool = False) -> dict:
         """Posterior over log10_age via direct flow evaluation.
 
         Returns dict with median, mean, map, p16, p84 — same interface as the
-        NLE predictors so downstream batching code is unchanged.
+        NLE predictors so downstream batching code is unchanged. With
+        return_posterior=True the full per-star grid posterior is added under
+        'posterior' (B, G) — enables a leakage-free post-hoc fusion with a
+        literature-age prior on the same grid.
         """
         z   = self.encoder(x)
         B   = z.shape[0]
@@ -638,13 +657,16 @@ class AgePredictorNPE(nn.Module):
         def pct(p: float) -> torch.Tensor:
             return loga_grid[(cdf >= p).float().argmax(dim=1)]
 
-        return {
+        out = {
             'median': pct(0.5),
             'mean':   mean,
             'map':    map_est,
             'p16':    pct(0.16),
             'p84':    pct(0.84),
         }
+        if return_posterior:
+            out['posterior'] = posterior
+        return out
 
 
 class AgePredictorPCANPE(nn.Module):
@@ -774,12 +796,13 @@ class AgePredictorPCANPE(nn.Module):
 
     def predict_stats(self, z: torch.Tensor, bprp0: torch.Tensor,
                       log_bprp0_err: torch.Tensor, log_mg: torch.Tensor,
-                      loga_grid: torch.Tensor) -> dict:
+                      loga_grid: torch.Tensor, return_posterior: bool = False) -> dict:
         """Summarize the flow's 1D age density (median, mean, map, p16, p84).
 
         The grid only discretizes p(log_age | context) to read off percentiles —
         no Bayes inversion. Same return interface as the NLE predictors so the
-        batching / CSV code downstream is unchanged.
+        batching / CSV code downstream is unchanged. With return_posterior=True
+        the full per-star grid posterior is added under 'posterior' (B, G).
 
         The flow models the STANDARDIZED age, so the grid is standardized before
         evaluation; every returned statistic is read off the ORIGINAL `loga_grid`
@@ -808,13 +831,16 @@ class AgePredictorPCANPE(nn.Module):
         def pct(p: float) -> torch.Tensor:
             return loga_grid[(cdf >= p).float().argmax(dim=1)]
 
-        return {
+        out = {
             'median': pct(0.5),
             'mean':   mean,
             'map':    map_est,
             'p16':    pct(0.16),
             'p84':    pct(0.84),
         }
+        if return_posterior:
+            out['posterior'] = posterior
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -1645,25 +1671,36 @@ class CombinedLRScheduler:
 # ---------------------------------------------------------------------------
 
 def _batched_predict_stats(model, Z_val_t, bprp0_val_t, berr_val_t, mg_val_t,
-                            loga_grid, pred_batch_size=256):
+                            loga_grid, pred_batch_size=256, return_posterior=False):
     """Run predict_stats in chunks to avoid the (B × G) memory spike.
 
     With a 1000-point age grid, calling predict_stats on the full val set at once
     creates tensors of shape (B*1000, D) which can be hundreds of MB. Chunking to
     pred_batch_size stars keeps peak memory proportional to the chunk size.
+
+    return_posterior=True additionally returns out['posterior'] (N, G) — the full
+    per-star grid posterior, concatenated across chunks (NPE models only).
     """
     stat_keys = ('median', 'mean', 'map', 'p16', 'p84')
     accum = {k: [] for k in stat_keys}
+    post_accum = [] if return_posterior else None
     n = Z_val_t.shape[0]
     for start in range(0, n, pred_batch_size):
         end = min(start + pred_batch_size, n)
-        stats = model.predict_stats(
-            Z_val_t[start:end], bprp0_val_t[start:end],
-            berr_val_t[start:end], mg_val_t[start:end], loga_grid
-        )
+        args = (Z_val_t[start:end], bprp0_val_t[start:end],
+                berr_val_t[start:end], mg_val_t[start:end], loga_grid)
+        # Only the NPE predict_stats accept return_posterior; pass it only when
+        # requested so the NLE predictors (no such kwarg) stay callable.
+        stats = (model.predict_stats(*args, return_posterior=True)
+                 if return_posterior else model.predict_stats(*args))
         for k in stat_keys:
             accum[k].append(stats[k].cpu())
-    return {k: torch.cat(accum[k]) for k in stat_keys}
+        if return_posterior:
+            post_accum.append(stats['posterior'].cpu())
+    out = {k: torch.cat(accum[k]) for k in stat_keys}
+    if return_posterior:
+        out['posterior'] = torch.cat(post_accum)
+    return out
 
 
 def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, mem_prob_train,
@@ -1682,7 +1719,8 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
                       balance_age=False, balance_age_temp=1.0,
                       adv_sector_weight=0.0, adv_hidden=64,
                       eiv=False, eiv_sigma_train=None,
-                      npe_age_loc=0.0, npe_age_scale=1.0):
+                      npe_age_loc=0.0, npe_age_scale=1.0,
+                      return_val_posterior=False):
     """Train one fold of NLE *or* NPE model.
 
     prediction_mode:
@@ -2048,10 +2086,18 @@ def train_single_fold(X_train, y_train, bprp0_train, bprp0_err_train, mg_train, 
     model.eval()
     with torch.no_grad():
         stats     = _batched_predict_stats(model, Z_val_t, bprp0_val_t, berr_val_t, mg_val_t,
-                                           loga_grid.to(device))
+                                           loga_grid.to(device),
+                                           return_posterior=return_val_posterior)
+        val_posterior = (stats.pop('posterior').numpy() if return_val_posterior else None)
         val_stats = {k: v.numpy() for k, v in stats.items()}
 
-    return val_stats, best_loss, best_state, fold_pca, train_losses, val_losses
+    # Final learnable EIV age latents (the model's de-noised "true" ages for the
+    # TRAINING stars; None when EIV is off). Captured at the end of training.
+    y_latent_final = (y_latent_param.detach().cpu().numpy()
+                      if eiv and y_latent_param is not None else None)
+
+    return (val_stats, best_loss, best_state, fold_pca, train_losses, val_losses,
+            val_posterior, y_latent_final)
 
 
 # ---------------------------------------------------------------------------
@@ -2201,6 +2247,8 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
                  loocv_age=False,
                  eiv=False, eiv_sigma_floor_frac=0.05,
                  npe_standardize_target=False,
+                 save_heldout_posteriors=False,
+                 n_posterior_samples=0,
                  loso=False, loso_star_sectors=None, loso_strict_train=True,
                  prefit_pca_bundle=None):
     """Run k-fold cross-validation.
@@ -2457,6 +2505,14 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
     fold_losses = []
     fold_models = []
 
+    # Optional held-out per-star grid posterior accumulator (NLE or NPE). Each
+    # star is filled from the single fold in which it is held out, so this is a
+    # leakage-free posterior per star (same role as all_stats, but the full grid).
+    # For NLE the grid posterior is ∝ likelihood (uniform prior cancels); for NPE
+    # (balanced) it is ≈ likelihood — either way it is ready for archive-prior fusion.
+    want_posteriors = save_heldout_posteriors
+    heldout_post = np.full((n_samples, G), np.nan, dtype=np.float32) if want_posteriors else None
+
     print(f'\nRunning {n_folds}-fold CV on {n_samples} samples '
           f'({"star-level" if star_level_split else "sample-level"} split)...')
 
@@ -2516,7 +2572,8 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
         mem_prob_train     = mem_prob[train_idx]
         mem_prob_val_fold  = mem_prob[val_idx]
 
-        val_stats, train_loss, model_state, fold_pca, train_losses, val_losses = train_single_fold(
+        (val_stats, train_loss, model_state, fold_pca, train_losses, val_losses,
+         val_posterior, _y_latent_fold) = train_single_fold(
             X_train, y_train, bprp0_train, bprp0_err_train, mg_train, mem_prob_train,
             X_val, y[val_idx], bprp0_val, bprp0_err_val, mg_val, mem_prob_val_fold,
             pca_dim, lr, weight_decay, n_epochs, batch_size, device,
@@ -2540,6 +2597,7 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
             eiv=eiv,
             eiv_sigma_train=(eiv_sigma_full[train_idx] if eiv_sigma_full is not None else None),
             npe_age_loc=npe_age_loc, npe_age_scale=npe_age_scale,
+            return_val_posterior=want_posteriors,
         )
         fold_models.append({
             'state_dict': model_state, 'pca': fold_pca,
@@ -2548,6 +2606,8 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
 
         for k in stat_keys:
             all_stats[k][val_idx] = val_stats[k]
+        if want_posteriors and val_posterior is not None:
+            heldout_post[val_idx] = val_posterior
         fold_of_sample[val_idx] = fold  # already set, but explicit
         fold_losses.append(train_loss)
 
@@ -2589,6 +2649,7 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
         print(f'Saved training curves to {save_dir / "training_curves.json"}')
 
     # ── Optional: train a single model on ALL labeled stars for deployment ──
+    full_y_latent = None   # EIV de-noised "true" ages from the full model (if any)
     if train_full and save_models_dir is not None:
         print('\n' + '='*60)
         print('Training full model on ALL labeled stars for deployment')
@@ -2596,7 +2657,8 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
         save_dir = Path(save_models_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        full_stats, full_loss, full_state, full_pca, full_train, full_val = train_single_fold(
+        (full_stats, full_loss, full_state, full_pca, full_train, full_val,
+         _full_post, full_y_latent) = train_single_fold(
             X_norm, y, bprp0_norm, bprp0_err_norm, mg_norm, mem_prob,   # train = all
             X_norm, y, bprp0_norm, bprp0_err_norm, mg_norm, mem_prob,   # val = all (tracking only)
             pca_dim, lr, weight_decay, n_epochs, batch_size, device,
@@ -2644,6 +2706,51 @@ def run_kfold_cv(latent_vectors, ages, bprp0, bprp0_err, mg, mem_prob, tic_ids,
             print(f'Full model: train_nll={full_loss:.4f}  '
                   f'MAE={full_mae:.3f} dex  r={full_corr:.3f}')
         print(f'Saved full model to {save_dir / "full_model.pt"}')
+
+    # ── Save held-out grid posteriors + EIV true ages (for post-hoc literature
+    # fusion + inspection). Both align row-for-row to tic_ids (input star order). ──
+    if save_models_dir is not None and (want_posteriors or full_y_latent is not None):
+        save_dir = Path(save_models_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        npz = {
+            'tic_ids': np.asarray(tic_ids),
+            'grid':    loga_grid_np.astype(np.float32),
+            'y_obs':   np.asarray(y_central, dtype=np.float32),
+        }
+        if want_posteriors:
+            npz['posterior'] = heldout_post          # (N, G), held-out per star
+        if full_y_latent is not None:
+            npz['eiv_y_latent'] = np.asarray(full_y_latent, dtype=np.float32)
+        # Optional: draw K samples per star from the held-out grid posterior so
+        # downstream pooled-residual plots (e.g. violins by true-age bin) don't
+        # have to redo the sampling. Inverse-CDF on the grid; deterministic for
+        # a given --seed.
+        if want_posteriors and n_posterior_samples > 0:
+            K = int(n_posterior_samples)
+            G = heldout_post.shape[1]
+            rng = np.random.default_rng(seed)
+            row_sum = heldout_post.sum(axis=1, keepdims=True)
+            ok = (row_sum[:, 0] > 0) & np.isfinite(row_sum[:, 0])
+            samples = np.full((heldout_post.shape[0], K), np.nan, dtype=np.float32)
+            grid_np = loga_grid_np.astype(np.float32)
+            if ok.any():
+                p_ok = heldout_post[ok] / row_sum[ok]
+                # Per-row weighted sampling; vectorize via cdf + uniform draws.
+                cdf = np.cumsum(p_ok, axis=1)
+                cdf[:, -1] = 1.0  # guard floating-point drift
+                u = rng.random((p_ok.shape[0], K), dtype=np.float32)
+                idx = np.empty((p_ok.shape[0], K), dtype=np.int64)
+                for i in range(p_ok.shape[0]):
+                    idx[i] = np.searchsorted(cdf[i], u[i], side='right').clip(0, G - 1)
+                samples[ok] = grid_np[idx]
+            npz['posterior_samples'] = samples
+            n_bad = int((~ok).sum())
+            print(f'  drew {K} posterior samples/star ({"all ok" if n_bad == 0 else f"{n_bad} stars left NaN due to zero-mass posterior"})')
+        np.savez_compressed(Path(save_models_dir) / 'heldout_posteriors.npz', **npz)
+        print(f'Saved {Path(save_models_dir) / "heldout_posteriors.npz"} '
+              f'(posterior={"yes" if want_posteriors else "no"}, '
+              f'samples={"yes" if want_posteriors and n_posterior_samples > 0 else "no"}, '
+              f'eiv_y_latent={"yes" if full_y_latent is not None else "no"})')
 
     all_predictions = all_stats['median']  # log10(age/Myr), used as primary prediction
     return all_predictions, all_stats, ages, tic_ids, fold_of_sample, fold_losses, norm_params

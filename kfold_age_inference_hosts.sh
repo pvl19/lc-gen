@@ -138,6 +138,13 @@ FLOW_TRANSFORMS=6
 FLOW_HIDDEN_DIMS="64 64"
 LOGA_GRID_SIZE=1000
 
+# Draw K samples per star from the held-out grid posterior (inverse CDF, seeded
+# by SEED) and save as `posterior_samples` in heldout_posteriors.npz so the
+# pooled-residual violin script (scripts/plot_host_residual_violins.py) doesn't
+# have to redo the sampling. 0 = skip (back-compat). 200 is plenty: a typical
+# 100-star bin pools to 20k samples per violin, far above what KDE needs.
+N_POSTERIOR_SAMPLES=200
+
 TRAIN_FULL=true
 
 # Encoder-specific CLI args: PCA feeds the shared cache; mlp/linear feed the
@@ -199,6 +206,7 @@ CMD="python scripts/kfold_nle_age_inference_hosts.py \
   --flow_transforms ${FLOW_TRANSFORMS} \
   --flow_hidden_dims ${FLOW_HIDDEN_DIMS} \
   --loga_grid_size ${LOGA_GRID_SIZE} \
+  --n_posterior_samples ${N_POSTERIOR_SAMPLES} \
   ${ENCODER_EXTRA_ARGS}"
 
 if [ "${USE_MG}"     = "true" ]; then CMD="${CMD} --use_mg"; fi
