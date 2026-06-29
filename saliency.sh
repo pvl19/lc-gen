@@ -8,12 +8,12 @@
 # docs/plans/2026-06-27_saliency-mapping.md for the design.
 
 # === Model + data ==========================================================
-# Match the sendit/e50 deployment by default (final_model/sendit/e50/best_model.pt
-# does not exist; the actual sendit checkpoint is at meta_mask/e50). The latent
-# bank for PC1 must be extracted with the SAME checkpoint.
-MODEL_PATH="final_model/meta_mask/e50/best_model.pt"
+# All latent banks must be extracted with the SAME checkpoint as MODEL_PATH.
+# Concatenating pretrain + hosts + thickdisk gives a PC1 representative of the
+# full deployment population rather than the labeled (cluster-heavy) subset.
+MODEL_PATH="final_model/sendit/e100/best_model.pt"
 H5_PATHS="final_pretrain/timeseries_pretrain.h5 final_pretrain/timeseries_exop_hosts.h5 final_pretrain/timeseries_thickdisk.h5"
-LATENTS_NPZ="final_model/meta_mask/e50/metaAll/latents_pretrain.npz"
+LATENTS_NPZ="final_model/sendit/e100/latents_pretrain.npz final_model/sendit/e100/latents_hosts.npz final_model/sendit/e100/latents_thickdisk.npz"
 
 # === Target star ===========================================================
 # Leave both empty to pick a random star with --seed.
@@ -65,10 +65,19 @@ if [ "${USE_METADATA}"      = "true" ]; then CMD="${CMD} --use_metadata"; fi
 if [ "${USE_METADATA}"      = "false" ]; then CMD="${CMD} --no-use_metadata"; fi
 if [ "${USE_CONV_CHANNELS}" = "true" ]; then CMD="${CMD} --use_conv_channels"; fi
 if [ "${APPLY_HEAD_NORM}"   = "false" ]; then CMD="${CMD} --no-apply_head_norm"; fi
-if [ -n "${LATENTS_NPZ}" ] && [ -f "${LATENTS_NPZ}" ]; then
+# LATENTS_NPZ may be one or several space-separated paths; word-splits into
+# multiple --latents_npz args. The python script concatenates the banks before
+# fitting PC1.
+LATENTS_OK="true"
+for p in ${LATENTS_NPZ}; do
+  if [ ! -f "${p}" ]; then
+    echo "[saliency.sh] latent bank missing: ${p} — skipping PC1 target."
+    LATENTS_OK="false"
+    break
+  fi
+done
+if [ -n "${LATENTS_NPZ}" ] && [ "${LATENTS_OK}" = "true" ]; then
   CMD="${CMD} --latents_npz ${LATENTS_NPZ}"
-else
-  echo "[saliency.sh] LATENTS_NPZ not provided / not found — skipping PC1 target."
 fi
 
 echo "${CMD}"
@@ -81,7 +90,7 @@ if [ -n "${LAST_DIR}" ]; then
   NPZ="${LAST_DIR%/}/attribution.npz"
   echo "[saliency.sh] plotting ${NPZ}"
   python scripts/plot_saliency.py --input_npz "${NPZ}" --target norm
-  if [ -n "${LATENTS_NPZ}" ] && [ -f "${LATENTS_NPZ}" ]; then
+  if [ -n "${LATENTS_NPZ}" ] && [ "${LATENTS_OK}" = "true" ]; then
     python scripts/plot_saliency.py --input_npz "${NPZ}" --target pc1
   fi
 fi
