@@ -3,12 +3,18 @@
 Consumes the .npz produced by compute_saliency.py and renders three panels
 sharing the time axis:
 
-  Top:    flux trace, points colored by signed IG attribution (||z||^2 target
-          by default; --target pc1 switches to the PC1 target if present).
-  Middle: flux_err trace, points colored by signed IG attribution.
+  Top:    flux trace, points colored by signed attribution.
+  Middle: flux_err trace, points colored by signed attribution.
   Bottom: minGRU gate-weight w_t over time (line + fill, no per-point color).
 
-Output: PNG into the same directory as the input npz.
+The attribution shown is either Integrated Gradients (--method ig) or
+single-point occlusion (--method occlusion), and the target scalar is
+||z||^2 (--target norm) or the population PC1 projection (--target pc1).
+For occlusion the per-channel attributions are read from the dedicated
+flux-only / err-only ablation modes saved in the npz.
+
+Output: PNG into the same directory as the input npz, named
+`saliency_<method>_<target>.png`.
 """
 import argparse
 from pathlib import Path
@@ -43,9 +49,13 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--input_npz', type=str, required=True,
                    help='Path to attribution.npz produced by compute_saliency.py')
+    p.add_argument('--method', type=str, default='ig', choices=['ig', 'occlusion'],
+                   help='ig: Integrated Gradients attribution. '
+                        'occlusion: single-point ablation deltas.')
     p.add_argument('--target', type=str, default='norm', choices=['norm', 'pc1'])
     p.add_argument('--output', type=str, default=None,
-                   help='Output PNG path. Defaults to <npz_dir>/saliency_<target>.png')
+                   help='Output PNG path. Defaults to '
+                        '<npz_dir>/saliency_<method>_<target>.png')
     p.add_argument('--clip_percentile', type=float, default=99.0,
                    help='Color scale uses ±this percentile of |s| for saturation.')
     return p.parse_args()
@@ -57,21 +67,40 @@ def main():
     data = np.load(in_path, allow_pickle=True)
 
     target = args.target
-    if target == 'pc1' and 's_flux_pc1' not in data.files:
+    method = args.method
+    if method == 'ig':
+        flux_key, err_key = f's_flux_{target}', f's_err_{target}'
+        f_full_key, f_base_key = f'f_{target}_full', f'f_{target}_baseline'
+    else:
+        # Occlusion: prefer per-channel arrays (only present with
+        # --run_occlusion_per_channel). Fall back to whole-timestep, shown
+        # on both panels — same colour pattern over flux and over flux_err
+        # to make clear that the attribution is a single "drop this point"
+        # number, not channel-resolved.
+        f_full_key, f_base_key = f'occ_f_full_{target}', None
+        if f'occ_s_flux_{target}' in data.files:
+            flux_key, err_key = f'occ_s_flux_{target}', f'occ_s_err_{target}'
+        elif f'occ_s_whole_{target}' in data.files:
+            flux_key, err_key = f'occ_s_whole_{target}', f'occ_s_whole_{target}'
+        else:
+            flux_key = None
+    if flux_key is None or flux_key not in data.files:
         raise SystemExit(
-            f'{in_path} has no PC1 attribution. Re-run compute_saliency.py '
-            f'with --latents_npz to enable it, or use --target norm.'
+            f'{in_path} has no {method}/{target} attribution. Re-run '
+            f'compute_saliency.py with the appropriate flags '
+            f'(--run_occlusion / --latents_npz / '
+            f'--run_occlusion_per_channel for split-channel occlusion).'
         )
 
     t = data['times']
     flux = data['flux']
     flux_err = data['flux_err']
-    s_flux = data[f's_flux_{target}']
-    s_err = data[f's_err_{target}']
+    s_flux = data[flux_key]
+    s_err = data[err_key]
     w_gate = data['w_gate']
     L = t.size
-    f_full = float(data[f'f_{target}_full'])
-    f_base = float(data[f'f_{target}_baseline'])
+    f_full = float(data[f_full_key])
+    f_base = 0.0 if f_base_key is None else float(data[f_base_key])
     total = float(s_flux.sum() + s_err.sum())
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True,
@@ -88,10 +117,17 @@ def main():
     ax_flux.set_ylim(flux.min() - 0.05 * (flux.max() - flux.min() + 1e-12),
                      flux.max() + 0.05 * (flux.max() - flux.min() + 1e-12))
     ax_flux.set_ylabel('flux')
+    if method == 'ig':
+        title_tail = (f'baseline={str(data["baseline_mode"])}  |  '
+                      f'Σs={total:.3e}  expected={f_full - f_base:.3e}')
+    else:
+        title_tail = (f'f(full)={f_full:.3e}  |  '
+                      f'Σ|s_flux|/Σ|s_err|={np.sum(np.abs(s_flux)):.2e}/'
+                      f'{np.sum(np.abs(s_err)):.2e}')
     ax_flux.set_title(
-        f'Gaia {data["gaia_id"]}  |  TIC {int(data["tic_id"])}  |  sector {int(data["sector"])}  |  '
-        f'target=f({target})  |  baseline={str(data["baseline_mode"])}  |  '
-        f'Σs={total:.3e}  expected={f_full - f_base:.3e}'
+        f'Gaia {data["gaia_id"]}  |  TIC {int(data["tic_id"])}  |  '
+        f'sector {int(data["sector"])}  |  '
+        f'method={method}  |  target=f({target})  |  {title_tail}'
     )
     cb1 = fig.colorbar(lc1, ax=ax_flux, pad=0.01)
     cb1.set_label(f's_flux  (signed, ±p{args.clip_percentile})')
@@ -125,7 +161,8 @@ def main():
 
     fig.tight_layout()
 
-    out_path = Path(args.output) if args.output else in_path.parent / f'saliency_{target}.png'
+    out_path = (Path(args.output) if args.output
+                else in_path.parent / f'saliency_{method}_{target}.png')
     fig.savefig(out_path, dpi=140, bbox_inches='tight')
     print(f'[save] {out_path}')
 

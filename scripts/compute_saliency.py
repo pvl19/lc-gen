@@ -224,6 +224,304 @@ def integrated_gradients(model, lc, baseline_mode: str, n_steps: int,
 
 
 # ---------------------------------------------------------------------------
+# Batched multiscale pool (used by the occlusion path so 1000+ forward passes
+# don't pay Python-loop overhead per batch item). Only supports the locked-in
+# pool config used by the deployed extraction:
+#
+#     glob_mode='uniform', seg_mode='equal_count', diff_weight_mode='dt',
+#     minmax_quantile=0.0, subtract_temporal_mean=False.
+#
+# If any of those flags differ at the CLI we fall back to the per-item loop in
+# the original compute_multiscale_features (which is the source of truth). The
+# saliency.sh wrapper locks the supported config; the assertion below is the
+# guard.
+# ---------------------------------------------------------------------------
+
+LOCKED_POOL_KWARGS = dict(
+    glob_mode='uniform', seg_mode='equal_count', diff_weight_mode='dt',
+    minmax_quantile=0.0, subtract_temporal_mean=False,
+)
+
+
+def _pool_kwargs_match_locked(pool_kwargs):
+    """True iff `pool_kwargs` agrees with LOCKED_POOL_KWARGS on every key we
+    care about (other keys like minmax_edge_skip are fine — they affect the
+    indexing but the formula is identical to the unbatched version).
+    """
+    for k, v in LOCKED_POOL_KWARGS.items():
+        if pool_kwargs.get(k, v) != v:
+            return False
+    return True
+
+
+def compute_multiscale_features_batched(h: torch.Tensor, t: torch.Tensor,
+                                        n_segments: int = 4,
+                                        minmax_edge_skip: int = 0,
+                                        hidden_size=None) -> torch.Tensor:
+    """Vectorized over leading batch dim of `h`. h: (B, L, H), t: (L,).
+    Returns (B, 12*H). Matches compute_multiscale_features for the locked-in
+    pool config; verified against it in the smoke test.
+
+    Only the time-axis statistics in `h` vary across batch — `t`, the segment
+    edges, the minmax_edge_skip slice, and the Δt vector are all batch-constant
+    by construction (we're occluding flux/flux_err, not times).
+    """
+    B, L, H = h.shape
+    dtype = h.dtype
+    device = h.device
+    eps = torch.finfo(dtype).eps
+    features = []
+
+    # 1. Global mean / std (uniform weights → unweighted statistics over time).
+    global_mean = h.mean(dim=1)                                # (B, H)
+    centered = h - global_mean.unsqueeze(1)
+    global_var = centered.pow(2).mean(dim=1)
+    global_std = global_var.clamp_min(0.0).sqrt()
+
+    # 2. Order statistics over the inner (minmax_edge_skip-stripped) window.
+    m = max(0, int(minmax_edge_skip))
+    if m > 0 and L > 2 * m + 1:
+        h_inner = h[:, m:L - m, :]
+    else:
+        h_inner = h
+    global_max = h_inner.max(dim=1).values                     # (B, H)
+    global_min = h_inner.min(dim=1).values
+    features.extend([global_mean, global_std, global_max, global_min])
+
+    # 3. Equal-count segment means (uniform weights → unweighted segment mean).
+    idx_edges = torch.linspace(0, L, n_segments + 1).round().to(torch.long)
+    for seg_idx in range(n_segments):
+        s = int(idx_edges[seg_idx])
+        e = int(idx_edges[seg_idx + 1])
+        if e > s:
+            seg_mean = h[:, s:e, :].mean(dim=1)                # (B, H)
+        else:
+            seg_mean = torch.zeros(B, H, device=device, dtype=dtype)
+        features.append(seg_mean)
+
+    # 4. first / last hidden states.
+    features.append(h[:, 0, :])
+    features.append(h[:, -1, :])
+
+    # 5. Rate statistics, dt-weighted.
+    if L > 1:
+        dt_step = (t[1:] - t[:-1]).to(dtype).clamp_min(eps)    # (L-1,)
+        rates = (h[:, 1:, :] - h[:, :-1, :]) / dt_step.unsqueeze(0).unsqueeze(-1)
+        w_d = dt_step.unsqueeze(0).unsqueeze(-1)               # (1, L-1, 1)
+        w_d_sum = dt_step.sum().clamp_min(eps)
+        diff_mean = (w_d * rates).sum(dim=1) / w_d_sum         # (B, H)
+        if rates.shape[1] > 1:
+            cent = rates - diff_mean.unsqueeze(1)
+            diff_var = (w_d * cent.pow(2)).sum(dim=1) / w_d_sum
+            diff_std = diff_var.clamp_min(0.0).sqrt()
+        else:
+            diff_std = torch.zeros(B, H, device=device, dtype=dtype)
+    else:
+        diff_mean = torch.zeros(B, H, device=device, dtype=dtype)
+        diff_std = torch.zeros(B, H, device=device, dtype=dtype)
+    features.extend([diff_mean, diff_std])
+
+    return torch.cat(features, dim=-1)                         # (B, 12*H)
+
+
+# ---------------------------------------------------------------------------
+# Single-point occlusion (Method 3 in the plan, now first-class)
+# ---------------------------------------------------------------------------
+
+def single_point_occlusion(model, lc, pca_dir, pca_mean,
+                           apply_head_norm: bool,
+                           pool_kwargs=None, device='cpu',
+                           batch_size: int = 64, per_channel: bool = False,
+                           verbose: bool = True):
+    """For each timestep t, compute s_t = f(z_full) - f(z_occluded_t) for the
+    `whole`-timestep ablation (always), and optionally for the per-channel
+    `flux_only` and `err_only` modes when `per_channel=True`.
+
+    Modes:
+      whole    : mask[t]=0 (the encoder's own gating zeros flux + flux_err
+                 at that step and skips the recurrence update — uses the
+                 model's trained missing-data behavior; the cleanest
+                 "what does the model lose without this point" reading).
+      flux_only: flux[t]=0, flux_err[t] unchanged, mask all-ones (synthetic
+                 input the encoder never saw at training — interpret with
+                 caution; off by default).
+      err_only : flux[t] unchanged, flux_err[t]=0, mask all-ones (same caveat).
+
+    Two targets per mode (`norm`, `pc1`) computed from the same z.
+
+    Returns dict with per-mode (L,) arrays for both targets plus the f_full
+    reference values. No gradients are used; pure forward passes.
+    """
+    pool_kwargs = pool_kwargs or {}
+    use_batched_pool = _pool_kwargs_match_locked(pool_kwargs)
+    if not use_batched_pool:
+        print('[occlusion] WARN: pool config differs from locked-in (uniform / '
+              'equal_count / dt / no quantile / no temporal-mean subtract); '
+              'falling back to per-item pool loop. This is ~20x slower.')
+
+    flux = lc['flux'].to(device)
+    flux_err = lc['flux_err'].to(device)
+    times = lc['times'].to(device)
+    L = flux.numel()
+
+    t_in_one = times.unsqueeze(0).unsqueeze(-1)        # (1, L, 1)
+    meta_one = lc['metadata'].unsqueeze(0) if lc['metadata'] is not None else None
+    if meta_one is not None and model.meta_use_mask:
+        meta_mask_one = torch.ones_like(meta_one)
+    else:
+        meta_mask_one = None
+    conv_data_one = lc['conv_data']
+
+    # Reference values (target evaluated on the unperturbed star).
+    with torch.no_grad():
+        x_full = torch.stack([flux, flux_err], dim=-1).unsqueeze(0)
+        mask_full = torch.ones(1, L, device=device)
+        z_full = _pooled_latent(model, x_full, t_in_one, mask_full,
+                                meta_one, meta_mask_one, conv_data_one,
+                                apply_head_norm=apply_head_norm,
+                                pool_kwargs=pool_kwargs)
+        f_full_norm = (z_full * z_full).sum().item()
+        if pca_dir is not None:
+            f_full_pc1 = ((z_full - pca_mean) * pca_dir).sum().item()
+        else:
+            f_full_pc1 = None
+
+        if use_batched_pool:
+            # Parity check: batched pool on the unperturbed star must match
+            # the unbatched call (used to compute z_full above) to <1e-4
+            # relative. Catches subtle divergences (off-by-one, dtype
+            # promotion) before we trust 1000+ batches of attribution.
+            out_ref = model(x_full, t_in_one, mask=mask_full,
+                            metadata=meta_one, meta_mask=meta_mask_one,
+                            conv_data=conv_data_one, return_states=True)
+            h_fwd_r, h_bwd_r, t_enc_r = (
+                out_ref['h_fwd_tensor'], out_ref['h_bwd_tensor'], out_ref['t_enc'])
+            if apply_head_norm:
+                H = model.hidden_size
+                h_bi = torch.cat([h_fwd_r, h_bwd_r, t_enc_r], dim=-1)
+                h_bi = model.head_norm(h_bi)
+                h_fwd_r, h_bwd_r = h_bi[..., :H], h_bi[..., H:2 * H]
+            h_comb_r = torch.cat([h_fwd_r, h_bwd_r], dim=-1)
+            z_batched = compute_multiscale_features_batched(
+                h_comb_r, times, n_segments=4,
+                minmax_edge_skip=pool_kwargs.get('minmax_edge_skip', 0),
+                hidden_size=model.hidden_size,
+            )[0]
+            denom = z_full.detach().abs().max().clamp_min(1e-12)
+            rel = (z_batched - z_full).abs().max() / denom
+            print(f'[occlusion] batched-pool parity: rel max diff = {float(rel):.2e}')
+            assert rel < 1e-4, (
+                f'Batched pool diverges from compute_multiscale_features '
+                f'(rel max diff {float(rel):.2e}). Bailing rather than '
+                f'producing untrustworthy occlusion attributions.'
+            )
+
+    def _batch_forward_mode(mode: str):
+        """Returns z (L, D): pooled latent for each occlusion variant.
+        Variant b within a batch ablates timestep (start + b).
+        """
+        s_norm = np.zeros(L, dtype=np.float64)
+        s_pc1 = np.zeros(L, dtype=np.float64) if pca_dir is not None else None
+        with torch.no_grad():
+            for start in range(0, L, batch_size):
+                end = min(start + batch_size, L)
+                B = end - start
+                # Build per-variant inputs.
+                if mode == 'whole':
+                    flux_b = flux.unsqueeze(0).expand(B, L).contiguous()
+                    err_b = flux_err.unsqueeze(0).expand(B, L).contiguous()
+                    mask_b = torch.ones(B, L, device=device)
+                    rows = torch.arange(B, device=device)
+                    cols = torch.arange(start, end, device=device)
+                    mask_b[rows, cols] = 0.0
+                elif mode == 'flux_only':
+                    flux_b = flux.unsqueeze(0).expand(B, L).contiguous().clone()
+                    err_b = flux_err.unsqueeze(0).expand(B, L).contiguous()
+                    rows = torch.arange(B, device=device)
+                    cols = torch.arange(start, end, device=device)
+                    flux_b[rows, cols] = 0.0
+                    mask_b = torch.ones(B, L, device=device)
+                elif mode == 'err_only':
+                    flux_b = flux.unsqueeze(0).expand(B, L).contiguous()
+                    err_b = flux_err.unsqueeze(0).expand(B, L).contiguous().clone()
+                    rows = torch.arange(B, device=device)
+                    cols = torch.arange(start, end, device=device)
+                    err_b[rows, cols] = 0.0
+                    mask_b = torch.ones(B, L, device=device)
+                else:
+                    raise ValueError(f'Unknown occlusion mode: {mode!r}')
+
+                x_b = torch.stack([flux_b, err_b], dim=-1)
+                t_b = t_in_one.expand(B, L, 1)
+                meta_b = meta_one.expand(B, -1) if meta_one is not None else None
+                meta_mask_b = (meta_mask_one.expand(B, -1)
+                               if meta_mask_one is not None else None)
+                conv_b = ({k: v.expand(B, *v.shape[1:]) for k, v in conv_data_one.items()}
+                          if conv_data_one is not None else None)
+
+                out = model(x_b, t_b, mask=mask_b, metadata=meta_b,
+                            meta_mask=meta_mask_b, conv_data=conv_b,
+                            return_states=True)
+                h_fwd = out['h_fwd_tensor']
+                h_bwd = out['h_bwd_tensor']
+                t_enc = out['t_enc']
+                if apply_head_norm:
+                    H = model.hidden_size
+                    h_bi = torch.cat([h_fwd, h_bwd, t_enc], dim=-1)
+                    h_bi = model.head_norm(h_bi)
+                    h_fwd = h_bi[..., :H]
+                    h_bwd = h_bi[..., H:2 * H]
+
+                # Vectorized pool over batch dim. We hard-require the locked-in
+                # pool config (the deployed extraction) — anything else falls
+                # back to the per-item loop.
+                h_comb = torch.cat([h_fwd, h_bwd], dim=-1)     # (B, L, 2H)
+                if use_batched_pool:
+                    z = compute_multiscale_features_batched(
+                        h_comb, times, n_segments=4,
+                        minmax_edge_skip=pool_kwargs.get('minmax_edge_skip', 0),
+                        hidden_size=model.hidden_size,
+                    )                                          # (B, D)
+                    s_norm_batch = f_full_norm - (z * z).sum(dim=-1)        # (B,)
+                    s_norm[start:end] = s_norm_batch.cpu().numpy()
+                    if s_pc1 is not None:
+                        s_pc1_batch = f_full_pc1 - ((z - pca_mean) * pca_dir).sum(dim=-1)
+                        s_pc1[start:end] = s_pc1_batch.cpu().numpy()
+                else:
+                    for b in range(B):
+                        z_b = compute_multiscale_features(
+                            h_comb[b], times, n_segments=4,
+                            hidden_size=model.hidden_size, **pool_kwargs,
+                        )
+                        s_norm[start + b] = f_full_norm - (z_b * z_b).sum().item()
+                        if s_pc1 is not None:
+                            s_pc1[start + b] = f_full_pc1 - ((z_b - pca_mean) * pca_dir).sum().item()
+
+                if verbose and (start // batch_size) % max(1, (L // batch_size) // 8) == 0:
+                    print(f'  [occlusion/{mode}] {end}/{L}')
+
+        return s_norm, s_pc1
+
+    print(f'[occlusion] running whole-timestep ablation (L={L}, batch={batch_size})')
+    s_whole_norm, s_whole_pc1 = _batch_forward_mode('whole')
+    if per_channel:
+        print('[occlusion] running flux-only ablation')
+        s_flux_norm, s_flux_pc1 = _batch_forward_mode('flux_only')
+        print('[occlusion] running err-only ablation')
+        s_err_norm, s_err_pc1 = _batch_forward_mode('err_only')
+    else:
+        s_flux_norm = s_flux_pc1 = None
+        s_err_norm = s_err_pc1 = None
+
+    return {
+        'f_full_norm': f_full_norm, 'f_full_pc1': f_full_pc1,
+        's_whole_norm': s_whole_norm, 's_whole_pc1': s_whole_pc1,
+        's_flux_norm': s_flux_norm, 's_flux_pc1': s_flux_pc1,
+        's_err_norm': s_err_norm, 's_err_pc1': s_err_pc1,
+    }
+
+
+# ---------------------------------------------------------------------------
 # (3) Analytic minGRU update-gate memory weighting (Method 4 in the plan)
 # ---------------------------------------------------------------------------
 
@@ -423,6 +721,18 @@ def parse_args():
                         'plot_reconstructions / plot_umap_latent.')
     p.add_argument('--apply_head_norm', action=argparse.BooleanOptionalAction, default=True,
                    help='Match the latent-bank extraction (default True).')
+    p.add_argument('--run_occlusion', action=argparse.BooleanOptionalAction, default=True,
+                   help='Run single-point occlusion in addition to IG. '
+                        'L forward passes per star, batched.')
+    p.add_argument('--run_occlusion_per_channel', action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help='Also run the per-channel ablation modes (flux-only, '
+                        'err-only). 3x slower; defaults off. Whole-timestep '
+                        'occlusion is what most people want — these per-channel '
+                        'modes feed synthetic inputs the encoder never saw at '
+                        'training, so attribution semantics are weaker.')
+    p.add_argument('--occlusion_batch_size', type=int, default=64,
+                   help='Batch size for the occlusion forward passes.')
     p.add_argument('--minmax_edge_skip', type=int, default=100,
                    help='Match plot_umap_metaAll.sh (default 100).')
     p.add_argument('--minmax_quantile', type=float, default=0.0)
@@ -512,6 +822,18 @@ def main():
         w_gate = gate['w_write']
         w_gate_final = gate['w_final']
 
+        # --- (4) Single-point occlusion (optional) ---
+        occ = None
+        if args.run_occlusion:
+            occ = single_point_occlusion(
+                model, lc,
+                pca_dir=pca_dir, pca_mean=pca_mean,
+                apply_head_norm=args.apply_head_norm,
+                pool_kwargs=pool_kwargs, device=device,
+                batch_size=args.occlusion_batch_size,
+                per_channel=args.run_occlusion_per_channel,
+            )
+
         # --- Sanity checks ---
         sanity = {}
         for name, ig in [('norm', ig_norm)] + ([('pc1', ig_pc1)] if ig_pc1 is not None else []):
@@ -556,6 +878,29 @@ def main():
                 f_pc1_full=ig_pc1['f_full'],
                 f_pc1_baseline=ig_pc1['f_baseline'],
             )
+        if occ is not None:
+            # Suffix `_occ` on every occlusion key to keep IG vs. occlusion
+            # cleanly separated downstream. Per-channel arrays only appear
+            # when --run_occlusion_per_channel is set.
+            save_dict.update(
+                occ_f_full_norm=occ['f_full_norm'],
+                occ_s_whole_norm=occ['s_whole_norm'],
+            )
+            if occ['f_full_pc1'] is not None:
+                save_dict.update(
+                    occ_f_full_pc1=occ['f_full_pc1'],
+                    occ_s_whole_pc1=occ['s_whole_pc1'],
+                )
+            if occ['s_flux_norm'] is not None:
+                save_dict.update(
+                    occ_s_flux_norm=occ['s_flux_norm'],
+                    occ_s_err_norm=occ['s_err_norm'],
+                )
+                if occ['s_flux_pc1'] is not None:
+                    save_dict.update(
+                        occ_s_flux_pc1=occ['s_flux_pc1'],
+                        occ_s_err_pc1=occ['s_err_pc1'],
+                    )
         np.savez(save_path, **save_dict)
         with open(out_dir / 'sanity.json', 'w') as f:
             json.dump(sanity, f, indent=2)
