@@ -346,18 +346,19 @@ def _load_latent_bank(path: str) -> np.ndarray:
 
 def maybe_load_pc1(latents_npz, device):
     """Load one or more latents .npz files, concatenate row-wise, fit PCA, and
-    return (pc1_dir, mean) on `device`.
+    return (pc1_dir, mean) on `device`, where pc1_dir is expressed in the
+    ORIGINAL latent coordinates so f(z) = (z - mean) @ pc1_dir.
+
+    Pre-PCA: per-feature z-scoring (X - X_mean) / X_std, matching the
+    deployment PCA in kfold_age_inference.fit_global_pca_bundle so PC1 is the
+    direction the age head would actually pick up. Without z-scoring, the
+    1536-d multiscale latent's natural-scale heterogeneity across pool blocks
+    (order stats dominate variance) lets one block monopolize PC1 — what the
+    saliency would attribute to PC1 then has nothing to do with the
+    age-inference projection.
 
     latents_npz: str | list[str] | None.
-
-    All banks must share the same D (pool dim) — this is guaranteed when they
-    come from the same checkpoint + extraction config. Concatenating across
-    populations (pretrain / hosts / thickdisk) gives a PC1 that is
-    representative of the full deployment population rather than the labeled
-    subset alone.
-
-    pc1_dir is unit-norm. mean is per-feature mean. Both as 1D float32 tensors
-    of size D.
+    All banks must share the same D (pool dim).
     """
     if not latents_npz:
         return None, None
@@ -373,19 +374,28 @@ def maybe_load_pc1(latents_npz, device):
         raise ValueError(f'Latent banks have mismatched feature dims: {Ds}. '
                          f'They must come from the same checkpoint + extraction config.')
     X = np.concatenate(parts, axis=0).astype(np.float64, copy=False)
-    print(f'[pca] fitting PCA on concatenated bank of shape {X.shape}')
-    mean = X.mean(axis=0)
-    Xc = X - mean
-    cov = (Xc.T @ Xc) / max(1, Xc.shape[0] - 1)
+    print(f'[pca] fitting PCA on concatenated bank of shape {X.shape} '
+          f'(per-feature z-score, matches deployment)')
+    X_mean = X.mean(axis=0)
+    X_std = X.std(axis=0) + 1e-8
+    X_norm = (X - X_mean) / X_std
+    cov = (X_norm.T @ X_norm) / max(1, X_norm.shape[0] - 1)
     w, v = np.linalg.eigh(cov)
-    pc1 = v[:, -1]
-    pc1 = pc1 / max(np.linalg.norm(pc1), 1e-12)
-    if (Xc @ pc1).mean() < 0:
-        pc1 = -pc1
-    print(f'[pca] D={pc1.size}, eig_top/eig_sum = {w[-1] / max(w.sum(), 1e-12):.3f}')
+    pc1_norm = v[:, -1]
+    pc1_norm = pc1_norm / max(np.linalg.norm(pc1_norm), 1e-12)
+    if (X_norm @ pc1_norm).mean() < 0:
+        pc1_norm = -pc1_norm
+    # Re-express PC1 in the ORIGINAL coordinates so we can compute the target
+    # scalar as (z_raw - X_mean) @ pc1_orig without re-standardizing inside the
+    # IG loop. From (z - X_mean) @ pc1_orig := ((z - X_mean) / X_std) @ pc1_norm,
+    # we have pc1_orig = pc1_norm / X_std. The result is not unit-norm in the
+    # original space — that's fine; only directionality matters for IG.
+    pc1_orig = pc1_norm / X_std
+    print(f'[pca] D={pc1_orig.size}, eig_top/eig_sum = {w[-1] / max(w.sum(), 1e-12):.3f} '
+          f'(on z-scored bank)')
     return (
-        torch.tensor(pc1, dtype=torch.float32, device=device),
-        torch.tensor(mean, dtype=torch.float32, device=device),
+        torch.tensor(pc1_orig, dtype=torch.float32, device=device),
+        torch.tensor(X_mean, dtype=torch.float32, device=device),
     )
 
 
