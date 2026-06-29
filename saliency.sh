@@ -46,6 +46,15 @@ RUN_OCCLUSION="true"
 RUN_OCCLUSION_PER_CHANNEL="false"
 OCCLUSION_BATCH_SIZE=64
 
+# === Mirror-symmetry diagnostic (decompose forward / backward) =============
+# When true, runs two extra IGs against ||z_fwd||^2 and ||z_bwd||^2 (each is
+# the pool of only one direction's hidden states). Reports the Pearson corr
+# between s_fwd[t] and time-reversed s_bwd[t]: corr ≈ +1 means the trained
+# forward/backward encoders are mirror-symmetric (so bidirectionality should
+# cancel time asymmetry); low or negative corr means they've diverged.
+# Adds 2*N_IG_STEPS forward+backward passes.
+DECOMPOSE_DIRECTIONS="false"
+
 # === Pool config (MUST match the latent bank used for PCA) =================
 # These mirror plot_umap_metaAll.sh.
 APPLY_HEAD_NORM="true"        # use --no-apply_head_norm to flip
@@ -89,6 +98,7 @@ if [ "${USE_CONV_CHANNELS}" = "true" ]; then CMD="${CMD} --use_conv_channels"; f
 if [ "${APPLY_HEAD_NORM}"   = "false" ]; then CMD="${CMD} --no-apply_head_norm"; fi
 if [ "${RUN_OCCLUSION}"             = "false" ]; then CMD="${CMD} --no-run_occlusion"; fi
 if [ "${RUN_OCCLUSION_PER_CHANNEL}"  = "true"  ]; then CMD="${CMD} --run_occlusion_per_channel"; fi
+if [ "${DECOMPOSE_DIRECTIONS}"       = "true"  ]; then CMD="${CMD} --decompose_directions"; fi
 # LATENTS_NPZ may be one or several space-separated paths; word-splits into
 # multiple --latents_npz args. The python script concatenates the banks before
 # fitting PC1.

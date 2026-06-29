@@ -56,12 +56,23 @@ from plot_umap_latent import compute_multiscale_features
 # ---------------------------------------------------------------------------
 
 def _pooled_latent(model, x_in, t_in, mask, meta, meta_mask, conv_data,
-                   apply_head_norm: bool, pool_kwargs: dict):
+                   apply_head_norm: bool, pool_kwargs: dict,
+                   direction_subset: str = 'both'):
     """Run model -> hidden states -> head_norm -> multiscale pool -> z.
 
-    Mirrors the path inside extract_latent_vectors in plot_umap_latent.py so
-    that the saliency targets the EXACT vector downstream age inference uses.
-    x_in is (1, L, 2); the returned z is (D,) where D = 12 * 2H.
+    direction_subset:
+        'both' (default): pool the concatenated [h_fwd | h_bwd], matching the
+            deployed extraction. z has dim 12*2H.
+        'fwd' : pool h_fwd only (no head_norm applied to the bwd channel).
+            z has dim 12*H. Used to isolate the forward-direction signal for
+            the mirror-symmetry diagnostic.
+        'bwd' : symmetric — pool h_bwd only.
+
+    The head_norm in 'fwd'/'bwd' mode runs over [h_one | t_enc] (whichever
+    direction is kept) rather than the full [h_fwd | h_bwd | t_enc] the model
+    was trained with. That keeps the normalization closed-form per direction
+    while losing exact deployment parity — fine for a diagnostic, not what you
+    want for production attribution.
     """
     out = model(x_in, t_in, mask=mask, metadata=meta, meta_mask=meta_mask,
                 conv_data=conv_data, return_states=True)
@@ -74,22 +85,41 @@ def _pooled_latent(model, x_in, t_in, mask, meta, meta_mask, conv_data,
             'h_fwd_tensor and h_bwd_tensor.'
         )
 
-    if apply_head_norm:
-        if model.head_norm is None:
-            raise RuntimeError(
-                '--apply_head_norm set but model has no head_norm. Pass '
-                '--no-apply_head_norm or use a checkpoint with head_norm.'
-            )
-        H = model.hidden_size
-        h_bi = torch.cat([h_fwd, h_bwd, t_enc], dim=-1)
-        h_bi = model.head_norm(h_bi)
-        h_fwd = h_bi[..., :H]
-        h_bwd = h_bi[..., H:2 * H]
+    if direction_subset == 'both':
+        if apply_head_norm:
+            if model.head_norm is None:
+                raise RuntimeError(
+                    '--apply_head_norm set but model has no head_norm. Pass '
+                    '--no-apply_head_norm or use a checkpoint with head_norm.'
+                )
+            H = model.hidden_size
+            h_bi = torch.cat([h_fwd, h_bwd, t_enc], dim=-1)
+            h_bi = model.head_norm(h_bi)
+            h_fwd = h_bi[..., :H]
+            h_bwd = h_bi[..., H:2 * H]
+        L = x_in.size(1)
+        h_combined = torch.cat([h_fwd[0, :L, :], h_bwd[0, :L, :]], dim=-1)
+    elif direction_subset == 'fwd':
+        if apply_head_norm and model.head_norm is not None:
+            H = model.hidden_size
+            # LayerNorm parameter shape is (2H + Te,). Run it on the full
+            # tensor and then slice — keeps stat-pool consistent with deployment.
+            h_bi = torch.cat([h_fwd, h_bwd, t_enc], dim=-1)
+            h_bi = model.head_norm(h_bi)
+            h_fwd = h_bi[..., :H]
+        L = x_in.size(1)
+        h_combined = h_fwd[0, :L, :]
+    elif direction_subset == 'bwd':
+        if apply_head_norm and model.head_norm is not None:
+            H = model.hidden_size
+            h_bi = torch.cat([h_fwd, h_bwd, t_enc], dim=-1)
+            h_bi = model.head_norm(h_bi)
+            h_bwd = h_bi[..., H:2 * H]
+        L = x_in.size(1)
+        h_combined = h_bwd[0, :L, :]
+    else:
+        raise ValueError(f'direction_subset must be both/fwd/bwd, got {direction_subset!r}')
 
-    # (1, L, 2H) -> (L, 2H). mask is all-ones at inference (we pass no test-time
-    # masking), so valid_len == L.
-    L = x_in.size(1)
-    h_combined = torch.cat([h_fwd[0, :L, :], h_bwd[0, :L, :]], dim=-1)
     t_combined = t_in[0, :L] if t_in.dim() == 2 else t_in[0, :L, 0]
 
     z = compute_multiscale_features(
@@ -115,7 +145,8 @@ def _build_x_in(flux: torch.Tensor, flux_err: torch.Tensor):
 def integrated_gradients(model, lc, baseline_mode: str, n_steps: int,
                          target: str, pca_dir=None, pca_mean=None,
                          apply_head_norm: bool = True,
-                         pool_kwargs=None, device='cpu', verbose=True):
+                         pool_kwargs=None, device='cpu', verbose=True,
+                         direction_subset: str = 'both'):
     """Integrated Gradients of f(z) w.r.t. flux and flux_err.
 
     Args:
@@ -190,6 +221,7 @@ def integrated_gradients(model, lc, baseline_mode: str, n_steps: int,
         z = _pooled_latent(
             model, x_a, t_in, mask, meta, meta_mask, conv_data,
             apply_head_norm=apply_head_norm, pool_kwargs=pool_kwargs,
+            direction_subset=direction_subset,
         )
         scalar = f_of_z(z)
         grad, = torch.autograd.grad(scalar, x_a, retain_graph=False, create_graph=False)
@@ -197,7 +229,7 @@ def integrated_gradients(model, lc, baseline_mode: str, n_steps: int,
         s_flux_acc = s_flux_acc + grad[0, :, 0].detach()
         s_err_acc = s_err_acc + grad[0, :, 1].detach()
         if verbose and (k + 1) % max(1, n_steps // 4) == 0:
-            print(f'  [IG/{target}] step {k+1}/{n_steps}')
+            print(f'  [IG/{target}/{direction_subset}] step {k+1}/{n_steps}')
 
     s_flux = (flux - flux_b) * (s_flux_acc / n_steps)
     s_err = (flux_err - err_b) * (s_err_acc / n_steps)
@@ -206,11 +238,13 @@ def integrated_gradients(model, lc, baseline_mode: str, n_steps: int,
     with torch.no_grad():
         x_full = torch.stack([flux, flux_err], dim=-1).unsqueeze(0)
         z_full = _pooled_latent(model, x_full, t_in, mask, meta, meta_mask, conv_data,
-                                apply_head_norm=apply_head_norm, pool_kwargs=pool_kwargs)
+                                apply_head_norm=apply_head_norm, pool_kwargs=pool_kwargs,
+                                direction_subset=direction_subset)
         f_full = f_of_z(z_full).item()
         x_base = torch.stack([flux_b, err_b], dim=-1).unsqueeze(0)
         z_base = _pooled_latent(model, x_base, t_in, mask, meta, meta_mask, conv_data,
-                                apply_head_norm=apply_head_norm, pool_kwargs=pool_kwargs)
+                                apply_head_norm=apply_head_norm, pool_kwargs=pool_kwargs,
+                                direction_subset=direction_subset)
         f_baseline = f_of_z(z_base).item()
 
     return {
@@ -733,6 +767,14 @@ def parse_args():
                         'training, so attribution semantics are weaker.')
     p.add_argument('--occlusion_batch_size', type=int, default=64,
                    help='Batch size for the occlusion forward passes.')
+    p.add_argument('--decompose_directions', action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help='Diagnostic mode: also run IG against ||z_fwd||^2 and '
+                        '||z_bwd||^2 separately (pool over h_fwd-only or '
+                        'h_bwd-only). Adds 2*n_ig_steps forward+backward '
+                        'passes. Used to test whether the trained forward and '
+                        'backward encoders have learned mirror-symmetric '
+                        'responses, by checking if s_fwd[t] ≈ s_bwd[L-1-t].')
     p.add_argument('--minmax_edge_skip', type=int, default=100,
                    help='Match plot_umap_metaAll.sh (default 100).')
     p.add_argument('--minmax_quantile', type=float, default=0.0)
@@ -813,6 +855,28 @@ def main():
                 pool_kwargs=pool_kwargs, device=device,
             )
 
+        # --- (2b) Forward-only and backward-only IG (diagnostic) ---
+        ig_fwd = ig_bwd = None
+        if args.decompose_directions:
+            print('[IG] target=||z_fwd||^2 (forward-only pool), '
+                  f'n_steps={args.n_ig_steps}')
+            ig_fwd = integrated_gradients(
+                model, lc, baseline_mode=args.baseline_mode,
+                n_steps=args.n_ig_steps, target='norm',
+                apply_head_norm=args.apply_head_norm,
+                pool_kwargs=pool_kwargs, device=device,
+                direction_subset='fwd',
+            )
+            print('[IG] target=||z_bwd||^2 (backward-only pool), '
+                  f'n_steps={args.n_ig_steps}')
+            ig_bwd = integrated_gradients(
+                model, lc, baseline_mode=args.baseline_mode,
+                n_steps=args.n_ig_steps, target='norm',
+                apply_head_norm=args.apply_head_norm,
+                pool_kwargs=pool_kwargs, device=device,
+                direction_subset='bwd',
+            )
+
         # --- (3) Gate-weight ---
         print('[gate] computing analytic memory weights')
         gate = gate_weight_attribution(
@@ -852,6 +916,35 @@ def main():
         assert ig_norm['s_err'].shape == (L,)
         assert w_gate.shape == (L,)
 
+        # --- Mirror-symmetry diagnostic (decompose_directions) ---
+        # If the trained forward and backward encoders had learned mirror-
+        # symmetric responses, s_fwd[t] would equal s_bwd[L-1-t] up to per-
+        # encoder weight scale. Report the Pearson correlation between
+        # s_fwd[t] and the time-reversed s_bwd[t]. A high positive corr
+        # (≈+1) means the encoders are mirror images and any time
+        # asymmetry in the *bidirectional* attribution comes from
+        # elsewhere (pool / IG path). A low or negative corr means the
+        # forward and backward encoders have diverged during training.
+        if ig_fwd is not None and ig_bwd is not None:
+            s_fwd = ig_fwd['s_flux'] + ig_fwd['s_err']
+            s_bwd = ig_bwd['s_flux'] + ig_bwd['s_err']
+            s_bwd_rev = s_bwd[::-1]
+            # Pearson on raw signed attributions.
+            mf, mb = s_fwd.mean(), s_bwd_rev.mean()
+            num = ((s_fwd - mf) * (s_bwd_rev - mb)).sum()
+            den = np.sqrt(((s_fwd - mf) ** 2).sum() * ((s_bwd_rev - mb) ** 2).sum())
+            corr_signed = float(num / max(den, 1e-12))
+            # And on |·| (often more informative since signs may flip per-block).
+            af, ab = np.abs(s_fwd), np.abs(s_bwd_rev)
+            mf, mb = af.mean(), ab.mean()
+            num = ((af - mf) * (ab - mb)).sum()
+            den = np.sqrt(((af - mf) ** 2).sum() * ((ab - mb) ** 2).sum())
+            corr_abs = float(num / max(den, 1e-12))
+            sanity['mirror_corr_signed'] = corr_signed
+            sanity['mirror_corr_abs'] = corr_abs
+            print(f'[sanity:mirror] corr(s_fwd[t], s_bwd[L-1-t]) signed={corr_signed:+.3f}  '
+                  f'|·|={corr_abs:+.3f}  (+1 ↔ encoders mirror-symmetric; ≤0 ↔ diverged)')
+
         # --- Save ---
         out_dir = out_root / tag
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -877,6 +970,20 @@ def main():
                 s_err_pc1=ig_pc1['s_err'],
                 f_pc1_full=ig_pc1['f_full'],
                 f_pc1_baseline=ig_pc1['f_baseline'],
+            )
+        if ig_fwd is not None:
+            save_dict.update(
+                s_flux_norm_fwd=ig_fwd['s_flux'],
+                s_err_norm_fwd=ig_fwd['s_err'],
+                f_norm_full_fwd=ig_fwd['f_full'],
+                f_norm_baseline_fwd=ig_fwd['f_baseline'],
+            )
+        if ig_bwd is not None:
+            save_dict.update(
+                s_flux_norm_bwd=ig_bwd['s_flux'],
+                s_err_norm_bwd=ig_bwd['s_err'],
+                f_norm_full_bwd=ig_bwd['f_full'],
+                f_norm_baseline_bwd=ig_bwd['f_baseline'],
             )
         if occ is not None:
             # Suffix `_occ` on every occlusion key to keep IG vs. occlusion
