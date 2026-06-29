@@ -328,38 +328,58 @@ def gate_weight_attribution(model, lc, apply_head_norm: bool,
 # Driver
 # ---------------------------------------------------------------------------
 
-def maybe_load_pc1(latents_npz: str, device):
-    """Load a latents .npz, fit a PCA, return (pc1_dir, mean) on `device`.
-
-    pc1_dir is unit-norm. mean is per-feature mean. Both as 1D float32 tensors
-    of size D = pool dim.
-    """
-    if not latents_npz:
-        return None, None
-    print(f'[pca] loading {latents_npz}')
-    data = np.load(latents_npz, allow_pickle=True)
+def _load_latent_bank(path: str) -> np.ndarray:
+    """Load one latents .npz and return its (N, D) latent matrix."""
+    data = np.load(path, allow_pickle=True)
     if 'latent_vectors' in data:
         X = data['latent_vectors']
     elif 'latents' in data:
         X = data['latents']
     else:
-        # Just take the first array.
         keys = [k for k in data.files if data[k].ndim == 2]
         if not keys:
-            raise ValueError(f'No 2D array found in {latents_npz}; keys: {list(data.files)}')
+            raise ValueError(f'No 2D array found in {path}; keys: {list(data.files)}')
         X = data[keys[0]]
-        print(f'[pca] using array key {keys[0]!r} with shape {X.shape}')
-    X = np.asarray(X, dtype=np.float64)
-    print(f'[pca] fitting PCA on bank of shape {X.shape}')
+        print(f'[pca]   {path}: using array key {keys[0]!r}')
+    return np.asarray(X)
+
+
+def maybe_load_pc1(latents_npz, device):
+    """Load one or more latents .npz files, concatenate row-wise, fit PCA, and
+    return (pc1_dir, mean) on `device`.
+
+    latents_npz: str | list[str] | None.
+
+    All banks must share the same D (pool dim) — this is guaranteed when they
+    come from the same checkpoint + extraction config. Concatenating across
+    populations (pretrain / hosts / thickdisk) gives a PC1 that is
+    representative of the full deployment population rather than the labeled
+    subset alone.
+
+    pc1_dir is unit-norm. mean is per-feature mean. Both as 1D float32 tensors
+    of size D.
+    """
+    if not latents_npz:
+        return None, None
+    paths = [latents_npz] if isinstance(latents_npz, str) else list(latents_npz)
+    parts = []
+    print(f'[pca] loading {len(paths)} latent bank(s)')
+    for p in paths:
+        X = _load_latent_bank(p)
+        print(f'[pca]   {p}: shape {X.shape}')
+        parts.append(X)
+    Ds = {p.shape[1] for p in parts}
+    if len(Ds) != 1:
+        raise ValueError(f'Latent banks have mismatched feature dims: {Ds}. '
+                         f'They must come from the same checkpoint + extraction config.')
+    X = np.concatenate(parts, axis=0).astype(np.float64, copy=False)
+    print(f'[pca] fitting PCA on concatenated bank of shape {X.shape}')
     mean = X.mean(axis=0)
     Xc = X - mean
-    # Truncated SVD to get top-1 PC; full SVD is fine for ~D=1536.
-    # numpy SVD on N×D where N is large can be slow; use eig on D×D covariance.
     cov = (Xc.T @ Xc) / max(1, Xc.shape[0] - 1)
     w, v = np.linalg.eigh(cov)
-    pc1 = v[:, -1]                          # eigvec with largest eigenvalue
+    pc1 = v[:, -1]
     pc1 = pc1 / max(np.linalg.norm(pc1), 1e-12)
-    # Sign convention: pick the orientation where PC1 mean over the bank > 0.
     if (Xc @ pc1).mean() < 0:
         pc1 = -pc1
     print(f'[pca] D={pc1.size}, eig_top/eig_sum = {w[-1] / max(w.sum(), 1e-12):.3f}')
@@ -381,9 +401,13 @@ def parse_args():
     p.add_argument('--n_ig_steps', type=int, default=64,
                    help='Number of trapezoidal IG steps. 32-64 is standard.')
     p.add_argument('--baseline_mode', type=str, default='zero', choices=['zero', 'mean'])
-    p.add_argument('--latents_npz', type=str, default=None,
-                   help='Optional path to a latent-bank .npz; if given, IG is '
-                        'also computed for the PC1 target.')
+    p.add_argument('--latents_npz', type=str, nargs='+', default=None,
+                   help='Optional path(s) to one or more latent-bank .npz files. '
+                        'When multiple paths are given they are concatenated '
+                        'row-wise before PCA — gives a PC1 representative of '
+                        'the full deployment population (pretrain + hosts + '
+                        'thickdisk) rather than the labeled subset alone. If '
+                        'given, IG is also computed for the PC1 target.')
     p.add_argument('--trim_edges', type=int, default=10,
                    help='Must match the model training. Same convention as in '
                         'plot_reconstructions / plot_umap_latent.')
