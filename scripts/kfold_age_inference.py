@@ -3030,6 +3030,15 @@ def main():
                         help='Use (MG, MG_err) instead of (BPRP0, BPRP0_err) as flow context. '
                              'Implemented as a swap before training so the flow still sees a '
                              '3-context input. Mutually exclusive with --use_mg.')
+    parser.add_argument('--use_prot',             action='store_true', default=False,
+                        help='Add log10(Prot) as a 4th flow context variable. Implemented by '
+                             'loading the `Prot` column from --prot_csv (default: --age_csv) '
+                             'into the MG slot and forcing --use_mg=True. The flow then sees '
+                             '(log10_age, BPRP0, log10(BPRP0_err), log10(Prot)). Rows with NaN '
+                             'Prot are dropped. Mutually exclusive with --use_mg and --use_mg_only.')
+    parser.add_argument('--prot_csv',             type=str, default=None,
+                        help='CSV column source for --use_prot. Must have GaiaDR3_ID and Prot '
+                             'columns. Defaults to --age_csv if omitted.')
 
     # Subset filtering
     parser.add_argument('--subset_col', type=str, default=None,
@@ -3060,6 +3069,14 @@ def main():
     parser.add_argument('--train_full',   action='store_true',
                         help='After k-fold CV, train a final model on ALL labeled stars '
                              'and save as full_model.pt for deployment to unlabeled data.')
+
+    # Held-out posterior saving (for downstream log-likelihood / CRPS / PIT)
+    parser.add_argument('--save_heldout_posteriors', action='store_true',
+                        help='Save each star\'s held-out grid posterior to '
+                             'heldout_posteriors.npz in --output_dir. Adds (N, G) array.')
+    parser.add_argument('--n_posterior_samples', type=int, default=0,
+                        help='If --save_heldout_posteriors, also draw K samples/star '
+                             'from the held-out grid posterior (deterministic via --seed).')
 
     # Latents cache
     parser.add_argument('--save_latents', type=str, default=None, metavar='PATH',
@@ -3122,6 +3139,11 @@ def main():
 
     if args.use_mg and args.use_mg_only:
         parser.error('--use_mg and --use_mg_only are mutually exclusive.')
+
+    if args.use_prot:
+        if args.use_mg or args.use_mg_only:
+            parser.error('--use_prot rides the MG slot; mutually exclusive with --use_mg / --use_mg_only.')
+        args.use_mg = True  # the 4th context dim is Prot, plumbed via the MG channel
 
     if args.loso:
         if args.loocv_age or args.sector_level_split:
@@ -3564,6 +3586,53 @@ def main():
         kfold_bprp0     = kfold_mg
         kfold_bprp0_err = kfold_mg_err
 
+    # ── Step 2b': optional Prot-in-MG-slot injection ───────────────────────
+    # When --use_prot is set, overwrite the kfold_mg array with log10(Prot)
+    # joined from --prot_csv on GaiaDR3_ID. The model then sees Prot as its
+    # 4th NSF context dim. kfold_tics holds GaiaDR3_IDs after latent_max
+    # aggregation (aggregate_by_star groups by gaia_id). Rows with NaN or
+    # non-positive Prot are dropped here, matching the gyro-baseline filter.
+    if args.use_prot:
+        prot_csv = args.prot_csv or args.age_csv
+        df_prot  = pd.read_csv(prot_csv, usecols=['GaiaDR3_ID', 'Prot'])
+        df_prot['GaiaDR3_ID'] = df_prot['GaiaDR3_ID'].astype(str)
+        df_prot = df_prot.drop_duplicates(subset='GaiaDR3_ID', keep='first')
+        gid_to_prot = dict(zip(df_prot['GaiaDR3_ID'], df_prot['Prot'].astype(float)))
+
+        # kfold_tics here = unique gaia_ids after star aggregation; for
+        # per-sector modes (none / predict_mean) it's still tic_ids and we
+        # must look up via the per-row gaia_ids array (already filtered by
+        # the subset block above, so aligned with kfold_* arrays).
+        if args.star_aggregation in ('none', 'predict_mean'):
+            lookup_keys = gaia_ids
+        else:
+            lookup_keys = kfold_tics
+        prot_vals = np.array([gid_to_prot.get(str(g), np.nan) for g in lookup_keys],
+                              dtype=float)
+        log_prot  = np.where((prot_vals > 0) & np.isfinite(prot_vals),
+                              np.log10(prot_vals), np.nan)
+        ok = np.isfinite(log_prot)
+        n_drop = int((~ok).sum())
+        if n_drop:
+            print(f'\n--use_prot: dropping {n_drop}/{len(ok)} rows with NaN/<=0 Prot.')
+            kfold_latents   = kfold_latents[ok]
+            kfold_ages      = kfold_ages[ok]
+            kfold_bprp0     = kfold_bprp0[ok]
+            kfold_bprp0_err = kfold_bprp0_err[ok]
+            kfold_mg        = kfold_mg[ok]
+            kfold_mg_err    = kfold_mg_err[ok]
+            kfold_mem_prob  = kfold_mem_prob[ok]
+            kfold_tics      = kfold_tics[ok]
+            if kfold_sectors is not None:
+                kfold_sectors = kfold_sectors[ok]
+            if kfold_source is not None:
+                kfold_source = kfold_source[ok]
+            log_prot = log_prot[ok]
+        print(f'--use_prot: log10(Prot) range [{log_prot.min():.3f}, {log_prot.max():.3f}] '
+              f'days over {len(log_prot)} stars; written into the MG slot.')
+        kfold_mg     = log_prot
+        kfold_mg_err = np.full_like(log_prot, 0.01)  # placeholder; model does not use mg_err
+
     # ── Step 2c: LOSO per-star sector sets ─────────────────────────────────
     # latent_max collapses all sectors of a star into one row, so the sector
     # info is gone by run_kfold_cv. Rebuild each star's sector-set here, aligned
@@ -3661,6 +3730,8 @@ def main():
         loso_star_sectors=loso_star_sectors,
         loso_strict_train=(not args.loso_relaxed_train),
         prefit_pca_bundle=prefit_pca_bundle,
+        save_heldout_posteriors=args.save_heldout_posteriors,
+        n_posterior_samples=args.n_posterior_samples,
     )
 
     # ── Step 4: for predict_mean, save per-sector CSV then average per star ─
