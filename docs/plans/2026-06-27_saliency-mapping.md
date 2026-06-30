@@ -317,3 +317,154 @@ PCA — we want the *deployed* projection.
 4. Stars to attribute on next: pick from the same examples
    `plot_reconstructions.sh` already uses; the wrapper currently runs one
    star per invocation (set `SEED`/`GAIA_ID`/`TIC_ID` in `saliency.sh`).
+
+## 12. Interpretation notes (v1 outputs)
+
+Findings from the first batch of diagnostic runs on `sendit/e100`. The point
+of this section is to record what the saliency *is honestly reporting* about
+the trained model, so the figures are not over-interpreted in either
+direction. Tests and scripts referenced live in `scripts/per_direction_nll.py`
+and the `--decompose_directions` mode of `scripts/compute_saliency.py`.
+
+### 12.1 The bidirectional architecture is symmetric; the trained model is not.
+
+Forward and backward encoders share the same architecture, hidden dim, time
+encoding, and head-norm. Nothing structural privileges one direction. On the
+trained sendit/e100 checkpoint:
+
+- Raw per-timestep magnitudes are balanced: `||h_fwd||` ≈ 10.10,
+  `||h_bwd||` ≈ 9.86 (ratio 1.02).
+- `head_norm.weight` mean abs is 1.048 (forward dims) vs 1.046 (backward) —
+  the model has not learned to compensate via gain.
+- Per-dim std of `h_bwd` is actually slightly *higher* than `h_fwd` after
+  head_norm (1.02 vs 0.71).
+
+So the two channels are equally "loud" in their hidden state values. The
+asymmetry that drives saliency lives in their **gradients**, not magnitudes.
+
+### 12.2 Forward = sensitivity, backward = predictive value.
+
+Two diagnostics establish these as distinct properties:
+
+**`--decompose_directions` (`scripts/compute_saliency.py`).**
+Runs IG against `||z_fwd||²` and `||z_bwd||²` separately. On the s86 host
+star:
+- `s_fwd[t]` magnitude ≈ 7× `s_bwd[t]` magnitude — `∂h_fwd/∂flux` is ~7×
+  more responsive than `∂h_bwd/∂flux`.
+- Mirror correlation `corr(s_fwd[t], s_bwd[L-1-t])` ≈ +0.005 signed,
+  +0.002 absolute. **The forward and backward encoders are not mirror
+  images of each other.**
+
+**`scripts/per_direction_nll.py`.**
+Computes the flow-head NLL on a held-out star sample, under three context-
+ablation modes: deployed bidirectional, forward-zeroed, backward-zeroed.
+Mirrors `bounded_horizon_future_nll` exactly. On 50 stars from
+pretrain+hosts+thickdisk at k ∈ {1, 8, 64, 720}:
+- Median NLL (deployed): 1.41–1.43.
+- Median NLL with forward zeroed: 1.48 (Δ +0.05–0.07).
+- Median NLL with backward zeroed: 1.51 (Δ +0.07–0.10).
+- Ratio Δbwd / Δfwd: 0.83–0.91 across every horizon.
+
+So zeroing the **forward channel hurts prediction less** than zeroing the
+backward channel. The backward channel is the more useful predictor.
+
+The synthesis: the forward channel is highly **reactive** to inputs (loud
+attribution), while the backward channel is more **informative** for the
+prediction task. Both can be true simultaneously — sensitivity and
+predictive value are different properties of a representation, and on this
+checkpoint they happen to point in opposite directions across the two
+encoders.
+
+### 12.3 PC1 attribution is forward-dominated by gradient, not by loading.
+
+PC1 itself (the principal axis fit on the deployed latent bank) is balanced
+across the forward and backward halves of the 1536-dim pool:
+
+- Forward share of `||PC1||²`: **0.482**.
+- Backward share of `||PC1||²`: **0.518**.
+- All 12 blocks have fwd/bwd ratio ≈ 1, except `first_h` (0.13, bwd-
+  dominated because `h_fwd[0]` is initialized to zero) and `last_h` (3.54,
+  fwd-dominated by symmetry); these two roughly cancel.
+
+But the gradient `∂(z·PC1) / ∂flux` decomposes as:
+```
+∂(z·PC1) / ∂flux  =  PC1_fwd · ∂z_fwd / ∂flux  +  PC1_bwd · ∂z_bwd / ∂flux
+```
+Both `PC1_fwd` and `PC1_bwd` have similar magnitudes, but the forward
+gradient is 7× larger. So **the PC1-target saliency inherits the forward
+channel's asymmetry pattern regardless of PC1's balanced loading**. Picking
+a "better" projection of `z` does not help; the asymmetry travels with the
+sensitivity of the underlying representation.
+
+### 12.4 The "decreasing impact over time" is a gap step, not a smooth decay.
+
+Time-binning the attribution on two stars from the same checkpoint:
+
+| Star (sector)              | Max gap (days) | Pre-gap mean | Post-gap mean | Post/pre ratio |
+|----------------------------|----------------|--------------|---------------|----------------|
+| Gaia 249212801592026240 / s86 | 6.05 d | ~245 | ~85 | 0.35 |
+| Gaia 5211227379520496896 / s93 | 2.36 d | ~240 | ~178 | 0.74 |
+
+Within each star, attribution is roughly flat through the pre-gap region, then
+drops at the gap, then tails off slightly through the post-gap region. The
+size of the drop scales with the size of the gap. The smooth ~5% monotonic
+decay in the `w_gate` panel is a separate, much smaller effect — the
+write-gate's response to time encoding drifts gently as `t` grows.
+
+Mechanism: when either encoder crosses a long gap, its hidden state has
+already accumulated significant signal from the pre-gap region. Post-gap
+inputs write into an already-loaded recurrent state, so each post-gap
+sample's marginal influence on the pool is smaller. Bidirectionality does
+not cancel this because both directions have learned the same pre-gap
+bias — they are not mirror images, so the backward channel cannot
+"fill in" what the forward channel attenuated.
+
+### 12.5 Why we did NOT modify the pool or the PCA to mitigate the asymmetry.
+
+Two natural mitigations were considered and rejected:
+
+- **Rescaling `h_bwd` before the pool** (e.g. multiplying by 7×). Per-feature
+  z-scoring in the deployed age-inference PCA exactly undoes this rescaling
+  by construction: each scaled feature gets divided by its also-scaled std,
+  the factor cancels, and the resulting PC1 is identical to the un-rescaled
+  one. Doesn't help.
+- **Switching to per-channel z-scoring with fitted stds** (one std for all
+  forward dims, one for all backward dims). The empirical channel stds are
+  near-equal in this checkpoint (driven by head_norm), so per-channel
+  z-scoring is numerically very close to per-feature z-scoring and likewise
+  doesn't fix the gradient asymmetry. To get a real effect, the per-channel
+  std ratio would have to be **hand-set** to match the sensitivity ratio
+  (~7), not fitted from data — explicitly downweighting the forward channel.
+
+Either fix would change the latent the age head consumes, requiring an
+age-inference re-run to confirm MAE doesn't regress. More importantly, the
+saliency is correctly reporting a real property of the trained model: the
+forward channel **is** more sensitive to flux than the backward channel.
+Hiding that with a normalization trick produces figures that look prettier
+without changing the underlying behavior.
+
+If we ever do another pretraining run, the right fix is upstream: **per-
+direction LayerNorm** (separate LN for `h_fwd` and `h_bwd` before head
+operations) would force the two channels to converge to comparable
+sensitivities during training rather than retrofitting balance afterwards.
+That is filed as a follow-up for the next pretraining iteration; it does
+not block any current saliency work.
+
+### 12.6 What the v1 saliency outputs are honestly showing.
+
+Recap of the per-star attribution figures, given the above:
+
+- **Pre/post-gap step-down in `s_flux_norm` and `s_flux_pc1`** is the
+  encoder's actual processing of the gap; it scales with gap size and is
+  shared by both directions.
+- **Forward-domination of the bidirectional attribution magnitude** reflects
+  the trained sensitivity gap, not a structural or PCA-loading bias.
+- **`s_err` ≪ `s_flux`** (Σ|·| ratio ≈ 0.19) confirms `flux_err` carries
+  much less attribution mass than `flux`.
+- **`w_gate` monotonic 5% decay** is a smaller, separate effect from the
+  encoder's response to time encoding — not the same mechanism as the gap
+  step.
+
+None of these are bugs in the saliency tool. They are the model's actual
+behavior on this data, surfaced by the diagnostic. Future analyses should
+treat them as findings, not artifacts.
