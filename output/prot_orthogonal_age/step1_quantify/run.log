@@ -1,0 +1,108 @@
+############## C3: ChronoFlow LOSO pca4 + log10(tars_Prot) ##############
+Device: cpu
+
+=== Loading latents from cache: final_model/sendit/e50/metaAll/latents_pretrain.npz ===
+Loaded latents cache ← final_model/sendit/e50/metaAll/latents_pretrain.npz
+  per-sector samples : 40662
+  latent dim         : 1536
+  cross-sector latents: not in cache
+  dropped 8789/40662 rows with NaN age/bprp0/bprp0_err
+  --override_ages_from_csv (final_pretrain/metadata.csv): 1937 ages changed, dropping 24777 rows not in CSV
+
+=== Loading PCA fit pool (3 cache(s)) ===
+  final_model/sendit/e50/metaAll/latents_pretrain.npz: (40662, 1536)
+  final_model/sendit/e50/metaAll/latents_hosts.npz: (19969, 1536)
+  final_model/sendit/e50/metaAll/latents_thickdisk.npz: (8688, 1536)
+Global PCA pool: 69,319 latents x 1536 dims
+
+Subset filter: ref in ['ChronoFlow'] → 7096/7096 per-sector samples (2470 unique stars)
+
+=== Aggregating latents (latent_max) ===
+latent_max: reduced to 2470 stars | latent dim: 1536
+
+--use_prot: dropping 821/2470 rows with NaN/<=0 Prot.
+--use_prot: log10(Prot) range [-0.991, 1.332] days over 1649 stars; written into the MG slot.
+
+--loso: built per-star sector sets for 1649 stars across 43 unique sectors.
+
+=== Loading global PCA cache: final_model/sendit/e50/global_pca_d16.npz ===
+  Loaded global PCA artifact ← final_model/sendit/e50/global_pca_d16.npz (took 4/16 components, 72.0% var explained)
+
+=== Running K-Fold Cross-Validation ===
+Normalization + PCA basis from prefit_pca_bundle (no per-fold refit; identical basis across runs).
+Leave-one-sector-out: 43 unique sectors → 10 disjoint groups; 1649 stars. Training drops every star touching the held-out group.
+
+Running 10-fold CV on 1649 samples (sample-level split)...
+    PCA 4D: 72.0% variance explained
+  Fold 1/10: best_val_nll=1.6942  val_MAE=0.539 dex  val_r=0.399
+    PCA 4D: 72.0% variance explained
+  Fold 2/10: best_val_nll=2.5610  val_MAE=0.538 dex  val_r=0.578
+    PCA 4D: 72.0% variance explained
+  Fold 3/10: best_val_nll=2.2338  val_MAE=0.482 dex  val_r=0.545
+    PCA 4D: 72.0% variance explained
+  Fold 4/10: best_val_nll=1.6204  val_MAE=0.642 dex  val_r=0.189
+    PCA 4D: 72.0% variance explained
+  Fold 5/10: best_val_nll=1.5502  val_MAE=0.691 dex  val_r=0.123
+    PCA 4D: 72.0% variance explained
+  Fold 6/10: best_val_nll=3.4146  val_MAE=0.387 dex  val_r=0.279
+    PCA 4D: 72.0% variance explained
+  Fold 7/10: best_val_nll=3.7241  val_MAE=0.848 dex  val_r=-0.004
+    PCA 4D: 72.0% variance explained
+  Fold 8/10: best_val_nll=3.2004  val_MAE=0.548 dex  val_r=0.553
+    PCA 4D: 72.0% variance explained
+  Fold 9/10: best_val_nll=2.4830  val_MAE=0.408 dex  val_r=0.594
+    PCA 4D: 72.0% variance explained
+  Fold 10/10: best_val_nll=6.1384  val_MAE=0.675 dex  val_r=0.190
+Saved 10 fold models to output/prot_orthogonal_age/step1_quantify/c3_chronoflow_loso_pca4_tarsProt/kfold_models.pt
+Saved training curves to output/prot_orthogonal_age/step1_quantify/c3_chronoflow_loso_pca4_tarsProt/training_curves.json
+
+=== K-Fold Results ===
+N = 1649
+MAE = 0.541 dex   Median AE = 0.413 dex   RMSE = 0.725 dex
+Bias = -0.040 dex   Scatter = 0.724 dex   Pearson r = 0.626
+Saved plot to output/prot_orthogonal_age/step1_quantify/c3_chronoflow_loso_pca4_tarsProt/kfold_results.png
+Saved predictions to output/prot_orthogonal_age/step1_quantify/c3_chronoflow_loso_pca4_tarsProt/kfold_predictions.csv
+
+Done!
+
+############## C2: ChronoFlow LOSO gyro (folds inherited from C1) ##############
+Device: cpu
+
+=== Loading gyro data ===
+Loaded 7047 stars with valid age, BPRP0, BPRP0_err, Prot
+Age range:  1.5 – 6920.0 Myr
+Prot range: 0.10 – 23.42 days
+
+=== Inheriting folds from final_model/sendit/e50/age_inference/chronoflow/loso/pca4/kfold_predictions.csv ===
+Matched gyro stars : 2590 / 7047 have a fold
+n_folds            : 10
+per-fold counts    : {0: 220, 1: 355, 2: 228, 3: 324, 4: 358, 5: 479, 6: 76, 7: 111, 8: 102, 9: 337}
+
+=== Training 10 folds (100 epochs each) ===
+  Fold 1/10: best_val_nll=0.0177  val_MAE=0.484  val_r=0.414  (n_train=2370, n_val=220)
+  Fold 2/10: best_val_nll=0.1548  val_MAE=0.439  val_r=0.213  (n_train=2235, n_val=355)
+  Fold 3/10: best_val_nll=0.0885  val_MAE=0.427  val_r=0.556  (n_train=2362, n_val=228)
+  Fold 4/10: best_val_nll=0.1365  val_MAE=0.476  val_r=0.418  (n_train=2266, n_val=324)
+  Fold 5/10: best_val_nll=0.0708  val_MAE=0.379  val_r=0.075  (n_train=2232, n_val=358)
+  Fold 6/10: best_val_nll=0.3657  val_MAE=0.744  val_r=-0.068  (n_train=2111, n_val=479)
+  Fold 7/10: best_val_nll=0.1270  val_MAE=0.801  val_r=0.332  (n_train=2514, n_val=76)
+  Fold 8/10: best_val_nll=0.2101  val_MAE=0.635  val_r=0.493  (n_train=2479, n_val=111)
+  Fold 9/10: best_val_nll=0.1763  val_MAE=0.628  val_r=0.481  (n_train=2488, n_val=102)
+  Fold 10/10: best_val_nll=0.4895  val_MAE=0.432  val_r=0.353  (n_train=2253, n_val=337)
+
+=== Gyro LOSO (inherited folds) — overall ===
+  n_samples: 2590
+  mae_dex: 0.5201454753994331
+  median_ae_dex: 0.3439082032526275
+  rmse_dex: 0.7329756758468206
+  bias_dex: -0.09205051106464428
+  scatter_dex: 0.7271726375461616
+  correlation: 0.3407621321092214
+  inherit_folds_from: final_model/sendit/e50/age_inference/chronoflow/loso/pca4/kfold_predictions.csv
+
+Done. Output dir: output/prot_orthogonal_age/step1_quantify/c2_chronoflow_loso_gyro_inherited
+
+############## Step 1 summary (C1/C2/C3 + per-PC partial-r) ##############
+
+=== Assembling apples-to-apples C1/C2/C3 table ===
+output/prot_orthogonal_age/step1_quantify/c3_chronoflow_loso_pca4_tarsProt/kfold_predictions.csv: missing true_log_age or pred_median
